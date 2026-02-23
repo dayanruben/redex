@@ -40,7 +40,8 @@
     "@docusaurus/**/diff": ">=8.0.3",
     "lodash": ">=4.17.23",
     "lodash-es": ">=4.17.23",
-    "qs": "^6.14.2"
+    "qs": "^6.14.2",
+    "**/url-loader/schema-utils/ajv": "^6.14.0"
   },
   "browserslist": {
     "production": [
