@@ -72,7 +72,9 @@ bool Transform::replace_with_const(const ConstantEnvironment& env,
     auto primary_it = cfg_it.cfg().primary_instruction_of_move_result(cfg_it);
     always_assert(!replacement.empty());
     if (replacement.size() == 1) {
-      always_assert(opcode::is_a_literal_const(replacement.front()->opcode()));
+      IROpcode opcode = replacement.front()->opcode();
+      always_assert(opcode::is_a_literal_const(opcode) ||
+                    opcode == IOPCODE_R_CONST);
       // The move-result-pseudo instruction might be in a different block. We
       // cannot use the CFGMutator's replace functionality, as it would put the
       // replacement into the wrong block --- the block of the primary
