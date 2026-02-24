@@ -9,7 +9,6 @@
 #include <limits>
 #include <unordered_set>
 
-#include "Debug.h"
 #include "androidfw/ResourceTypes.h"
 #include "utils/Serialize.h"
 #include "utils/Visitor.h"
