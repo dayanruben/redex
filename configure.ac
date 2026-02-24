@@ -182,7 +182,7 @@ AS_IF([test "x$enable_tests" != "xno"], [
     AC_CHECK_HEADERS(
         [gtest/gtest.h gmock/gmock.h],
         [AC_SUBST(GOOGLETEST_INCLUDE_DIR,"$GOOGLETEST_INCLUDE_DIR")],
-        [AC_MSG_ERROR([googletest not detected or --with-googletest does not seem to point at a valid GoogleTest installation with the header files.])])
+        [AC_MSG_ERROR([googletest not detected or --with-googletest does not point at a valid GoogleTest installation. Pass --with-googletest=/path/to/googletest to specify a valid path, or --disable-tests to skip building tests.])])
     CXXFLAGS="$save_CXXFLAGS"
     CPPFLAGS="$save_CPPFLAGS"
 
@@ -195,10 +195,10 @@ AS_IF([test "x$enable_tests" != "xno"], [
     LIBS=
     AC_CHECK_LIB(gtest_main, main,
         [AC_SUBST(GOOGLETEST_TEST_LIBS,"$LDFLAGS -lgtest_main -lgtest")],
-        [AC_MSG_ERROR([googletest not detected or --with-googletest does not seem to point at a valid GoogleTest installation with gtest_main.])])
+        [AC_MSG_ERROR([gtest_main not found or --with-googletest does not point at a valid GoogleTest installation. Pass --with-googletest=/path/to/googletest to specify a valid path, or --disable-tests to skip building tests.])])
     AC_CHECK_LIB(gmock_main, main,
         [AC_SUBST(GOOGLETEST_MOCK_LIBS,"$LDFLAGS -lgmock_main -lgmock -lgtest")],
-        [AC_MSG_ERROR([googletest not detected or --with-googletest does not seem to point at a valid GoogleTest installation with gmock_main.])])
+        [AC_MSG_ERROR([gmock_main not found or --with-googletest does not point at a valid GoogleTest installation. Pass --with-googletest=/path/to/googletest to specify a valid path, or --disable-tests to skip building tests.])])
     LDFLAGS="$save_LDFLAGS"
     LIBS="$save_LIBS"
     AC_LANG_POP([C++])
