@@ -14,7 +14,6 @@
 #include "Creators.h"
 #include "DexClass.h"
 #include "IRAssembler.h"
-#include "MethodProfiles.h"
 #include "RedexTest.h"
 #include "ScopedCFG.h"
 #include "TypeUtil.h"
