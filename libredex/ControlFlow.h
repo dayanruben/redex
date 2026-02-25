@@ -506,6 +506,8 @@ class ControlFlowGraph {
   // elements.
   std::vector<Block*> blocks() const;
 
+  auto blocks_view() const { return std::views::values(m_blocks); }
+
   // Return vector of blocks in reverse post order (RPO). If there is a path
   // from Block A to Block B, then A appears before B in this vector.
   //
@@ -1040,11 +1042,6 @@ class ControlFlowGraph {
 
   bool structural_equals(const ControlFlowGraph& other,
                          const InstructionEquality& instruction_equals) const;
-
-  auto blocks_view() const {
-    return std::ranges::subrange(m_blocks.begin(), m_blocks.end()) |
-           std::views::transform([](const auto& p) { return p.second; });
-  }
 
   template <class ForwardIt>
   bool insert(const InstructionIterator& position,
