@@ -16,7 +16,6 @@
 #include "DexCallSite.h"
 #include "DexDefs.h"
 #include "DexMethodHandle.h"
-#include "Macros.h"
 #include "Show.h"
 #include "Trace.h"
 #include "Walkers.h"
@@ -167,7 +166,7 @@ void validate_dex_header(const dex_header* dh,
     if (is_this_dex_version) {
       input_dex_version = std::max(input_dex_version, 39);
     }
-    FALLTHROUGH_INTENDED; /* intentional fallthrough to also check for v38 */
+    [[fallthrough]]; /* intentional fallthrough to also check for v38 */
   case 38:
     is_this_dex_version =
         memcmp(dh->magic, DEX_HEADER_DEXMAGIC_V38, sizeof(dh->magic)) == 0;
@@ -175,7 +174,7 @@ void validate_dex_header(const dex_header* dh,
     if (is_this_dex_version) {
       input_dex_version = std::max(input_dex_version, 38);
     }
-    FALLTHROUGH_INTENDED; /* intentional fallthrough to also check for v37 */
+    [[fallthrough]]; /* intentional fallthrough to also check for v37 */
   case 37:
     is_this_dex_version =
         memcmp(dh->magic, DEX_HEADER_DEXMAGIC_V37, sizeof(dh->magic)) == 0;
@@ -183,7 +182,7 @@ void validate_dex_header(const dex_header* dh,
     if (is_this_dex_version) {
       input_dex_version = std::max(input_dex_version, 37);
     }
-    FALLTHROUGH_INTENDED; /* intentional fallthrough to also check for v35 */
+    [[fallthrough]]; /* intentional fallthrough to also check for v35 */
   case 35:
     is_this_dex_version =
         memcmp(dh->magic, DEX_HEADER_DEXMAGIC_V35, sizeof(dh->magic)) == 0;

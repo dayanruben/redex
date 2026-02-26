@@ -12,7 +12,6 @@
 #include "DexIdx.h"
 #include "DexMethodHandle.h"
 #include "DexOutput.h"
-#include "Macros.h"
 #include "Show.h"
 #include "Trace.h"
 #include "Warning.h"
@@ -843,7 +842,7 @@ DexInstruction* DexInstruction::make_instruction(DexIdx* idx,
     // While nops allow any upper byte (except the ones above), we do not want
     // to distinguish that.
     fopcode = DexOpcode::DOPCODE_NOP;
-    FALLTHROUGH_INTENDED;
+    [[fallthrough]];
   case DOPCODE_MOVE:
   case DOPCODE_MOVE_WIDE:
   case DOPCODE_MOVE_OBJECT:

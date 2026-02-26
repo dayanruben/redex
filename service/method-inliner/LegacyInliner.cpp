@@ -179,7 +179,7 @@ class MethodSplicer {
         return true;
       }
     }
-      FALLTHROUGH_INTENDED;
+      [[fallthrough]];
     default:
       return false;
     }

@@ -70,7 +70,7 @@ bool make_hot_tail_unique(cfg::ControlFlowGraph& cfg,
                      *target_succ->case_key());
         break;
       }
-      FALLTHROUGH_INTENDED;
+      [[fallthrough]];
     case cfg::EDGE_GOTO:
     case cfg::EDGE_GHOST:
       cfg.add_edge(target_copy, target_succ->target(), target_succ->type());

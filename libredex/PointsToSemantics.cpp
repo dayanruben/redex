@@ -32,7 +32,6 @@
 #include "IRCode.h"
 #include "IRInstruction.h"
 #include "IROpcode.h"
-#include "Macros.h"
 #include "PointsToSemanticsUtils.h"
 #include "Show.h"
 #include "Trace.h"
@@ -1021,7 +1020,7 @@ class PointsToActionGenerator final {
       }
       // Otherwise, we fall through to the generic case.
     }
-      FALLTHROUGH_INTENDED;
+      [[fallthrough]];
     case OPCODE_NEW_ARRAY:
     case OPCODE_FILLED_NEW_ARRAY: {
       m_semantics->add(PointsToAction::load_operation(
