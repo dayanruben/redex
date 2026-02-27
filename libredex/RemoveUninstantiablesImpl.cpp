@@ -139,7 +139,7 @@ Stats replace_uninstantiable_refs(
     case OPCODE_INVOKE_SUPER:
       // Note that we don't want to call resolve_method here: The most precise
       // class information is already present in the supplied method reference,
-      // which gives us the best change of finding an uninstantiable type.
+      // which gives us the best chance of finding an uninstantiable type.
       if (scoped_uninstantiable_types.count(insn->get_method()->get_class()) !=
           0u) {
         m.replace(it, npe_creator.get_insns(insn));
@@ -253,7 +253,7 @@ Stats reduce_uncallable_instance_methods(
                    !is_implementation_method(method)) {
           // We require same visibility, as we are going to remove the method
           // and rewrite all references to the overridden method. TODO: Consider
-          // upgrading the visibility of the overriden method.
+          // upgrading the visibility of the overridden method.
           always_assert(overridden_method != method);
           class_post_processing.update(
               type_class(method->get_class()),
@@ -275,7 +275,7 @@ Stats reduce_uncallable_instance_methods(
       uncallable_instance_methods);
 
   // Post-processing:
-  // 1. make methods abstract (stretty straightforward), and
+  // 1. make methods abstract (pretty straightforward), and
   // 2. remove methods (per class in parallel for best performance, and rewrite
   // all invocation references)
   std::vector<DexClass*> classes_with_removed_vmethods;
