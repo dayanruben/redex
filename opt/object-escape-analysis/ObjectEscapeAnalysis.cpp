@@ -54,7 +54,6 @@
 #include "GlobalConfig.h"
 #include "IRInstruction.h"
 #include "Inliner.h"
-#include "InlinerConfig.h"
 #include "LinearScan.h"
 #include "MutablePriorityQueue.h"
 #include "ObjectEscapeAnalysisImpl.h"

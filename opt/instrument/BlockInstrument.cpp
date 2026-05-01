@@ -25,7 +25,6 @@
 #include "GlobalConfig.h"
 #include "InitClassesWithSideEffects.h"
 #include "Inliner.h"
-#include "InlinerConfig.h"
 #include "LoopInfo.h"
 #include "RedexContext.h"
 #include "ScopedMetrics.h"

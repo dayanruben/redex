@@ -15,7 +15,6 @@
 #include "ScopeHelper.h"
 #include "SourceBlocks.h"
 #include "TypeUtil.h"
-#include "VirtualScope.h"
 #include "Walkers.h"
 
 namespace {

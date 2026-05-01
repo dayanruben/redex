@@ -16,7 +16,6 @@
 #include "DexAccess.h"
 #include "DexCallSite.h"
 #include "DexDefs.h"
-#include "DexMethodHandle.h"
 #include "Show.h"
 #include "Trace.h"
 #include "Walkers.h"
