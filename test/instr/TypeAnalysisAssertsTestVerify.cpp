@@ -7,7 +7,6 @@
 
 #include <gtest/gtest.h>
 
-#include "DexInstruction.h"
 #include "VerifyUtil.h"
 
 TEST_F(PreVerify, NoTypeChecks) {

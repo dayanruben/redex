@@ -7,7 +7,6 @@
 
 #include <gtest/gtest.h>
 
-#include "DexInstruction.h"
 #include "IRCode.h"
 #include "Show.h"
 #include "VerifyUtil.h"
