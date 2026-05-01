@@ -6,7 +6,6 @@
  */
 
 #include <functional>
-#include <gmock/gmock.h>
 #include <gtest/gtest.h>
 #include <thread>
 #include <unordered_map>
