@@ -9,7 +9,6 @@
 
 #include <fstream>
 #include <optional>
-#include <sstream>
 #include <string>
 
 #include "ConfigFiles.h"
