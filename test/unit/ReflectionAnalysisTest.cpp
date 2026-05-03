@@ -8,7 +8,6 @@
 #include <gtest/gtest.h>
 #include <sstream>
 #include <string>
-#include <unordered_set>
 
 #include "DexClass.h"
 #include "IRAssembler.h"

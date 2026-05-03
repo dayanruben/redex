@@ -7,7 +7,6 @@
 
 #include "gtest/gtest.h"
 #include <memory>
-#include <unordered_set>
 
 #include "IRCode.h"
 #include "RearrangeEnumClinit.h"
