@@ -10,7 +10,6 @@
 
 #include <algorithm>
 #include <initializer_list>
-#include <ranges>
 #include <string_view>
 
 #include <gmock/gmock.h>
