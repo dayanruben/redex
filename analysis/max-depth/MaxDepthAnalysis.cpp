@@ -8,7 +8,6 @@
 #include "MaxDepthAnalysis.h"
 
 #include <sparta/AbstractDomain.h>
-#include <sparta/ConstantAbstractDomain.h>
 #include <sparta/HashedSetAbstractDomain.h>
 
 #include "Debug.h"

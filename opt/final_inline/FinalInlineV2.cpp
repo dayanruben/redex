@@ -9,8 +9,6 @@
 
 #include <vector>
 
-#include <sparta/WeakTopologicalOrdering.h>
-
 #include "CFGMutation.h"
 #include "ConfigFiles.h"
 #include "ConstantPropagationState.h"

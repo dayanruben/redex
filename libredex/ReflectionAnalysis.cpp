@@ -12,7 +12,6 @@
 #include <iomanip>
 #include <ostream>
 
-#include <sparta/FiniteAbstractDomain.h>
 #include <sparta/PatriciaTreeMapAbstractEnvironment.h>
 #include <sparta/ReducedProductAbstractDomain.h>
 
