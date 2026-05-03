@@ -7,7 +7,6 @@
 
 #include "LocalDce.h"
 
-#include <array>
 #include <vector>
 
 #include "CFGMutation.h"
