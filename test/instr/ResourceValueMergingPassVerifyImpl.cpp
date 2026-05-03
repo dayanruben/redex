@@ -11,7 +11,6 @@
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 #include <string>
-#include <unordered_map>
 #include <unordered_set>
 using ::testing::SizeIs;
 
