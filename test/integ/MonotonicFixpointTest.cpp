@@ -6,7 +6,6 @@
  */
 
 #include <cstring>
-#include <functional>
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 #include <iostream>

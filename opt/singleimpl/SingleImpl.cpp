@@ -7,7 +7,6 @@
 
 #include "SingleImpl.h"
 
-#include <functional>
 #include <memory>
 #include <stdio.h>
 #include <string>

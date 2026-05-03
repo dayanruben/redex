@@ -8,7 +8,6 @@
 #include "ConcurrentContainers.h"
 
 #include <cstdint>
-#include <functional>
 #include <gtest/gtest.h>
 #include <utility>
 #include <vector>

@@ -5,7 +5,6 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-#include <functional>
 #include <gtest/gtest.h>
 #include <thread>
 #include <unordered_map>
