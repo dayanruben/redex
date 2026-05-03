@@ -9,7 +9,6 @@
 
 #include <cstdint>
 #include <gtest/gtest.h>
-#include <utility>
 #include <vector>
 
 #include <boost/thread/thread.hpp> // NOLINT
