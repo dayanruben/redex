@@ -7,7 +7,6 @@
 
 #include <map>
 #include <string>
-#include <vector>
 
 #include "Debug.h"
 #include "DeterministicContainers.h"
