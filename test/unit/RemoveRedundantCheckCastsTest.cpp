@@ -8,7 +8,6 @@
 #include "RemoveRedundantCheckCasts.h"
 
 #include <gtest/gtest.h>
-#include <iterator>
 #include <utility>
 
 #include "Creators.h"

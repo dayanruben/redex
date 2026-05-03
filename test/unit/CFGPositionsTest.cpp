@@ -13,7 +13,6 @@
 #include "RedexTest.h"
 
 #include <functional>
-#include <iterator>
 
 using namespace cfg;
 using namespace dex_asm;

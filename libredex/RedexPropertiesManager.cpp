@@ -8,7 +8,6 @@
 #include "RedexPropertiesManager.h"
 
 #include <algorithm>
-#include <iterator>
 #include <sstream>
 
 #include <json/value.h>
