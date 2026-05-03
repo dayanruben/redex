@@ -11,7 +11,6 @@
 #include <cinttypes>
 #include <cstring>
 #include <limits>
-#include <set>
 #include <type_traits>
 
 #include "ControlFlow.h"

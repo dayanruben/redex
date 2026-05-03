@@ -7,7 +7,6 @@
 
 #include <functional>
 #include <memory>
-#include <set>
 #include <stdio.h>
 #include <string>
 
