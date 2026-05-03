@@ -11,7 +11,6 @@
 #include <cinttypes>
 #include <cstring>
 #include <limits>
-#include <mutex>
 #include <set>
 #include <type_traits>
 
