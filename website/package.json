@@ -32,7 +32,7 @@
   "resolutions": {
     "on-headers": "^1.1.0",
     "brace-expansion": "^1.1.13",
-    "mermaid": "^11.10.0",
+    "mermaid": "^11.15.0",
     "minimatch": ">=3.1.5",
     "webpack-dev-server": "^5.2.1",
     "estree-util-value-to-estree": "^3.3.3",
