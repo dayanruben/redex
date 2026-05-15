@@ -943,7 +943,8 @@ void move_vector_elements(std::vector<T>& from, std::vector<T>& to) {
 void parse(const std::vector<Token>& vec,
            ProguardConfiguration* pg_config,
            Stats& stats,
-           const std::string& filename) {
+           const std::string& filename,
+           Diagnostics* diagnostics) {
   TokenIndex idx{vec, vec.begin()};
 
   auto check_empty = [&stats](const auto& val) {
@@ -972,6 +973,10 @@ void parse(const std::vector<Token>& vec,
       std::cerr << "Expecting command but found " << idx.show() << " at line "
                 << idx.line() << '\n'
                 << idx.show_context(2) << '\n';
+      if (diagnostics != nullptr) {
+        diagnostics->unknown_commands.push_back(
+            {idx.show(), filename, (uint32_t)idx.line(), idx.show_context(2)});
+      }
       idx.next();
       skip_to_next_command(idx);
       ++stats.unknown_commands;
@@ -1173,6 +1178,11 @@ void parse(const std::vector<Token>& vec,
         std::cerr << "Unimplemented command (skipping): " << idx.show()
                   << " at line " << idx.line() << '\n'
                   << idx.show_context(2) << '\n';
+        if (diagnostics != nullptr) {
+          diagnostics->skipped_commands.push_back({idx.show(), filename,
+                                                   (uint32_t)idx.line(),
+                                                   idx.show_context(2)});
+        }
         ++stats.unimplemented;
       }
       idx.next();
@@ -1236,7 +1246,8 @@ void parse(const std::vector<Token>& vec,
 
 Stats parse(const std::string_view& config,
             ProguardConfiguration* pg_config,
-            const std::string& filename) {
+            const std::string& filename,
+            Diagnostics* diagnostics) {
   Stats ret{};
 
   std::vector<Token> tokens = lex(config);
@@ -1258,7 +1269,7 @@ Stats parse(const std::string_view& config,
     return ret;
   }
 
-  parse(tokens, pg_config, ret, filename);
+  parse(tokens, pg_config, ret, filename, diagnostics);
   if (ret.parse_errors == 0) {
     pg_config->ok = ok;
   } else {
@@ -1270,22 +1281,41 @@ Stats parse(const std::string_view& config,
   return ret;
 }
 
+Stats parse(const std::string_view& config,
+            ProguardConfiguration* pg_config,
+            const std::string& filename) {
+  return parse(config, pg_config, filename, /* diagnostics */ nullptr);
+}
+
 } // namespace
 
 Stats parse(std::istream& config,
             ProguardConfiguration* pg_config,
             const std::string& filename) {
+  return parse(config, pg_config, filename, /* diagnostics */ nullptr);
+}
+
+Stats parse(std::istream& config,
+            ProguardConfiguration* pg_config,
+            const std::string& filename,
+            Diagnostics* diagnostics) {
   std::stringstream buffer;
   buffer << config.rdbuf();
-  return parse(buffer.str(), pg_config, filename);
+  return parse(buffer.str(), pg_config, filename, diagnostics);
 }
 
 Stats parse_file(const std::string& filename,
                  ProguardConfiguration* pg_config) {
+  return parse_file(filename, pg_config, /* diagnostics */ nullptr);
+}
+
+Stats parse_file(const std::string& filename,
+                 ProguardConfiguration* pg_config,
+                 Diagnostics* diagnostics) {
   Stats ret{};
   redex::read_file_with_contents(filename, [&](const char* data, size_t s) {
     std::string_view view(data, s);
-    ret += parse(view, pg_config, filename);
+    ret += parse(view, pg_config, filename, diagnostics);
     // Parse the included files.
     for (const auto& included_filename : pg_config->includes) {
       if (pg_config->already_included.find(included_filename) !=
@@ -1293,7 +1323,7 @@ Stats parse_file(const std::string& filename,
         continue;
       }
       pg_config->already_included.emplace(included_filename);
-      ret += parse_file(included_filename, pg_config);
+      ret += parse_file(included_filename, pg_config, diagnostics);
     }
   });
   return ret;

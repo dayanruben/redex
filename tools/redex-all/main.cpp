@@ -19,6 +19,7 @@
 #include <optional>
 #include <set>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include <fcntl.h>
@@ -66,6 +67,7 @@
 #include "ProguardMatcher.h"
 #include "ProguardParser.h" // New ProGuard Parser
 #include "ProguardPrintConfiguration.h" // New ProGuard configuration
+#include "ProguardReporting.h"
 #include "ReachableClasses.h"
 #include "RedexContext.h"
 #include "RedexProperties.h"
@@ -1184,10 +1186,16 @@ void dump_keep_reasons(const ConfigFiles& conf,
   }
 }
 
-void process_proguard_rules(ConfigFiles& conf,
-                            Scope& scope,
-                            Scope& external_classes,
-                            keep_rules::ProguardConfiguration& pg_config) {
+void process_proguard_rules(
+    ConfigFiles& conf,
+    const DexStoresVector& stores,
+    Scope& scope,
+    Scope& external_classes,
+    keep_rules::ProguardConfiguration& pg_config,
+    bool dump_proguard_lens,
+    const keep_rules::proguard_parser::Stats& parser_stats,
+    const keep_rules::proguard_parser::Diagnostics& parser_diagnostics,
+    size_t blocklisted_rules) {
   bool keep_all_annotation_classes;
   conf.get_json_config().get("keep_all_annotation_classes", true,
                              keep_all_annotation_classes);
@@ -1226,6 +1234,17 @@ void process_proguard_rules(ConfigFiles& conf,
                         }()
                             .c_str());
     }
+  }
+  if (dump_proguard_lens) {
+    redex::dump_proguard_lens_json(
+        conf.metafile("redex-proguard-lens-initial.json"),
+        stores,
+        "initial",
+        &pg_config,
+        &proguard_rule_recorder,
+        &parser_stats,
+        &parser_diagnostics,
+        blocklisted_rules);
   }
 }
 
@@ -1330,16 +1349,20 @@ void redex_frontend(ConfigFiles& conf, /* input */
                     Arguments& args, /* inout */
                     keep_rules::ProguardConfiguration& pg_config,
                     DexStoresVector& stores,
+                    bool dump_proguard_lens,
                     Json::Value& stats) {
   Timer redex_frontend_timer("Redex_frontend");
 
   g_redex->load_pointers_cache();
 
   keep_rules::proguard_parser::Stats parser_stats{};
+  keep_rules::proguard_parser::Diagnostics parser_diagnostics{};
   for (const auto& pg_config_path : args.proguard_config_paths) {
     Timer time_pg_parsing("Parsed ProGuard config file");
-    parser_stats +=
-        keep_rules::proguard_parser::parse_file(pg_config_path, &pg_config);
+    parser_stats += keep_rules::proguard_parser::parse_file(
+        pg_config_path,
+        &pg_config,
+        dump_proguard_lens ? &parser_diagnostics : nullptr);
   }
 
   size_t blocklisted_rules{0};
@@ -1447,7 +1470,15 @@ void redex_frontend(ConfigFiles& conf, /* input */
     init_reachable_classes(scope, ReachableClassesConfig(json_config));
   });
   Timer::scope("Processing proguard rules", [&] {
-    process_proguard_rules(conf, scope, external_classes, pg_config);
+    process_proguard_rules(conf,
+                           stores,
+                           scope,
+                           external_classes,
+                           pg_config,
+                           dump_proguard_lens,
+                           parser_stats,
+                           parser_diagnostics,
+                           blocklisted_rules);
   });
 
   TRACE(NATIVE, 2, "Blanket native classes: %zu",
@@ -2073,10 +2104,13 @@ int main(int argc, char* argv[]) {
       }
     }
 
+    bool dump_proguard_lens =
+        args.config.get("dump_proguard_lens", false).asBool();
+
     {
       auto profile_frontend =
           ScopedCommandProfiling::maybe_from_env("FRONTEND_", "frontend");
-      redex_frontend(conf, args, *pg_config, stores, stats);
+      redex_frontend(conf, args, *pg_config, stores, dump_proguard_lens, stats);
       conf.parse_global_config();
       if (args.redex_options.instrument_pass_enabled) {
         auto* global_resources_config =
@@ -2119,6 +2153,11 @@ int main(int argc, char* argv[]) {
       manager.run_passes(stores, conf);
       maybe_dump_jemalloc_profile("MALLOC_PROFILE_DUMP_AFTER_ALL_PASSES");
     });
+
+    if (dump_proguard_lens) {
+      redex::dump_proguard_lens_json(
+          conf.metafile("redex-proguard-lens-final.json"), stores, "final");
+    }
 
     if (args.stop_pass_idx == std::nullopt) {
       // Call redex_backend by default
