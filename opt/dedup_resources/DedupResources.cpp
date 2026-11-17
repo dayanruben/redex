@@ -18,6 +18,7 @@
 #include "OptimizeResources.h"
 #include "PassManager.h"
 #include "RClass.h"
+#include "ReachableResources.h"
 #include "ReadMaybeMapped.h"
 #include "RedexResources.h"
 #include "Timer.h"
@@ -408,10 +409,10 @@ void DedupResourcesPass::prepare_disallowed_ids(
   auto types = res_table->get_types_by_name(m_disallowed_types);
   insert_unordered_iterable(*disallowed_types, types);
 
-  for (const std::string& n : UnorderedIterable(m_disallowed_resources)) {
-    const auto& v = res_table->get_res_ids_by_name(n);
-    disallowed_ids->insert(v.begin(), v.end());
-  }
+  auto disallowed_by_name = resources::get_resources_by_prefix_and_name(
+      m_disallowed_resource_prefixes, m_disallowed_resources,
+      res_table->name_to_ids);
+  insert_unordered_iterable(*disallowed_ids, disallowed_by_name);
   // Overlayable ids, keep as-is.
   auto overlayable_ids = res_table->get_overlayable_id_roots();
   insert_unordered_iterable(*disallowed_ids, overlayable_ids);
@@ -428,9 +429,29 @@ void DedupResourcesPass::prepare_disallowed_ids(
 
 void DedupResourcesPass::eval_pass(DexStoresVector& /*stores*/,
                                    ConfigFiles& conf,
-                                   PassManager&) {
+                                   PassManager& mgr) {
   auto& plugin_registery = opt_res::ReachableResourcesPluginRegistry::get();
   plugin_registery.configure_plugins(conf);
+
+  // The app may look up by name any resource that the last
+  // OptimizeResourcesPass (or an alias of it, such as
+  // NullifyOptimizeResourcesPass) assumes reachable, so keep those names. The
+  // app cannot rely on looking up any other name: that pass empties or deletes
+  // such resources when no code references them.
+  const OptimizeResourcesPass* last_removal_pass = nullptr;
+  for (const auto& info : mgr.get_pass_info()) {
+    if (const auto* pass =
+            dynamic_cast<const OptimizeResourcesPass*>(info.pass)) {
+      last_removal_pass = pass;
+    }
+  }
+  if (last_removal_pass != nullptr) {
+    const auto& prefixes = last_removal_pass->assume_reachable_prefixes();
+    m_disallowed_resource_prefixes.insert(m_disallowed_resource_prefixes.end(),
+                                          prefixes.begin(), prefixes.end());
+    TRACE(DEDUP_RES, 2, "Keeping %zu name prefix(es) assumed reachable by %s",
+          prefixes.size(), last_removal_pass->name().c_str());
+  }
 }
 
 void DedupResourcesPass::run_pass(DexStoresVector& stores,
