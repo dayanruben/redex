@@ -592,8 +592,10 @@ class OptimizeEnums {
   /**
    * There is usually one synthetic static field in enum class, typically named
    * "$VALUES", but also may be renamed.
-   * Return true if there is only one static synthetic field in the class,
-   * otherwise return false.
+   * Return true if the class has exactly one static synthetic field and it is
+   * the values array, otherwise return false. Boxing deletes that field as the
+   * values array, so another one, like javac's `$assertionsDisabled` once the
+   * values array was removed, must keep the enum.
    */
   bool only_one_static_synth_field(const DexClass* cls) {
     DexField* synth_field = nullptr;
@@ -610,6 +612,11 @@ class OptimizeEnums {
     }
     if (synth_field == nullptr) {
       TRACE(ENUM, 2, "No synthetic field found on %s", SHOW(cls));
+      return false;
+    }
+    if (!optimize_enums::is_enum_values_field(synth_field)) {
+      TRACE(ENUM, 2, "Synthetic field %s is not the values array",
+            SHOW(synth_field));
       return false;
     }
     return true;
@@ -860,7 +867,10 @@ class OptimizeEnums {
     const optimize_enums::OptimizeEnumsUnmap unmap(enum_field_to_ordinal,
                                                    generated_switch_cases);
 
-    walk::parallel::code(m_scope, [&](DexMethod*, IRCode& code) {
+    walk::parallel::code(m_scope, [&](DexMethod* method, IRCode& code) {
+      if (method->rstate.no_optimizations()) {
+        return;
+      }
       cfg::ControlFlowGraph& cfg = code.cfg();
       cfg.calculate_exit_block();
       unmap.unmap_switchmaps(cfg);

@@ -64,6 +64,7 @@ check_PROGRAMS = \
     class_checker_test \
     class_merging_fields_test \
     class_merging_hot_cold_grouping_test \
+    class_merging_models_test \
     class_order_sample_test \
     check_breadcrumbs_test \
     check_cast_analysis_test \
@@ -229,8 +230,8 @@ check_PROGRAMS = \
     unique_method_tracker_test \
     up_code_motion_test \
     used_vars_test \
-    vertical_merging_no_optimizations_test \
     vertical_merging_r_class_test \
+    vertical_merging_test \
     vertical_merging_type_lookup_test \
     virtual_merging_test \
     virtual_scopes_test \
@@ -314,6 +315,9 @@ class_merging_fields_test_SOURCES = \
 
 class_merging_hot_cold_grouping_test_SOURCES = \
     ClassMergingHotColdGroupingTest.cpp ScopeHelper.cpp
+
+class_merging_models_test_SOURCES = \
+    ClassMergingModelsTest.cpp ScopeHelper.cpp
 
 concurrent_containers_test_SOURCES = ConcurrentContainersTest.cpp
 
@@ -705,9 +709,9 @@ up_code_motion_test_LDADD = $(COMMON_MOCK_TEST_LIBS)
 used_vars_test_SOURCES = object-sensitive-dce/UsedVarsTest.cpp
 used_vars_test_LDADD = $(COMMON_MOCK_TEST_LIBS)
 
-vertical_merging_no_optimizations_test_SOURCES = VerticalMergingNoOptimizationsTest.cpp
-
 vertical_merging_r_class_test_SOURCES = VerticalMergingRClassTest.cpp
+
+vertical_merging_test_SOURCES = VerticalMergingTest.cpp
 
 vertical_merging_type_lookup_test_SOURCES = VerticalMergingTypeLookupTest.cpp
 
