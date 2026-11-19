@@ -15,3 +15,7 @@ See [CONTRIBUTING.md](https://github.com/facebook/redex/blob/master/CONTRIBUTING
 ## License
 
 The ReDex repository is available under the [MIT License](https://github.com/facebook/redex/blob/master/LICENSE).
+
+## Fork website validation
+
+The website uses tested security resolutions for its documentation dependencies and requires Node.js 22 or newer. From `website`, run `yarn install --frozen-lockfile` and `yarn build`. The workflow retains website builds and artifact validation in forks; GitHub Pages deployment runs only in `facebook/redex`.
