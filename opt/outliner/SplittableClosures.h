@@ -8,6 +8,7 @@
 #pragma once
 
 #include <atomic>
+#include <compare>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -21,6 +22,7 @@
 #include "MethodSplittingStats.h"
 #include "NeverInlineEligibility.h"
 #include "RefChecker.h"
+#include "RegionPlan.h"
 
 namespace api {
 class AndroidSDK;
@@ -55,6 +57,69 @@ class StoreRefCheckers {
   std::vector<std::unique_ptr<RefChecker>> m_ref_checkers;
 };
 
+// Where a candidate ranks in phase-2 selection and in its dex's emission
+// order. Emission ranks suffixes by `key`, the size product `split_size *
+// original_size / (split_size + remaining_size)`.
+struct SelectionRank {
+  double key;
+  // How many nodes of the reduced CFG (which collapses each loop into one node)
+  // a suffix holds; a suffix that holds another's entry contains it, and so
+  // holds more.
+  size_t suffix_nodes;
+};
+
+// The order of two ranks, `less` when `a` goes first: the larger key goes
+// first.
+std::weak_ordering compare_rank(const SelectionRank& a, const SelectionRank& b);
+
+// The order of two candidates of one method whose ranks are equivalent: a
+// single entry before a switch group, then by id.
+template <typename Candidate>
+bool precedes_by_identity(const Candidate& a, const Candidate& b) {
+  if (a.is_switch() != b.is_switch()) {
+    return a.is_switch() < b.is_switch();
+  }
+  return a.id() < b.id();
+}
+
+// The orders candidates are visited in once their ranks are set.
+enum class CandidateOrder : uint8_t {
+  // Phase-2 selection over one method's candidates. The size keys are not read:
+  // a suffix that holds another's entry contains it and holds more nodes, so
+  // candidates holding more go first.
+  Selection,
+  // Emission over one dex's selected candidates: by rank, then by method,
+  // then a single entry before a switch group, then by DESCENDING id, which
+  // keeps the names suffix splits get. Split names are numbered in this order.
+  Emission,
+};
+
+// Whether `a` goes before `b` in `Order`. In selection, `precedes_by_identity`
+// decides the candidates the order's rule leaves tied.
+template <CandidateOrder Order, typename Candidate>
+bool precedes(const Candidate& a, const Candidate& b) {
+  if constexpr (Order == CandidateOrder::Selection) {
+    if (a.rank.suffix_nodes != b.rank.suffix_nodes) {
+      return a.rank.suffix_nodes > b.rank.suffix_nodes;
+    }
+    return precedes_by_identity(a, b);
+  } else {
+    const auto order = compare_rank(a.rank, b.rank);
+    if (std::is_neq(order)) {
+      return std::is_lt(order);
+    }
+    const auto* a_method = a.method_closures->method;
+    const auto* b_method = b.method_closures->method;
+    if (a_method != b_method) {
+      return compare_dexmethods(a_method, b_method);
+    }
+    if (a.is_switch() != b.is_switch()) {
+      return a.is_switch() < b.is_switch();
+    }
+    return a.id() > b.id();
+  }
+}
+
 // Represents a single argument to a method closure. It must either have a type,
 // to pass the register value through a parameter, or a simple definition, which
 // must be const opcode.
@@ -75,12 +140,16 @@ struct SplittableClosure {
   // `switch_block` takes the switch's edges into these blocks.
   UnorderedSet<cfg::BlockId> grouped_heads;
   std::vector<ClosureArgument> args;
-  double rank;
+  SelectionRank rank;
+  SplitKind kind{SplitKind::Suffix};
   size_t added_code_size;
   std::optional<HotSplitKind> hot_split_kind;
   bool is_large_packed_switch{false};
   bool creates_large_sparse_switch{false};
   bool destroys_large_packed_switch{false};
+  // The region split's shape. Set when this closure was produced by
+  // `RegionStrategy`; nullopt for suffix closures.
+  std::optional<RegionPlan> region_plan;
   // The net saving of a net-gated candidate, carried to emission, where the
   // candidate's fate is recorded with it.
   std::optional<ClosureNetTerms> net_terms;
@@ -91,6 +160,8 @@ struct SplittableClosure {
   bool below_legacy_floors{false};
 
   int is_switch() const { return switch_block != nullptr ? 1 : 0; }
+
+  bool is_region() const { return kind == SplitKind::Region; }
 
   // id is unique among all splittable closures where is_switch() is the same.
   size_t id() const {

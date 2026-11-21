@@ -12,6 +12,7 @@
 
 #include <gtest/gtest.h>
 
+#include "ArtTypeCheck.h"
 #include "MethodClosures.h"
 #include "MethodProfiles.h"
 #include "MethodSplitter.h"
@@ -22,6 +23,7 @@
 #include "DeterministicContainers.h"
 #include "DexClass.h"
 #include "IRAssembler.h"
+#include "IRTypeChecker.h"
 #include "RedexTest.h"
 #include "Show.h"
 #include "SourceBlocks.h"
@@ -97,6 +99,7 @@ class MethodSplitterTest : public RedexTest {
     if (no_outlining) {
       m->rstate.set_no_outlining();
     }
+    const method_splitting_test::ArtTypeCheckOfOutput art_check({m});
     DexStoresVector stores;
     stores.emplace_back("test_store");
     DexClasses dex{cls};
@@ -122,6 +125,12 @@ class MethodSplitterTest : public RedexTest {
       method_splitting_impl::split_methods_in_stores(stores, env, config,
                                                      &stats);
     }
+    std::vector<DexMethod*> output{m};
+    for (const auto& [out, kind] : stats.added_methods) {
+      (void)kind;
+      output.push_back(out);
+    }
+    EXPECT_EQ(art_check.violations(output), "");
     // Every candidate is recorded once, at its final fate.
     const auto fates = stats.snapshot().suffix_fates;
     EXPECT_EQ(fates.recorded(), fates.candidates);
@@ -192,8 +201,15 @@ class MethodSplitterTest : public RedexTest {
     stores.front().get_dexen().push_back({cls});
     auto env = method_splitting_test::split_environment(
         stores, /* normal_primary_dex */ true);
+    const method_splitting_test::ArtTypeCheckOfOutput art_check({m});
     method_splitting_impl::Stats stats;
     method_splitting_impl::split_methods_in_stores(stores, env, config, &stats);
+    std::vector<DexMethod*> output{m};
+    for (const auto& [out, kind] : stats.added_methods) {
+      (void)kind;
+      output.push_back(out);
+    }
+    EXPECT_EQ(art_check.violations(output), "");
     const auto fates = stats.snapshot().suffix_fates;
     EXPECT_EQ(fates.recorded(), fates.candidates);
     return stats.added_methods.size();
@@ -396,6 +412,47 @@ TEST_F(MethodSplitterTest, KeepsConstructorCodeBeforeReceiverInitialization) {
   method_splitting_impl::split_methods_in_stores(stores, env, defaultConfig(),
                                                  &stats);
   EXPECT_EQ(stats.added_methods.size(), 0);
+}
+
+// Every candidate is evaluated, including one that a larger kept candidate
+// contains, so a contained candidate that fails evaluation is counted under
+// that failure. The tail from the block computing v1 and v2 reads only v0, and
+// it contains the later tails, each of which reads more values than
+// `max_live_in` allows except the last.
+TEST_F(MethodSplitterTest, ContainedCandidateIsCountedByItsEvaluationFailure) {
+  auto [cls, m] = create("(I)I", R"(
+    (
+      (load-param v0)
+      (add-int v0 v0 v0)
+      (add-int v0 v0 v0)
+      (add-int v1 v0 v0)
+      (add-int v2 v0 v0)
+      (add-int v3 v0 v0)
+      (add-int v4 v0 v0)
+      (add-int v5 v0 v0)
+      (add-int v0 v1 v2)
+      (add-int v0 v0 v3)
+      (add-int v0 v0 v4)
+      (add-int v0 v0 v5)
+      (return v0)
+    )
+  )");
+  m->get_code()->build_cfg();
+  DexStoresVector stores;
+  stores.emplace_back("test_store");
+  stores.front().get_dexen().push_back({cls});
+  auto env = method_splitting_test::split_environment(
+      stores, /* normal_primary_dex */ true);
+  auto config = defaultConfig();
+  config.max_live_in = 2;
+  method_splitting_impl::Stats stats;
+  method_splitting_impl::split_methods_in_stores(stores, env, config, &stats);
+  const auto fates = stats.snapshot().suffix_fates;
+  EXPECT_EQ(fates.recorded(), fates.candidates);
+  EXPECT_EQ(stats.added_methods.size(), 1u);
+  EXPECT_GT(
+      fates[method_splitting_impl::CandidateFate::Evaluation_TooManyLiveIns],
+      0u);
 }
 
 TEST_F(MethodSplitterTest, SplitPreselectedClosures) {
@@ -884,6 +941,118 @@ TEST_F(MethodSplitterTest, SplitSwitchPreferCasesWithSharedCode) {
   ASSERT_TRUE(res);
 }
 
+// A suffix is still split when a switch group selected before it holds the
+// entry of a case that the suffix also holds. The group redirects only the
+// switch's edges into its cases and leaves the edge from `:other` into `:d` in
+// place, so both splits keep a caller, and the blocks they share are copied
+// into both. `:other` enters the `:d` case from outside the switch, so its
+// suffix holds that case's entry without holding the switch.
+TEST_F(MethodSplitterTest, SuffixHoldingAGroupEntryIsStillSplit) {
+  const auto* code = R"(
+    (
+      (load-param v0)
+      (load-param v1)
+      (goto :loop)
+    (:loop)
+      (if-eqz v1 :other)
+      (switch v0 (:a :b :c :d))
+    (:fallthrough)
+      (add-int v0 v0 v0)
+      (add-int v0 v0 v0)
+      (add-int v0 v0 v0)
+      (return v0)
+    (:a 0)
+      (add-int v0 v0 v0)
+      (goto :loop)
+    (:b 11)
+      (add-int v0 v0 v0)
+      (add-int v0 v0 v0)
+      (add-int v0 v0 v0)
+      (return v0)
+    (:c 22)
+      (add-int v0 v0 v0)
+      (add-int v0 v0 v0)
+      (add-int v0 v0 v0)
+      (return v0)
+    (:d 33)
+    (:d_body)
+      (add-int v0 v0 v0)
+      (add-int v0 v0 v0)
+      (add-int v0 v0 v0)
+      (if-eqz v1 :d2)
+      (goto :shared)
+    (:d2)
+      (add-int v0 v0 v0)
+      (add-int v0 v0 v0)
+      (add-int v0 v0 v0)
+      (goto :shared)
+    (:shared)
+      (add-int v0 v0 v0)
+      (add-int v0 v0 v0)
+      (add-int v0 v0 v0)
+      (return v0)
+    (:other)
+      (add-int v0 v0 v0)
+      (add-int v0 v0 v0)
+      (add-int v0 v0 v0)
+      (goto :d_body)
+    )
+  )";
+  auto [cls, m] = create("(II)I", code);
+  m->get_code()->build_cfg();
+  DexStoresVector stores;
+  stores.emplace_back("test_store");
+  stores.front().get_dexen().push_back({cls});
+  auto env = method_splitting_test::split_environment(
+      stores, /* normal_primary_dex */ true);
+  method_splitting_impl::Stats stats;
+  method_splitting_impl::split_methods_in_stores(stores, env, defaultConfig(),
+                                                 &stats);
+  // Three splits: the group, the `:b` case, and the suffix from `:other`. The
+  // group takes the fallthrough and cases 22 and 33, so it holds the entry of
+  // `:d` that the suffix from `:other` also holds: 15 `add-int`s, in the
+  // fallthrough, `:c`, `:d`, `:d2` and `:shared`. The suffix holds `:other`,
+  // both blocks of `:d` and `:shared`: 12 `add-int`s and no switch.
+  size_t groups = 0;
+  size_t other_suffixes = 0;
+  for (const auto& added : stats.added_methods) {
+    auto* split = added.first;
+    auto& cfg = split->get_code()->cfg();
+    // A split's CFG starts as a copy of its host's and can hold blocks it does
+    // not reach, which linearizing it drops. Count only what it reaches.
+    cfg.remove_unreachable_blocks();
+    size_t adds = 0;
+    for (const auto& mie : cfg::InstructionIterable(cfg)) {
+      adds += mie.insn->opcode() == OPCODE_ADD_INT ? 1 : 0;
+    }
+    bool has_switch = false;
+    std::vector<int32_t> case_keys;
+    for (auto* b : cfg.blocks()) {
+      auto last = b->get_last_insn();
+      if (last == b->end() || last->insn->opcode() != OPCODE_SWITCH) {
+        continue;
+      }
+      has_switch = true;
+      for (auto* e : b->succs()) {
+        if (e->case_key()) {
+          case_keys.push_back(*e->case_key());
+        }
+      }
+    }
+    std::sort(case_keys.begin(), case_keys.end());
+    if (has_switch) {
+      ++groups;
+      EXPECT_EQ(case_keys, (std::vector<int32_t>{22, 33}));
+      EXPECT_EQ(adds, 15u);
+    } else if (adds == 12) {
+      ++other_suffixes;
+    }
+  }
+  EXPECT_EQ(stats.added_methods.size(), 3u);
+  EXPECT_EQ(groups, 1u);
+  EXPECT_EQ(other_suffixes, 1u);
+}
+
 TEST_F(MethodSplitterTest, SplitSwitchPreferNotBreakingLargePackedSwitches) {
   const auto* before = R"(
     (
@@ -1228,6 +1397,268 @@ TEST_F(MethodSplitterTest, LoopHeadedSplitTypesLiveInsByTheDefsItIsPassed) {
   EXPECT_EQ(show(split->get_proto()), "(ILLoopA;)V");
 }
 
+namespace {
+
+// `LAcceptI;` with implementations `LAcceptA;` and `LAcceptB;`, and two
+// subclasses `LAcceptSub1;` and `LAcceptSub2;` of `LAcceptBase;`.
+std::vector<DexClass*> make_accept_classes() {
+  ClassCreator i_creator(DexType::make_type("LAcceptI;"));
+  i_creator.set_access(ACC_PUBLIC | ACC_INTERFACE | ACC_ABSTRACT);
+  i_creator.set_super(type::java_lang_Object());
+  auto* i_cls = i_creator.create();
+  std::vector<DexClass*> classes{i_cls};
+  for (const auto* name : {"LAcceptA;", "LAcceptB;"}) {
+    ClassCreator creator(DexType::make_type(name));
+    creator.set_access(ACC_PUBLIC);
+    creator.set_super(type::java_lang_Object());
+    creator.add_interface(i_cls->get_type());
+    classes.push_back(creator.create());
+  }
+  ClassCreator base_creator(DexType::make_type("LAcceptBase;"));
+  base_creator.set_access(ACC_PUBLIC);
+  base_creator.set_super(type::java_lang_Object());
+  auto* base_cls = base_creator.create();
+  classes.push_back(base_cls);
+  for (const auto* name : {"LAcceptSub1;", "LAcceptSub2;"}) {
+    ClassCreator creator(DexType::make_type(name));
+    creator.set_access(ACC_PUBLIC);
+    creator.set_super(base_cls->get_type());
+    classes.push_back(creator.create());
+  }
+  return classes;
+}
+
+// Floors under which the only candidate of the tests below is their cold loop.
+method_splitting_impl::Config loop_config() {
+  method_splitting_impl::Config config;
+  config.split_block_size = 100000;
+  config.min_original_size = 1;
+  config.min_original_size_hot_method = 1;
+  config.min_hot_split_size = 4;
+  config.min_hot_cold_split_size = 8;
+  config.min_cold_split_size = 8;
+  config.max_overhead_ratio = 0.5;
+  config.max_iteration = 1;
+  config.cost_split_method = 1;
+  config.cost_split_switch = 1;
+  config.min_large_switch_size = 0;
+  return config;
+}
+
+// Splits the methods of `cls`, with `extra` in the same store.
+void split_with(DexClass* cls,
+                const std::vector<DexClass*>& extra,
+                const method_splitting_impl::Config& config,
+                method_splitting_impl::Stats* stats) {
+  DexStoresVector stores;
+  stores.emplace_back("test_store");
+  DexClasses dex{cls};
+  dex.insert(dex.end(), extra.begin(), extra.end());
+  stores.front().get_dexen().push_back(std::move(dex));
+  auto env = method_splitting_test::split_environment(
+      stores, /* normal_primary_dex */ true);
+  method_splitting_impl::split_methods_in_stores(stores, env, config, stats);
+}
+
+} // namespace
+
+// The host passes `v2` as a boolean or 2, a `byte`, which a `char` rejects.
+TEST_F(MethodSplitterTest, LoopHeadedSplitRefusesALiveInItsUsesReject) {
+  auto [cls, m] = create("(IZ)V", R"(
+    (
+      (load-param v0)
+      (load-param v1)
+      (.src_block "LFoo;.bar:(IZ)V" 0 (1.0 1.0))
+      (mul-int v0 v0 v0)
+      (mul-int v0 v0 v0)
+      (mul-int v0 v0 v0)
+      (mul-int v0 v0 v0)
+      (move v2 v1)
+      (if-eqz v0 :two)
+    (:loop)
+      (.src_block "LFoo;.bar:(IZ)V" 2 (0.0 0.0))
+      (invoke-static (v2) "LFoo;.takeChar:(C)V")
+      (add-int v0 v0 v0)
+      (add-int v0 v0 v0)
+      (add-int v0 v0 v0)
+      (add-int v0 v0 v0)
+      (add-int v0 v0 v0)
+      (add-int v0 v0 v0)
+      (add-int v0 v0 v0)
+      (add-int v0 v0 v0)
+      (invoke-static () "LFoo;.nextChar:()C")
+      (move-result v2)
+      (if-nez v0 :loop)
+      (.src_block "LFoo;.bar:(IZ)V" 3 (0.0 0.0))
+      (sput v0 "LFoo;.i:I")
+      (return-void)
+    (:two)
+      (.src_block "LFoo;.bar:(IZ)V" 1 (1.0 1.0))
+      (const v2 2)
+      (goto :loop)
+    ))");
+  m->get_code()->build_cfg();
+  method_splitting_impl::Stats stats;
+  split_with(cls, {}, loop_config(), &stats);
+  EXPECT_TRUE(stats.added_methods.empty());
+  EXPECT_EQ(
+      stats.snapshot().suffix_fates
+          [method_splitting_impl::CandidateFate::Evaluation_LiveInUntypable],
+      1u);
+}
+
+// Fewer references, `long`s or `float`s never merge wider: the loop splits.
+TEST_F(MethodSplitterTest, LoopHeadedSplitAcceptsReferenceWideAndFloatLiveIns) {
+  auto extra = make_accept_classes();
+  auto [cls, m] = create("(ILAcceptA;LAcceptB;LAcceptSub1;LAcceptSub2;JF)V", R"(
+    (
+      (load-param v0)
+      (load-param-object v1)
+      (load-param-object v2)
+      (load-param-object v3)
+      (load-param-object v4)
+      (load-param-wide v5)
+      (load-param v7)
+      (.src_block "LFoo;.bar:(ILAcceptA;LAcceptB;LAcceptSub1;LAcceptSub2;JF)V" 0 (1.0 1.0))
+      (mul-int v0 v0 v0)
+      (mul-int v0 v0 v0)
+      (mul-int v0 v0 v0)
+      (mul-int v0 v0 v0)
+      (move-object v8 v1)
+      (move-object v9 v3)
+      (move-wide v10 v5)
+      (move v12 v7)
+      (if-eqz v0 :two)
+    (:loop)
+      (.src_block "LFoo;.bar:(ILAcceptA;LAcceptB;LAcceptSub1;LAcceptSub2;JF)V" 2 (0.0 0.0))
+      (invoke-static (v8) "LFoo;.takeI:(LAcceptI;)V")
+      (invoke-static (v9) "LFoo;.takeBase:(LAcceptBase;)V")
+      (invoke-static (v10) "LFoo;.takeLong:(J)V")
+      (invoke-static (v12) "LFoo;.takeFloat:(F)V")
+      (add-int v0 v0 v0)
+      (add-int v0 v0 v0)
+      (add-int v0 v0 v0)
+      (add-int v0 v0 v0)
+      (invoke-static () "LFoo;.nextI:()LAcceptI;")
+      (move-result-object v8)
+      (invoke-static () "LFoo;.nextBase:()LAcceptBase;")
+      (move-result-object v9)
+      (invoke-static () "LFoo;.nextLong:()J")
+      (move-result-wide v10)
+      (invoke-static () "LFoo;.nextFloat:()F")
+      (move-result v12)
+      (if-nez v0 :loop)
+      (.src_block "LFoo;.bar:(ILAcceptA;LAcceptB;LAcceptSub1;LAcceptSub2;JF)V" 3 (0.0 0.0))
+      (sput v0 "LFoo;.i:I")
+      (return-void)
+    (:two)
+      (.src_block "LFoo;.bar:(ILAcceptA;LAcceptB;LAcceptSub1;LAcceptSub2;JF)V" 1 (1.0 1.0))
+      (move-object v8 v2)
+      (move-object v9 v4)
+      (const-wide v10 7)
+      (const v12 0)
+      (goto :loop)
+    ))");
+  m->get_code()->build_cfg();
+  method_splitting_impl::Stats stats;
+  split_with(cls, extra, loop_config(), &stats);
+  ASSERT_EQ(stats.added_methods.size(), 1u);
+  auto* split = stats.added_methods.front().first;
+  EXPECT_EQ(show(split->get_proto()), "(ILAcceptI;LAcceptBase;JF)V");
+  for (auto* method : {m, split}) {
+    method->get_code()->cfg().simplify();
+    IRTypeChecker checker(method);
+    checker.run();
+    EXPECT_TRUE(checker.good()) << show(method) << ": " << checker.what();
+  }
+}
+
+// The host alone passes `A[]` or `B[]`, which merge to `Object[]`, not `I[]`.
+TEST_F(MethodSplitterTest,
+       LoopHeadedSplitRefusesAnInterfaceArrayItsCallMergesWider) {
+  auto extra = make_accept_classes();
+  auto [cls, m] = create("(I[LAcceptA;[LAcceptB;)V", R"(
+    (
+      (load-param v0)
+      (load-param-object v1)
+      (load-param-object v2)
+      (.src_block "LFoo;.bar:(I[LAcceptA;[LAcceptB;)V" 0 (1.0 1.0))
+      (mul-int v0 v0 v0)
+      (mul-int v0 v0 v0)
+      (mul-int v0 v0 v0)
+      (mul-int v0 v0 v0)
+      (move-object v8 v1)
+      (if-eqz v0 :two)
+    (:loop)
+      (.src_block "LFoo;.bar:(I[LAcceptA;[LAcceptB;)V" 2 (0.0 0.0))
+      (invoke-static (v8) "LFoo;.takeIs:([LAcceptI;)V")
+      (add-int v0 v0 v0)
+      (add-int v0 v0 v0)
+      (add-int v0 v0 v0)
+      (add-int v0 v0 v0)
+      (add-int v0 v0 v0)
+      (add-int v0 v0 v0)
+      (add-int v0 v0 v0)
+      (add-int v0 v0 v0)
+      (invoke-static () "LFoo;.nextIs:()[LAcceptI;")
+      (move-result-object v8)
+      (if-nez v0 :loop)
+      (.src_block "LFoo;.bar:(I[LAcceptA;[LAcceptB;)V" 3 (0.0 0.0))
+      (sput v0 "LFoo;.i:I")
+      (return-void)
+    (:two)
+      (.src_block "LFoo;.bar:(I[LAcceptA;[LAcceptB;)V" 1 (1.0 1.0))
+      (move-object v8 v2)
+      (goto :loop)
+    ))");
+  m->get_code()->build_cfg();
+  method_splitting_impl::Stats stats;
+  split_with(cls, extra, loop_config(), &stats);
+  EXPECT_TRUE(stats.added_methods.empty());
+  EXPECT_EQ(
+      stats.snapshot().suffix_fates
+          [method_splitting_impl::CandidateFate::Evaluation_LiveInUntypable],
+      1u);
+}
+
+// The host passes only the constant 65, which a `char` parameter holds.
+TEST_F(MethodSplitterTest, LoopHeadedSplitAdmitsAConstantItsParameterHolds) {
+  auto [cls, m] = create("(I)V", R"(
+    (
+      (load-param v0)
+      (.src_block "LFoo;.bar:(I)V" 0 (1.0 1.0))
+      (mul-int v0 v0 v0)
+      (mul-int v0 v0 v0)
+      (mul-int v0 v0 v0)
+      (mul-int v0 v0 v0)
+      (const v2 65)
+      (invoke-static (v2) "LFoo;.takeShort:(S)V")
+    (:loop)
+      (.src_block "LFoo;.bar:(I)V" 1 (0.0 0.0))
+      (invoke-static (v2) "LFoo;.takeChar:(C)V")
+      (add-int v0 v0 v0)
+      (add-int v0 v0 v0)
+      (add-int v0 v0 v0)
+      (add-int v0 v0 v0)
+      (add-int v0 v0 v0)
+      (add-int v0 v0 v0)
+      (add-int v0 v0 v0)
+      (add-int v0 v0 v0)
+      (invoke-static () "LFoo;.nextChar:()C")
+      (move-result v2)
+      (if-nez v0 :loop)
+      (.src_block "LFoo;.bar:(I)V" 2 (0.0 0.0))
+      (sput v0 "LFoo;.i:I")
+      (return-void)
+    ))");
+  m->get_code()->build_cfg();
+  method_splitting_impl::Stats stats;
+  split_with(cls, {}, loop_config(), &stats);
+  ASSERT_EQ(stats.added_methods.size(), 1u);
+  auto* split = stats.added_methods.front().first;
+  EXPECT_EQ(show(split->get_proto()), "(IC)V");
+}
+
 TEST_F(MethodSplitterTest, DontSplitLoadParamChains) {
   const auto* code_str = R"(
     (
@@ -1361,7 +1792,7 @@ std::optional<method_splitting_impl::SplittableClosure> make_test_closure(
       .closures = std::move(closures),
       .grouped_heads = std::move(head_ids),
       .args = {{0, type::_int(), nullptr}},
-      .rank = 0,
+      .rank = {},
       .added_code_size = 0,
       .hot_split_kind = method_splitting_impl::HotSplitKind::HotCold,
       .net_terms = std::nullopt};
@@ -2065,6 +2496,91 @@ TEST_F(MethodSplitterTest, RemainingFloorOfASwitchGroupAtItsBoundary) {
   EXPECT_EQ(split_count("(I)V", switchGroupCode(), config), 1u);
   config.min_hot_split_size = kGroupRemaining + 1;
   EXPECT_EQ(split_count("(I)V", switchGroupCode(), config), 0u);
+}
+
+// The order of two ranks: the larger key goes first.
+TEST_F(MethodSplitterTest, SelectionRankOrder) {
+  const auto rank = [](double key) {
+    return method_splitting_impl::SelectionRank{.key = key, .suffix_nodes = 0};
+  };
+  const auto before = [](const method_splitting_impl::SelectionRank& a,
+                         const method_splitting_impl::SelectionRank& b) {
+    return std::is_lt(method_splitting_impl::compare_rank(a, b)) &&
+           std::is_gt(method_splitting_impl::compare_rank(b, a));
+  };
+  EXPECT_TRUE(before(rank(7), rank(5)));
+  EXPECT_TRUE(
+      std::is_eq(method_splitting_impl::compare_rank(rank(5), rank(5))));
+}
+
+// The orders of one method's candidates in selection and of one dex's
+// candidates in emission. Selection takes the candidate that takes more nodes
+// first, then a single entry before a switch group, then the lower id. Emission
+// goes by rank, then by method, then a single entry before a switch group, then
+// the higher id. Split names are numbered in emission order.
+TEST_F(MethodSplitterTest, CandidateOrders) {
+  std::vector<DexMethod*> hosts;
+  std::vector<std::shared_ptr<method_splitting_impl::MethodClosures>> mcss;
+  for (int i = 0; i < 2; ++i) {
+    auto [cls, method] = create("(I)V", switchGroupCode());
+    method->get_code()->build_cfg();
+    method_splitting_impl::normalize_cfg_for_splitting(method);
+    auto rcfg = method_splitting_impl::reduce_cfg(method);
+    auto mcs = method_splitting_impl::discover_closures(method, rcfg);
+    ASSERT_NE(mcs, nullptr);
+    hosts.push_back(method);
+    mcss.push_back(std::move(mcs));
+  }
+  if (compare_dexmethods(hosts[1], hosts[0])) {
+    std::swap(hosts[0], hosts[1]);
+    std::swap(mcss[0], mcss[1]);
+  }
+  // A candidate of `hosts[host]` taking the blocks of the source blocks
+  // `heads`, as a group of the switch's cases when `group`.
+  const auto candidate = [&](size_t host, const std::vector<uint32_t>& heads,
+                             bool group, double key, size_t suffix_nodes) {
+    std::vector<cfg::Block*> blocks;
+    blocks.reserve(heads.size());
+    for (auto id : heads) {
+      blocks.push_back(profile_block(hosts[host], id));
+    }
+    auto sc = make_test_closure(
+        mcss[host], blocks, group ? profile_block(hosts[host], 0) : nullptr);
+    sc.value().rank.key = key;
+    sc.value().rank.suffix_nodes = suffix_nodes;
+    return std::move(sc.value());
+  };
+  const auto case_a = candidate(0, {2}, false, 1, 1);
+  const auto case_b = candidate(0, {3}, false, 1, 1);
+  const auto group = candidate(0, {2, 3}, true, 1, 2);
+  const auto other_host = candidate(1, {2}, false, 1, 1);
+  const auto higher_rank = candidate(1, {3}, false, 2, 1);
+  ASSERT_NE(case_a.id(), case_b.id());
+  const auto* lower_id = case_a.id() < case_b.id() ? &case_a : &case_b;
+  const auto* higher_id = lower_id == &case_a ? &case_b : &case_a;
+  using Candidates =
+      std::vector<const method_splitting_impl::SplittableClosure*>;
+
+  Candidates selection{&case_a, &case_b, &group};
+  std::sort(selection.begin(), selection.end(), [](auto* c, auto* d) {
+    return method_splitting_impl::precedes<
+        method_splitting_impl::CandidateOrder::Selection>(*c, *d);
+  });
+  EXPECT_EQ(selection, (Candidates{&group, lower_id, higher_id}));
+  // A single entry and a switch group that hold equally many nodes.
+  const auto group_covering_one = candidate(0, {2, 3}, true, 1, 1);
+  EXPECT_TRUE(method_splitting_impl::precedes<
+              method_splitting_impl::CandidateOrder::Selection>(
+      *higher_id, group_covering_one));
+
+  Candidates emission{&case_a, &case_b, &group, &other_host, &higher_rank};
+  std::sort(emission.begin(), emission.end(), [](auto* c, auto* d) {
+    return method_splitting_impl::precedes<
+        method_splitting_impl::CandidateOrder::Emission>(*c, *d);
+  });
+  EXPECT_EQ(
+      emission,
+      (Candidates{&higher_rank, higher_id, lower_id, &group, &other_host}));
 }
 
 // The cases of a top-level switch, selected and split the way a

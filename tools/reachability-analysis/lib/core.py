@@ -52,9 +52,19 @@ class ReachableObjectType(object):
             return "SEED"
 
 
-# Aside from classes and annotations, the other nodes will never have collisions
-# in their node names. Thus, we are able to infer their node type just by
-# looking at their names. The functions below help with that.
+# Kinds whose name is shared by many objects: an annotation node is one
+# annotation instance, named by its type, and a seed node is one keep reason.
+# Each instance retains only what it names, so instances stay separate nodes.
+INSTANCE_TYPES = frozenset((ReachableObjectType.ANNO, ReachableObjectType.SEED))
+
+
+def instance_kind_names() -> frozenset[str]:
+    """INSTANCE_TYPES as the SQL export names kinds."""
+    return frozenset(ReachableObjectType.to_string(t) for t in INSTANCE_TYPES)
+
+
+# A method name contains `(` and a field name contains `:`; a keep reason can
+# contain either.
 
 
 def is_method(node_name):
@@ -160,7 +170,11 @@ class AbstractGraph(object):
             raise GraphFormatError("Magic number mismatch")
         version = _read_uint32(mapping, "version")
         if version != self.expected_version():
-            raise GraphFormatError("Version mismatch")
+            raise GraphFormatError(
+                f"Unsupported graph format version {version}; this tool reads "
+                f"version {self.expected_version()}. Regenerate the graph with "
+                "a matching Redex."
+            )
 
     def iter_serialized_records(self, fn):
         """Yield node IDs, nodes, and adjacency IDs without building the graph."""
@@ -215,7 +229,8 @@ class AbstractGraph(object):
 class ReachabilityGraph(AbstractGraph):
     @staticmethod
     def expected_version():
-        return 1
+        # GRAPH_FORMAT_VERSION in libredex/Reachability.h.
+        return 2
 
     def read_node(self, mapping):
         node_type = struct.unpack("<B", _read_exact(mapping, 1, "node type"))[0]
@@ -226,8 +241,21 @@ class ReachabilityGraph(AbstractGraph):
         return ReachableObject(node_type, node_name)
 
     def add_node(self, node):
+        # `nodes` maps each (type, name) to all its nodes: one for a class,
+        # field or method, one per instance of an annotation type or keep rule.
         self.node_records.append(node)
-        self.nodes[(node.type, node.name)] = node
+        self.nodes.setdefault((node.type, node.name), []).append(node)
+
+    def __repr__(self):
+        return (
+            "["
+            + ",\n".join(
+                node.__repr__()
+                for key in sorted(self.nodes.keys())
+                for node in self.nodes[key]
+            )
+            + "]"
+        )
 
     def dump(self, fn):
         nodes = sorted(self.node_records, key=lambda node: (node.type, node.name))
@@ -286,27 +314,41 @@ class ReachabilityGraph(AbstractGraph):
         if n2 not in n1.preds:
             n1.preds[n2] = None
 
-    def get_node(self, node_name):
-        if is_method(node_name):
-            return self.nodes[(ReachableObjectType.METHOD, node_name)]
-        if is_field(node_name):
-            return self.nodes[(ReachableObjectType.FIELD, node_name)]
-        # Prefer classes to preserve the existing behavior when a class and
-        # annotation have the same name.
+    def get_nodes(self, node_name):
+        """Every node of the named method, field, class, annotation type or
+        keep rule: several for an annotation type or keep rule with several
+        instances. A name stored under several kinds, such as a class and an
+        annotation type, resolves to the first of method, field, class,
+        annotation type and keep rule."""
         for node_type in (
+            ReachableObjectType.METHOD,
+            ReachableObjectType.FIELD,
             ReachableObjectType.CLASS,
             ReachableObjectType.ANNO,
             ReachableObjectType.SEED,
         ):
-            node = self.nodes.get((node_type, node_name))
-            if node is not None:
-                return node
-        raise KeyError((ReachableObjectType.CLASS, node_name))
+            nodes = self.nodes.get((node_type, node_name))
+            if nodes is not None:
+                return nodes
+        raise KeyError(node_name)
+
+    def get_node(self, node_name):
+        """The node of a name that has exactly one."""
+        nodes = self.get_nodes(node_name)
+        if len(nodes) != 1:
+            raise ValueError(
+                f"{len(nodes)} nodes are named {node_name!r}; use get_nodes"
+            )
+        return nodes[0]
 
     def get_anno(self, node_name):
+        """Every instance of an annotation type. Raises KeyError for a name
+        no annotation instance has, like `get_node`."""
         return self.nodes[(ReachableObjectType.ANNO, node_name)]
 
     def get_seed(self, node_name):
+        """Every seed of a keep rule. Raises KeyError for a name no seed has,
+        like `get_node`."""
         return self.nodes[(ReachableObjectType.SEED, node_name)]
 
 
@@ -345,31 +387,57 @@ class MethodOverrideGraph(AbstractGraph):
         child.parents.append(method)
 
 
+class _ReachabilityGraphWithOverrides(ReachabilityGraph):
+    """A reachability graph whose method nodes carry their override graph
+    edges. Each method node is made as it is read, so it is the one node
+    that the graph's lookup table, records and edges all hold."""
+
+    def __init__(self, method_override):
+        super().__init__()
+        self._method_override = method_override
+
+    def read_node(self, mapping):
+        node = super().read_node(mapping)
+        if node.type == ReachableObjectType.METHOD:
+            return ReachableMethod(node, self._method_override)
+        return node
+
+
 class CombinedGraph(object):
     def __init__(self, reachability, method_override):
-        self.reachability_graph = ReachabilityGraph()
-        self.reachability_graph.load(reachability)
         self.method_override_graph = MethodOverrideGraph()
         self.method_override_graph.load(method_override)
-
-        # extract information from the override graph
-        for type, name in self.reachability_graph.nodes:
-            if type == ReachableObjectType.METHOD:
-                self.reachability_graph.nodes[(type, name)] = ReachableMethod(
-                    self.reachability_graph.nodes[(type, name)],
-                    self.method_override_graph,
-                )
+        self.reachability_graph = _ReachabilityGraphWithOverrides(
+            self.method_override_graph
+        )
+        self.reachability_graph.load(reachability)
 
         for method in list(self.method_override_graph.nodes.keys()):
-            method_node = self.reachability_graph.get_node(method)
+            method_node = self._method(method)
+            if method_node is None:
+                continue
             for child in method_node.overridden_by:
                 # find child in reachability graph, then build edge
-                method_child = self.reachability_graph.get_node(child.name)
+                method_child = self._method(child.name)
+                if method_child is None:
+                    continue
                 for pred in method_node.preds:
                     if pred.type == ReachableObjectType.METHOD:
                         self.reachability_graph.add_edge(method_child, pred)
 
         self.nodes = self.reachability_graph.nodes
+
+    def _method(self, name):
+        """The graph's node of a method, or None for one marking did not
+        retain: the override graph is written before the sweep, so it can
+        name methods the reachability graph does not hold."""
+        nodes = self.reachability_graph.nodes.get((ReachableObjectType.METHOD, name))
+        if nodes is None:
+            return None
+        # A method has one node per name; only annotation and seed nodes are
+        # per instance.
+        [node] = nodes
+        return node
 
     @staticmethod
     def from_everstore(reachability, method_override):
@@ -383,7 +451,10 @@ class CombinedGraph(object):
         return ret
 
     def node(self, search_str=None, search_type=None):
-        node = None
+        """The nodes of the one matching (type, name), several for an
+        annotation type or keep rule; or, when several names match, a function
+        from a printed option's index to its nodes."""
+        nodes = None
         known_names = []
         for type, name in list(self.nodes.keys()):
             if search_type is not None and type != search_type:
@@ -395,17 +466,17 @@ class CombinedGraph(object):
 
         if search_str is not None and len(known_names) == 1:
             # know exactly one
-            node = self.nodes[known_names[0]]
+            nodes = self.nodes[known_names[0]]
         elif search_str is not None:
             # there could be names containing name of another node
             # in this case we prefer the only exact match
             exact_match = list(filter((lambda n: n[1] == search_str), known_names))
             if len(exact_match) == 1:
-                node = self.nodes[exact_match[0]]
+                nodes = self.nodes[exact_match[0]]
 
         # if after all we still can't get which one does the user want,
         # print all options
-        if node is None:
+        if nodes is None:
             print(("Found %s matching names:" % len(known_names)))
             idx = 0
             for type, name in known_names:
@@ -419,4 +490,4 @@ class CombinedGraph(object):
 
             return lambda i: self.nodes[known_names[i]]
 
-        return node
+        return nodes

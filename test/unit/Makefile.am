@@ -45,6 +45,7 @@ check_PROGRAMS = \
     armv7_jit_loop_checker_test \
     array_propagation_test \
     arsc_attribution_test \
+    art_type_check_test \
     art_profile_writer_pass_test \
     assert_test \
     atomic_field_updater_lowering_test \
@@ -141,6 +142,8 @@ check_PROGRAMS = \
     method_profiles_test \
     method_splitting_test \
     method_splitter_test_fixture_test \
+    method_splitter_region_no_live_out_test \
+    method_splitter_region_builder_test \
     method_splitter_suffix_net_gate_test \
     method_util_test \
     metrics_sink_test \
@@ -181,8 +184,10 @@ check_PROGRAMS = \
     reduce_sparse_switches_test \
     reflection_analysis_test \
     reg_alloc_test \
+    region_plan_test \
     registers_test \
     remark_test \
+    remove_builders_test \
     remove_null_check_string_arg_test \
     remove_recursive_locks_test \
     remove_redundant_check_casts_test \
@@ -228,6 +233,7 @@ check_PROGRAMS = \
     type_system_test \
     type_util_test \
     typed_nonreturning_methods_test \
+    uninitialized_objects_test \
     unique_method_tracker_test \
     up_code_motion_test \
     used_vars_test \
@@ -260,6 +266,8 @@ array_propagation_test_CPPFLAGS = $(AM_CPPFLAGS) -I$(top_srcdir)/sparta/test
 
 arsc_attribution_test_SOURCES = ArscAttributionTest.cpp $(top_srcdir)/tools/arsc/ArscStats.cpp arsc/TestStructures.cpp
 arsc_attribution_test_CPPFLAGS = $(AM_CPPFLAGS) -I$(top_srcdir)/tools/arsc -I$(top_srcdir)/test/unit/arsc
+
+art_type_check_test_SOURCES = ArtTypeCheckTest.cpp
 
 art_profile_writer_pass_test_SOURCES = ArtProfileWriterPassTest.cpp
 
@@ -367,7 +375,7 @@ dex_annotation_test_SOURCES = DexAnnotationTest.cpp
 
 dex_class_test_SOURCES = DexClassTest.cpp
 
-dex_hasher_test_SOURCES = DexHasherTest.cpp
+dex_hasher_test_SOURCES = DexHasherTest.cpp $(top_srcdir)/test/common/RedexTestUtils.cpp
 
 dex_instruction_test_SOURCES = DexInstructionTest.cpp
 
@@ -464,7 +472,7 @@ kotlin_lambda_dedup_pass_test_LDADD = $(COMMON_MOCK_TEST_LIBS)
 
 literals_test_SOURCES = LiteralsTest.cpp
 
-live_range_test_SOURCES = LiveRangeTest.cpp
+live_range_test_SOURCES = LiveRangeTest.cpp $(top_srcdir)/test/common/RedexTestUtils.cpp
 live_range_test_LDADD = $(COMMON_MOCK_TEST_LIBS)
 
 local_dce_test_SOURCES = LocalDceTest.cpp ScopeHelper.cpp
@@ -495,6 +503,13 @@ method_splitting_test_SOURCES = MethodSplittingTest.cpp
 method_splitter_test_fixture_test_SOURCES = \
 	MethodSplitterTestFixture.cpp \
 	MethodSplitterTestFixtureTest.cpp
+
+method_splitter_region_no_live_out_test_SOURCES = \
+	MethodSplitterTestFixture.cpp \
+	MethodSplitterRegionNoLiveOutTest.cpp
+
+method_splitter_region_builder_test_SOURCES = \
+	MethodSplitterRegionBuilderTest.cpp
 
 method_splitter_suffix_net_gate_test_SOURCES = \
 	MethodSplitterTestFixture.cpp \
@@ -531,7 +546,7 @@ object_inliner_test_LDADD = $(COMMON_MOCK_TEST_LIBS)
 object_propagation_test_SOURCES = constant-propagation/ObjectPropagationTest.cpp
 object_propagation_test_CPPFLAGS = $(AM_CPPFLAGS) -I$(top_srcdir)/sparta/test
 
-optimize_enums_test_SOURCES = OptimizeEnumsTest.cpp
+optimize_enums_test_SOURCES = OptimizeEnumsTest.cpp $(top_srcdir)/test/common/RedexTestUtils.cpp
 optimize_enums_test_LDADD = $(COMMON_MOCK_TEST_LIBS)
 
 outliner_type_analysis_test_SOURCES = OutlinerTypeAnalysisTest.cpp
@@ -595,9 +610,13 @@ reflection_analysis_test_LDADD = $(COMMON_MOCK_TEST_LIBS)
 reg_alloc_test_SOURCES = RegAllocTest.cpp OpcodeList.cpp
 reg_alloc_test_LDADD = $(COMMON_MOCK_TEST_LIBS)
 
+region_plan_test_SOURCES = RegionPlanTest.cpp
+
 registers_test_SOURCES = RegistersTest.cpp OpcodeList.cpp
 
 remark_test_SOURCES = RemarkTest.cpp
+
+remove_builders_test_SOURCES = RemoveBuildersTest.cpp
 
 remove_null_check_string_arg_test_SOURCES = RemoveNullCheckStringArgTest.cpp ScopeHelper.cpp
 
@@ -701,7 +720,9 @@ type_system_test_LDADD = $(COMMON_MOCK_TEST_LIBS)
 
 type_util_test_SOURCES = TypeUtilTest.cpp
 
-typed_nonreturning_methods_test_SOURCES = TypedNonReturningMethodsTest.cpp
+typed_nonreturning_methods_test_SOURCES = TypedNonReturningMethodsTest.cpp $(top_srcdir)/test/common/RedexTestUtils.cpp
+
+uninitialized_objects_test_SOURCES = UninitializedObjectsTest.cpp
 
 unique_method_tracker_test_SOURCES = UniqueMethodTrackerTest.cpp
 unique_method_tracker_test_LDADD = $(COMMON_MOCK_TEST_LIBS)

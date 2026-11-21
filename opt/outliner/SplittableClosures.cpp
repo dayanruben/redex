@@ -94,6 +94,8 @@ struct ScoredClosure {
   // The partition of `switch_block`'s edges by `grouped_heads`; set for a
   // candidate taking several cases of a switch.
   std::optional<SwitchPartition> dispatch{std::nullopt};
+  // Set once phase 1 has evaluated the candidate.
+  SelectionRank rank{};
 
   int is_switch() const { return switch_block != nullptr ? 1 : 0; }
 
@@ -271,11 +273,12 @@ void size_eviction(const UnorderedSet<cfg::Block*>& remaining_cfg_blocks,
   sc->evicted_size = sc->covered_code_units - duplicated_size;
 }
 
+// Measures one candidate: its sizes, its hot-split kind and the code it moves
+// out of the host. Returns nullopt for a candidate below a size floor.
 std::optional<ScoredClosure> score(
     const Config& config,
     const MethodClosures& mcs,
     bool host_compiled,
-    float max_overhead_ratio,
     cfg::Block* switch_block,
     bool is_large_packed_switch,
     const std::vector<const Closure*>& closures) {
@@ -373,14 +376,19 @@ std::optional<ScoredClosure> score(
   // `size_eviction` sizes from `covered_code_units`, which is this size.
   always_assert(sc.covered_code_units == reduced_components_code_size);
   size_eviction(remaining_cfg_blocks, &sc);
+  return std::optional<ScoredClosure>(std::move(sc));
+};
+
+// Whether a suffix candidate's estimated growth of the method, (split + what
+// remains) / original - 1, is within `max_overhead_ratio`.
+bool fits_overhead_ratio(const ScoredClosure& sc,
+                         const MethodClosures& mcs,
+                         float max_overhead_ratio) {
   auto overhead_ratio = static_cast<double>(sc.split_size + sc.remaining_size) /
                             static_cast<double>(mcs.original_size) -
                         1.0;
-  if (overhead_ratio > max_overhead_ratio) {
-    return std::nullopt;
-  }
-  return std::optional<ScoredClosure>(std::move(sc));
-};
+  return overhead_ratio <= max_overhead_ratio;
+}
 
 UnorderedSet<const ReducedBlock*> get_critical_components(
     const std::vector<std::pair<int32_t, const Closure*>>& keyed,
@@ -413,9 +421,9 @@ std::optional<ScoredClosure> select_prefix(
     bool is_large_packed_switch,
     std::vector<const Closure*> aggregated) {
   while (aggregated.size() > 1) {
-    auto opt_sc = score(config, mcs, host_compiled, max_overhead_ratio,
-                        switch_block, is_large_packed_switch, aggregated);
-    if (opt_sc) {
+    auto opt_sc = score(config, mcs, host_compiled, switch_block,
+                        is_large_packed_switch, aggregated);
+    if (opt_sc && fits_overhead_ratio(*opt_sc, mcs, max_overhead_ratio)) {
       return opt_sc;
     }
     aggregated.pop_back();
@@ -547,10 +555,9 @@ std::vector<ScoredClosure> get_scored_closures(const Config& config,
   UnorderedMap<cfg::Block*, std::vector<const Closure*>>
       remaining_switch_case_closures;
   for (const auto& c : mcs.closures) {
-    auto opt_sc = score(config, mcs, host_compiled, max_overhead_ratio,
-                        /* switch_block */ nullptr,
+    auto opt_sc = score(config, mcs, host_compiled, /* switch_block */ nullptr,
                         /* is_large_packed_switch */ false, {&c});
-    if (opt_sc) {
+    if (opt_sc && fits_overhead_ratio(*opt_sc, mcs, max_overhead_ratio)) {
       scored_closures.push_back(std::move(*opt_sc));
     }
     for (auto* src : UnorderedIterable(c.srcs)) {
@@ -684,6 +691,7 @@ NetSavingInput net_saving_input(const ScoredClosure& sc,
                      ? sc.evicted_size
                      : sc.evicted_size - sc.evicted_hot_size,
       .duplicated = sc.duplicated_dex_code_units,
+      .return_sites = 0,
       .passed_args = passed_args,
       .passed_arg_registers = passed_arg_registers,
       .recreated_defs = recreated_defs,
@@ -691,6 +699,36 @@ NetSavingInput net_saving_input(const ScoredClosure& sc,
       .copies_after = sc.copies_after,
       .split_compiled = sc.hot_split_kind == HotSplitKind::Hot,
   };
+}
+
+// What a split's call block passes for one of the split's arguments, `reg`.
+// The call takes the place of the code from `entry`, the candidate's first
+// instruction, so it passes the definitions that reach `entry` from outside
+// the candidate's blocks (`in_cover`). A definition inside those blocks that
+// reaches `entry` only along their own back edges, as in a suffix whose head
+// is a loop, is not passed: the split carries it to `entry` itself. An
+// outlined parameter must hold every value its call passes.
+struct PassedDefs {
+  // The host's definitions that reach the entry. The call passes their values.
+  sparta::PatriciaTreeSet<IRInstruction*> host;
+  // Whether `host` is every definition that reaches the entry.
+  bool every{false};
+  // The values the call passes, as ART types them (`value_of_producers`).
+  art::Value value;
+};
+
+PassedDefs passed_defs(OutlinerTypeAnalysis& ota,
+                       const Membership& in_cover,
+                       IRInstruction* entry,
+                       reg_t reg) {
+  const auto defs = ota.immediate_defs_at(entry, reg);
+  PassedDefs passed;
+  passed.host = defs;
+  passed.host.filter([&](IRInstruction* def) { return !in_cover(def); });
+  passed.every = passed.host.size() == defs.size();
+  passed.value = ota.value_of_producers(UnorderedSet<const IRInstruction*>(
+      passed.host.begin(), passed.host.end()));
+  return passed;
 }
 
 // The inputs of `evaluate_candidate`: the per-method Lazy analyses, built once
@@ -757,26 +795,27 @@ std::optional<CandidateFate> evaluate_candidate(ScoredClosure& sc,
   auto in_cover = [&ctx, &sc](IRInstruction* insn) {
     return sc.reduced_components.count(ctx.insns->at(insn)) != 0u;
   };
-  // A suffix whose head is a loop is entered at the loop header, so a
-  // definition of a live-in inside the loop reaches the entry too, through the
-  // back edge. The launchpad passes only the definitions from outside the
-  // closure. Typing the parameter by the uses of an in-loop definition could
-  // declare it narrower than the value the host passes.
-  auto passed_defs = [&](reg_t reg) {
-    auto defs = ctx.ota->immediate_defs_at(first_insn, reg);
-    defs.filter([&](IRInstruction* def) { return !in_cover(def); });
-    return defs;
-  };
   for (auto reg : ordered_live_in) {
     auto defs = ctx.ota->defs_at(first_insn, reg);
     if (defs.size() == 1 && opcode::is_a_const((*defs.begin())->opcode())) {
       sc.args.push_back((ClosureArgument){reg, nullptr, *defs.begin()});
       continue;
     }
+    // Typed by the uses of what the call passes. The uses of a definition the
+    // call does not pass could declare the parameter narrower than the value
+    // the host passes.
+    const auto passed = passed_defs(*ctx.ota, in_cover, first_insn, reg);
     const auto* type = art::declare_parameter(
-        ctx.ota->demand_of_uses(passed_defs(reg), in_cover),
+        ctx.ota->demand_of_uses(passed.host, in_cover),
         [&]() { return ctx.ota->value_at(first_insn, reg); });
     if (type == nullptr) {
+      return CandidateFate::Evaluation_LiveInUntypable;
+    }
+    // The uses were verified with every definition that reaches the entry,
+    // merged in the order ART chose. When the call passes only some of them, as
+    // at a loop header whose back edge is among the candidate's blocks, the
+    // declared type must still hold what it passes.
+    if (!passed.every && !art::accepts_argument(type, passed.value)) {
       return CandidateFate::Evaluation_LiveInUntypable;
     }
     // The type demand is a meet over the uses, so it can name a type that no
@@ -835,20 +874,6 @@ std::vector<SplittableClosure> to_splittable_closures(
     // Null on the top-level-switch path, which has no store context.
     const RefChecker* ref_checker) {
   std::vector<SplittableClosure> splittable_closures;
-  // We sort closures in a way that allows us to quickly prune contained
-  // closures if we found a viable containing closure.
-  std::sort(
-      scored_closures.begin(), scored_closures.end(), [](auto& a, auto& b) {
-        if (a.reduced_components.size() != b.reduced_components.size()) {
-          return a.reduced_components.size() > b.reduced_components.size();
-        }
-        if (a.is_switch() != b.is_switch()) {
-          return a.is_switch() < b.is_switch();
-        }
-        return a.id() < b.id();
-      });
-
-  // Now we do the expensive analysis of the remaining scored closures.
   auto* method = mcs->method;
   Lazy<OutlinerTypeAnalysis> ota(
       [method] { return std::make_unique<OutlinerTypeAnalysis>(method); });
@@ -891,7 +916,6 @@ std::vector<SplittableClosure> to_splittable_closures(
     }
     return std::make_unique<std::optional<reg_t>>(receiver_reg);
   });
-  UnorderedSet<const ReducedBlock*> covered;
 
   // Every scored suffix is a candidate from here on.
   stats.suffix_fates.candidates += scored_closures.size();
@@ -905,7 +929,42 @@ std::vector<SplittableClosure> to_splittable_closures(
   CandidateEvalContext ctx{ota,    liveness_fp_iter, uninitialized_objects,
                            insns,  receiver,         ref_checker,
                            config, host_compiled,    method};
-  std::erase_if(scored_closures, [&covered, &ctx, &record](auto& sc) {
+  // Selection runs in two phases. Phase 1 evaluates each candidate on its own
+  // and drops the ones that fail, without looking at overlaps. It checks the
+  // arguments, the dex references and the net-saving gates. Phase 2 then keeps,
+  // in order, each candidate none of whose entries is among a kept candidate's
+  // blocks.
+  std::erase_if(scored_closures, [&ctx, &record](auto& sc) {
+    auto fate = evaluate_candidate(sc, ctx);
+    if (fate) {
+      record(sc, *fate);
+    }
+    return fate.has_value();
+  });
+
+  // Phase 2: order the candidates by `CandidateOrder::Selection`, then keep, in
+  // that order, each candidate none of whose entries is among a kept
+  // candidate's blocks. Selection follows its containment rule rather than the
+  // size keys, so this is not the order their dex emits them in
+  // (`CandidateOrder::Emission`).
+  for (auto& sc : scored_closures) {
+    sc.rank = SelectionRank{
+        .key = static_cast<double>(sc.split_size) *
+               static_cast<double>(mcs->original_size) /
+               static_cast<double>(sc.split_size + sc.remaining_size),
+        .suffix_nodes = sc.reduced_components.size(),
+    };
+  }
+  std::sort(scored_closures.begin(), scored_closures.end(),
+            [](const ScoredClosure& a, const ScoredClosure& b) {
+              return precedes<CandidateOrder::Selection>(a, b);
+            });
+  UnorderedSet<const ReducedBlock*> covered;
+  // Greedy: the predicate reads this set and then inserts into it, so which
+  // candidates survive depends on the order the sort above left them in. That
+  // sort must be a total order: a tie would make the kept set
+  // nondeterministic.
+  std::erase_if(scored_closures, [&covered, &record](auto& sc) {
     for (auto* c : sc.closures) {
       if (covered.count(c->reduced_block)) {
         // We already have this contained closure covered by a valid
@@ -913,10 +972,6 @@ std::vector<SplittableClosure> to_splittable_closures(
         record(sc, CandidateFate::Selection_Displaced);
         return true;
       }
-    }
-    if (auto fate = evaluate_candidate(sc, ctx)) {
-      record(sc, *fate);
-      return true;
     }
     insert_unordered_iterable(covered, sc.reduced_components);
     return false;
@@ -961,9 +1016,6 @@ std::vector<SplittableClosure> to_splittable_closures(
       oss << ::show(method->get_code()->cfg());
       TRACE(MS, 2, "%s", oss.str().c_str());
     }
-    auto rank = static_cast<double>(sc.split_size) *
-                static_cast<double>(mcs->original_size) /
-                static_cast<double>(sc.split_size + sc.remaining_size);
     auto added_code_size =
         sc.split_size + sc.remaining_size - mcs->original_size;
     splittable_closures.push_back((SplittableClosure){
@@ -972,12 +1024,13 @@ std::vector<SplittableClosure> to_splittable_closures(
         .closures = std::move(sc.closures),
         .grouped_heads = std::move(sc.grouped_heads),
         .args = std::move(sc.args),
-        .rank = rank,
+        .rank = sc.rank,
         .added_code_size = added_code_size,
         .hot_split_kind = sc.hot_split_kind,
         .is_large_packed_switch = sc.is_large_packed_switch,
         .creates_large_sparse_switch = sc.creates_large_sparse_switch,
         .destroys_large_packed_switch = sc.destroys_large_packed_switch,
+        .region_plan = std::nullopt,
         .net_terms = sc.net_terms,
         .covered_code_units = sc.covered_code_units,
         .below_legacy_floors = sc.below_legacy_floors});
@@ -1487,6 +1540,15 @@ RareSuffixSelection::RareSuffixSelection(
             });
       },
       methods);
+}
+
+std::weak_ordering compare_rank(const SelectionRank& a,
+                                const SelectionRank& b) {
+  if (a.key != b.key) {
+    return a.key > b.key ? std::weak_ordering::less
+                         : std::weak_ordering::greater;
+  }
+  return std::weak_ordering::equivalent;
 }
 
 } // namespace method_splitting_impl

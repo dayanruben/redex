@@ -31,9 +31,9 @@ class SqliteExportTest(unittest.TestCase):
                     {
                         "schema_version": "2",
                         "source_graph": os.path.abspath(graph_file),
-                        "source_format": "Redex reachability graph binary v1",
+                        "source_format": "Redex reachability graph binary v2",
                         "edge_direction": sqlite_export.EDGE_DIRECTION,
-                        "dominator_tree_version": "1",
+                        "dominator_tree_version": "2",
                         "dominator_algorithm": "cooper-harvey-kennedy",
                     },
                 )

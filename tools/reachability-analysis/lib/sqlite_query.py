@@ -10,16 +10,16 @@ import sqlite3
 from collections.abc import Iterator
 from pathlib import Path
 
-from . import analysis
+from .core import instance_kind_names
 from .sqlite_export import (
     DOMINATOR_ALGORITHM,
     DOMINATOR_TREE_VERSION,
     EDGE_DIRECTION,
     SCHEMA_VERSION,
+    SOURCE_FORMAT,
 )
 
 
-SOURCE_FORMAT = "Redex reachability graph binary v1"
 KINDS = ("ANNO", "CLASS", "FIELD", "METHOD", "SEED")
 
 
@@ -71,22 +71,40 @@ def roots(
     kind: str | None,
     limit: int | None,
 ) -> Iterator[dict[str, object]]:
+    # An annotation or seed instance is a root when that instance has no
+    # retainer, and each such instance is its own row; a class, field or
+    # method is a root when no node of its name has one.
+    instance_list = ", ".join(f"'{kind}'" for kind in sorted(instance_kind_names()))
     cursor = connection.execute(
-        """
+        f"""
         WITH logical_nodes(kind, name) AS (
           SELECT DISTINCT kind, name FROM nodes
-        )
-        SELECT node.kind AS type, node.name AS name
-        FROM logical_nodes AS node
-        WHERE (:kind IS NULL OR node.kind = :kind)
-          AND NOT EXISTS (
+          WHERE kind NOT IN ({instance_list})
+        ),
+        root_nodes(kind, name) AS (
+          SELECT node.kind, node.name
+          FROM logical_nodes AS node
+          WHERE NOT EXISTS (
             SELECT 1
             FROM nodes AS raw
             JOIN edges AS edge INDEXED BY edges_by_retained
               ON edge.retained_id = raw.id
             WHERE raw.kind = node.kind AND raw.name = node.name
           )
-        ORDER BY node.kind, node.name
+          UNION ALL
+          SELECT instance.kind, instance.name
+          FROM nodes AS instance
+          WHERE instance.kind IN ({instance_list})
+            AND NOT EXISTS (
+              SELECT 1
+              FROM edges AS edge INDEXED BY edges_by_retained
+              WHERE edge.retained_id = instance.id
+            )
+        )
+        SELECT kind AS type, name
+        FROM root_nodes
+        WHERE (:kind IS NULL OR kind = :kind)
+        ORDER BY kind, name
         LIMIT :limit
         """,
         {
@@ -105,8 +123,10 @@ def semantic_roots(
         WITH logical_nodes(kind, name) AS (
           SELECT DISTINCT kind, name FROM nodes
         ),
-        seed_roots(type, name, reason) AS (
-          SELECT DISTINCT target.kind, target.name, seed.name
+        -- One row per seed instance: one keep rule in two config files is
+        -- two seeds of one name.
+        seed_roots(type, name, seed_id, reason) AS (
+          SELECT DISTINCT target.kind, target.name, seed.id, seed.name
           FROM nodes AS target
           JOIN edges AS edge INDEXED BY edges_by_retained
             ON edge.retained_id = target.id
@@ -127,7 +147,7 @@ def semantic_roots(
             )
         )
         SELECT type, name, reason FROM seed_roots
-        UNION
+        UNION ALL
         SELECT type, name, reason FROM literal_roots
         ORDER BY type, name, reason
         """
@@ -183,16 +203,22 @@ def _neighbors_in_direction(
         join = "edge.retainer_id = selected.id"
         neighbor_id = "edge.retained_id"
         index = "edges_by_retainer"
+    # One row per neighbor: an annotation or seed instance is its own, a
+    # class, field or method is one per name.
     cursor = connection.execute(
         f"""
-        SELECT DISTINCT :direction AS direction,
-               neighbor.kind AS type,
-               neighbor.name AS name
-        FROM nodes AS selected
-        JOIN edges AS edge INDEXED BY {index} ON {join}
-        JOIN nodes AS neighbor ON neighbor.id = {neighbor_id}
-        WHERE selected.kind = :kind AND selected.name = :name
-        ORDER BY neighbor.kind, neighbor.name
+        SELECT direction, type, name FROM (
+          SELECT DISTINCT :direction AS direction,
+                 neighbor.kind AS type,
+                 neighbor.name AS name,
+                 CASE WHEN neighbor.kind IN ({_instance_kinds_sql()})
+                   THEN neighbor.id ELSE -1 END AS instance_id
+          FROM nodes AS selected
+          JOIN edges AS edge INDEXED BY {index} ON {join}
+          JOIN nodes AS neighbor ON neighbor.id = {neighbor_id}
+          WHERE selected.kind = :kind AND selected.name = :name
+        )
+        ORDER BY type, name
         """,
         {
             "direction": direction,
@@ -214,7 +240,14 @@ def neighbors(
         yield from _neighbors_in_direction(connection, node, "retained")
 
 
+def _instance_kinds_sql() -> str:
+    return ", ".join(f"'{kind}'" for kind in sorted(instance_kind_names()))
+
+
 def _create_path_tables(connection: sqlite3.Connection) -> None:
+    # Each path step stands for one node: an annotation or seed instance is
+    # keyed by its node ID, a class, field or method by its name, with
+    # instance_id -1.
     connection.executescript(
         """
         DROP TABLE IF EXISTS temp.path_seen;
@@ -223,23 +256,36 @@ def _create_path_tables(connection: sqlite3.Connection) -> None:
         CREATE TEMP TABLE path_seen(
           kind TEXT NOT NULL,
           name TEXT NOT NULL,
+          instance_id INTEGER NOT NULL,
           parent_kind TEXT,
           parent_name TEXT,
-          PRIMARY KEY(kind, name)
+          parent_instance_id INTEGER,
+          PRIMARY KEY(kind, name, instance_id)
         ) WITHOUT ROWID;
         CREATE TEMP TABLE path_frontier(
           kind TEXT NOT NULL,
           name TEXT NOT NULL,
-          PRIMARY KEY(kind, name)
+          instance_id INTEGER NOT NULL,
+          PRIMARY KEY(kind, name, instance_id)
         ) WITHOUT ROWID;
         CREATE TEMP TABLE path_next(
           kind TEXT NOT NULL,
           name TEXT NOT NULL,
+          instance_id INTEGER NOT NULL,
           parent_kind TEXT NOT NULL,
           parent_name TEXT NOT NULL,
-          PRIMARY KEY(kind, name)
+          parent_instance_id INTEGER NOT NULL,
+          PRIMARY KEY(kind, name, instance_id)
         ) WITHOUT ROWID;
         """
+    )
+
+
+def _path_instance_id(node: str) -> str:
+    """The path step's instance_id of the nodes row aliased `node`."""
+    return (
+        f"CASE WHEN {node}.kind IN ({_instance_kinds_sql()}) "
+        f"THEN {node}.id ELSE -1 END"
     )
 
 
@@ -256,20 +302,36 @@ def _advance_path_frontier(
         edge_join = "edge.retainer_id = current.id"
         neighbor_id = "edge.retained_id"
         index = "edges_by_retainer"
+    neighbor_instance_id = _path_instance_id("neighbor")
     connection.execute("DELETE FROM path_next")
     connection.execute(
         f"""
-        INSERT OR IGNORE INTO path_next(kind, name, parent_kind, parent_name)
-        SELECT neighbor.kind, neighbor.name, current.kind, current.name
-        FROM path_frontier AS frontier
-        JOIN nodes AS current
-          ON current.kind = frontier.kind AND current.name = frontier.name
+        WITH current(id, kind, name, instance_id) AS (
+          SELECT node.id, node.kind, node.name, -1
+          FROM path_frontier AS frontier
+          JOIN nodes AS node INDEXED BY nodes_by_kind_name
+            ON node.kind = frontier.kind AND node.name = frontier.name
+          WHERE frontier.instance_id = -1
+          UNION ALL
+          SELECT node.id, node.kind, node.name, node.id
+          FROM path_frontier AS frontier
+          JOIN nodes AS node ON node.id = frontier.instance_id
+          WHERE frontier.instance_id != -1
+        )
+        INSERT OR IGNORE INTO path_next(
+          kind, name, instance_id, parent_kind, parent_name, parent_instance_id
+        )
+        SELECT neighbor.kind, neighbor.name, {neighbor_instance_id},
+               current.kind, current.name, current.instance_id
+        FROM current
         JOIN edges AS edge INDEXED BY {index} ON {edge_join}
         JOIN nodes AS neighbor ON neighbor.id = {neighbor_id}
         LEFT JOIN path_seen AS seen
           ON seen.kind = neighbor.kind AND seen.name = neighbor.name
+          AND seen.instance_id = {neighbor_instance_id}
         WHERE seen.kind IS NULL
-        ORDER BY neighbor.kind, neighbor.name, current.kind, current.name
+        ORDER BY neighbor.kind, neighbor.name, {neighbor_instance_id},
+                 current.kind, current.name, current.instance_id
         """
     )
     has_next = connection.execute("SELECT EXISTS(SELECT 1 FROM path_next)").fetchone()[
@@ -277,13 +339,18 @@ def _advance_path_frontier(
     ]
     connection.execute(
         """
-        INSERT INTO path_seen(kind, name, parent_kind, parent_name)
-        SELECT kind, name, parent_kind, parent_name FROM path_next
+        INSERT INTO path_seen(
+          kind, name, instance_id, parent_kind, parent_name, parent_instance_id
+        )
+        SELECT kind, name, instance_id, parent_kind, parent_name,
+               parent_instance_id
+        FROM path_next
         """
     )
     connection.execute("DELETE FROM path_frontier")
     connection.execute(
-        "INSERT INTO path_frontier(kind, name) SELECT kind, name FROM path_next"
+        "INSERT INTO path_frontier(kind, name, instance_id) "
+        "SELECT kind, name, instance_id FROM path_next"
     )
     return bool(has_next)
 
@@ -292,34 +359,43 @@ def _start_path_search(
     connection: sqlite3.Connection,
     start: tuple[str, str],
 ) -> None:
+    """Start from the named node, or from every instance of an annotation
+    type or keep rule."""
     _create_path_tables(connection)
-    connection.execute(
-        "INSERT INTO path_seen(kind, name) VALUES (?, ?)",
-        start,
-    )
-    connection.execute(
-        "INSERT INTO path_frontier(kind, name) VALUES (?, ?)",
-        start,
-    )
+    start_instance_id = _path_instance_id("node")
+    for table in ("path_seen", "path_frontier"):
+        connection.execute(
+            f"""
+            INSERT OR IGNORE INTO {table}(kind, name, instance_id)
+            SELECT node.kind, node.name, {start_instance_id}
+            FROM nodes AS node INDEXED BY nodes_by_kind_name
+            WHERE node.kind = ? AND node.name = ?
+            """,
+            start,
+        )
 
 
 def _path_from_seen(
     connection: sqlite3.Connection,
-    end: tuple[str, str],
+    end: tuple[str, str, int],
 ) -> list[dict[str, object]]:
     path = []
-    node: tuple[str, str] | None = end
+    node: tuple[str, str, int] | None = end
     while node is not None:
         path.append(node)
         parent = connection.execute(
-            "SELECT parent_kind, parent_name FROM path_seen "
-            "WHERE kind = ? AND name = ?",
+            "SELECT parent_kind, parent_name, parent_instance_id FROM path_seen "
+            "WHERE kind = ? AND name = ? AND instance_id = ?",
             node,
         ).fetchone()
         node = (
             None
             if parent["parent_kind"] is None
-            else (parent["parent_kind"], parent["parent_name"])
+            else (
+                parent["parent_kind"],
+                parent["parent_name"],
+                parent["parent_instance_id"],
+            )
         )
     path.reverse()
     return [
@@ -330,25 +406,32 @@ def _path_from_seen(
 
 def _path_frontier_root(
     connection: sqlite3.Connection,
-) -> tuple[str, str] | None:
+) -> tuple[str, str, int] | None:
     row = connection.execute(
         """
-        SELECT frontier.kind, frontier.name
+        SELECT frontier.kind, frontier.name, frontier.instance_id
         FROM path_frontier AS frontier
-        WHERE NOT EXISTS (
-          SELECT 1
-          FROM nodes AS raw
-          JOIN edges AS edge INDEXED BY edges_by_retained
-            ON edge.retained_id = raw.id
-          WHERE raw.kind = frontier.kind AND raw.name = frontier.name
-        )
-        ORDER BY frontier.kind, frontier.name
+        WHERE CASE
+          WHEN frontier.instance_id = -1 THEN NOT EXISTS (
+            SELECT 1
+            FROM nodes AS raw
+            JOIN edges AS edge INDEXED BY edges_by_retained
+              ON edge.retained_id = raw.id
+            WHERE raw.kind = frontier.kind AND raw.name = frontier.name
+          )
+          ELSE NOT EXISTS (
+            SELECT 1
+            FROM edges AS edge INDEXED BY edges_by_retained
+            WHERE edge.retained_id = frontier.instance_id
+          )
+        END
+        ORDER BY frontier.kind, frontier.name, frontier.instance_id
         LIMIT 1
         """
     ).fetchone()
     if row is None:
         return None
-    return row["kind"], row["name"]
+    return row["kind"], row["name"], row["instance_id"]
 
 
 def shortest_path(
@@ -357,15 +440,20 @@ def shortest_path(
     end: tuple[str, str],
 ) -> list[dict[str, object]] | None:
     _start_path_search(connection, start)
-    while start != end:
+    while True:
+        # Of several reached instances of the end, follow the first.
+        reached = connection.execute(
+            "SELECT kind, name, instance_id FROM path_seen "
+            "WHERE kind = ? AND name = ? ORDER BY instance_id LIMIT 1",
+            end,
+        ).fetchone()
+        if reached is not None:
+            return _path_from_seen(
+                connection,
+                (reached["kind"], reached["name"], reached["instance_id"]),
+            )
         if not _advance_path_frontier(connection, toward_retainers=False):
             return None
-        if connection.execute(
-            "SELECT 1 FROM path_seen WHERE kind = ? AND name = ?",
-            end,
-        ).fetchone():
-            break
-    return _path_from_seen(connection, end)
 
 
 def path_to_root(
@@ -384,43 +472,59 @@ def path_to_root(
 def _dom_stats(
     connection: sqlite3.Connection,
     node: tuple[str, str],
-) -> sqlite3.Row:
-    row = connection.execute(
+    limit: int,
+) -> list[sqlite3.Row]:
+    """Up to `limit` dom_stats rows of a node: one for a class, field or
+    method, one per instance for an annotation type or keep rule."""
+    rows = connection.execute(
         """
         SELECT stats.node_id, stats.retained_count
         FROM nodes AS selected INDEXED BY nodes_by_kind_name
         JOIN dom_stats AS stats ON stats.node_id = selected.id
         WHERE selected.kind = :kind AND selected.name = :name
-        LIMIT 1
+        LIMIT :limit
         """,
-        {"kind": node[0], "name": node[1]},
-    ).fetchone()
-    if row is None:
+        {"kind": node[0], "name": node[1], "limit": limit},
+    ).fetchall()
+    if not rows:
         raise ValueError(f"Node {node[1]!r} is not reachable from any root")
-    return row
+    return rows
+
+
+def _dominated_subtree(instances: int) -> str:
+    """The dominator subtrees of every dom_stats row of (:kind, :name). With
+    several instances they are deduplicated: an instance can lie in another
+    instance's subtree."""
+    union = "UNION" if instances > 1 else "UNION ALL"
+    return f"""
+        WITH RECURSIVE subtree(node_id) AS (
+          SELECT stats.node_id
+          FROM nodes AS selected INDEXED BY nodes_by_kind_name
+          JOIN dom_stats AS stats ON stats.node_id = selected.id
+          WHERE selected.kind = :kind AND selected.name = :name
+          {union}
+          SELECT child.node_id
+          FROM subtree
+          JOIN dom_stats AS child INDEXED BY dom_stats_by_idom
+            ON child.idom_id = subtree.node_id
+        )
+        """
 
 
 def dominated(
     connection: sqlite3.Connection,
     blocked: tuple[str, str],
 ) -> Iterator[dict[str, object]]:
-    node_id = _dom_stats(connection, blocked)["node_id"]
+    instances = len(_dom_stats(connection, blocked, 2))
     cursor = connection.execute(
-        """
-        WITH RECURSIVE subtree(node_id) AS (
-          VALUES(:node_id)
-          UNION ALL
-          SELECT child.node_id
-          FROM subtree
-          JOIN dom_stats AS child INDEXED BY dom_stats_by_idom
-            ON child.idom_id = subtree.node_id
-        )
+        _dominated_subtree(instances)
+        + """
         SELECT node.kind AS type, node.name AS name
         FROM subtree
         JOIN nodes AS node ON node.id = subtree.node_id
         ORDER BY node.kind, node.name
         """,
-        {"node_id": node_id},
+        {"kind": blocked[0], "name": blocked[1]},
     )
     return _rows(cursor)
 
@@ -429,11 +533,18 @@ def retained_count(
     connection: sqlite3.Connection,
     blocked: tuple[str, str],
 ) -> dict[str, object]:
-    stats = _dom_stats(connection, blocked)
+    rows = _dom_stats(connection, blocked, 2)
+    if len(rows) == 1:
+        count = rows[0]["retained_count"]
+    else:
+        count = connection.execute(
+            _dominated_subtree(len(rows)) + "SELECT COUNT(*) FROM subtree",
+            {"kind": blocked[0], "name": blocked[1]},
+        ).fetchone()[0]
     return {
         "type": blocked[0],
         "name": blocked[1],
-        "retained_count": stats["retained_count"],
+        "retained_count": count,
     }
 
 
@@ -468,95 +579,52 @@ def top_retained(
     return _rows(cursor)
 
 
-class _LogicalNode:
-    __slots__ = ("kind", "name", "preds", "succs")
-
-    def __init__(self, kind: str, name: str) -> None:
-        self.kind = kind
-        self.name = name
-        self.preds: set[_LogicalNode] = set()
-        self.succs: set[_LogicalNode] = set()
-
-
-class _LogicalGraph:
-    __slots__ = ("nodes",)
-
-    def __init__(self, nodes: dict[tuple[str, str], _LogicalNode]) -> None:
-        self.nodes = nodes
-
-
-def _load_ancestor_graph(
-    connection: sqlite3.Connection,
-    target: tuple[str, str],
-) -> _LogicalGraph:
-    connection.executescript(
+def _dominator_chain(connection: sqlite3.Connection, node_id: int) -> list[sqlite3.Row]:
+    """A node's proper dominators in the materialized dominator tree, nearest
+    first."""
+    return connection.execute(
         """
-        DROP TABLE IF EXISTS temp.dominator_nodes;
-        CREATE TEMP TABLE dominator_nodes(
-          kind TEXT NOT NULL,
-          name TEXT NOT NULL,
-          PRIMARY KEY(kind, name)
-        ) WITHOUT ROWID;
-        """
-    )
-    connection.execute(
-        """
-        WITH RECURSIVE ancestors(kind, name) AS (
-          VALUES(:kind, :name)
-          UNION
-          SELECT predecessor.kind, predecessor.name
-          FROM ancestors
-          JOIN nodes AS retained
-            ON retained.kind = ancestors.kind
-           AND retained.name = ancestors.name
-          JOIN edges AS edge INDEXED BY edges_by_retained
-            ON edge.retained_id = retained.id
-          JOIN nodes AS predecessor ON predecessor.id = edge.retainer_id
+        WITH RECURSIVE chain(node_id, depth) AS (
+          SELECT idom_id, 1 FROM dom_stats WHERE node_id = :node_id
+          UNION ALL
+          SELECT stats.idom_id, chain.depth + 1
+          FROM chain
+          JOIN dom_stats AS stats ON stats.node_id = chain.node_id
         )
-        INSERT INTO dominator_nodes(kind, name)
-        SELECT kind, name FROM ancestors
+        SELECT node.id AS id, node.kind AS type, node.name AS name
+        FROM chain
+        JOIN nodes AS node ON node.id = chain.node_id
+        ORDER BY chain.depth
         """,
-        {"kind": target[0], "name": target[1]},
-    )
-
-    nodes = {
-        (row["kind"], row["name"]): _LogicalNode(row["kind"], row["name"])
-        for row in connection.execute(
-            "SELECT kind, name FROM dominator_nodes ORDER BY kind, name"
-        )
-    }
-    for row in connection.execute(
-        """
-        SELECT DISTINCT
-          retainer.kind AS retainer_kind,
-          retainer.name AS retainer_name,
-          retained.kind AS retained_kind,
-          retained.name AS retained_name
-        FROM edges AS edge
-        JOIN nodes AS retainer ON retainer.id = edge.retainer_id
-        JOIN dominator_nodes AS predecessor
-          ON predecessor.kind = retainer.kind
-         AND predecessor.name = retainer.name
-        JOIN nodes AS retained ON retained.id = edge.retained_id
-        JOIN dominator_nodes AS successor
-          ON successor.kind = retained.kind
-         AND successor.name = retained.name
-        """
-    ):
-        predecessor = nodes[(row["retainer_kind"], row["retainer_name"])]
-        successor = nodes[(row["retained_kind"], row["retained_name"])]
-        predecessor.succs.add(successor)
-        successor.preds.add(predecessor)
-    return _LogicalGraph(nodes)
+        {"node_id": node_id},
+    ).fetchall()
 
 
 def dominators(
     connection: sqlite3.Connection,
     target: tuple[str, str],
 ) -> list[dict[str, object]]:
-    graph = _load_ancestor_graph(connection, target)
-    result = analysis.get_dominators(graph, graph.nodes[target])
-    return [{"type": node.kind, "name": node.name} for node in result]
+    """The target's chain in the materialized dominator tree, so `dominators`,
+    `dominated`, `retained-count` and `top-retained` answer from one tree. For an annotation
+    type or keep rule with several instances, the nodes that dominate every
+    instance."""
+    # SQLite reads a negative LIMIT as no limit.
+    instances = [row["node_id"] for row in _dom_stats(connection, target, -1)]
+    first = _dominator_chain(connection, instances[0])
+    common = {row["id"] for row in first}
+    for node_id in instances[1:]:
+        # An instance that is itself a root has an empty chain, and once the
+        # intersection is empty no node dominates every instance.
+        if not common:
+            return []
+        common &= {row["id"] for row in _dominator_chain(connection, node_id)}
+    common.difference_update(instances)
+    # One row per node of the chain: each annotation or seed instance is its own.
+    return [
+        {"type": row["type"], "name": row["name"]}
+        for row in first
+        if row["id"] in common
+    ]
 
 
 def new_nodes(
@@ -569,9 +637,10 @@ def new_nodes(
     if marker_exists is None:
         raise ValueError("input is not a reachability-diff graph: no <NEW> marker")
 
+    # One row per new node: each new annotation or seed instance is its own.
     cursor = connection.execute(
         """
-        SELECT DISTINCT node.kind AS type, node.name AS name
+        SELECT node.kind AS type, node.name AS name
         FROM nodes AS marker
         JOIN edges AS edge INDEXED BY edges_by_retained
           ON edge.retained_id = marker.id

@@ -92,10 +92,6 @@ void FixpointIterator::analyze_node(call_graph::NodeId const& node,
     }
     outgoing_insns.emplace(edge->invoke_insn());
   }
-  WholeProgramStateAccessorRecord record;
-  if (ipa->wps_accessor) {
-    ipa->wps_accessor->start_recording(&record);
-  }
   UnorderedMap<const IRInstruction*, ArgumentDomain> result;
   for (auto* block : cfg.blocks()) {
     auto state = intra_cp.get_entry_state_at(block);
@@ -114,14 +110,11 @@ void FixpointIterator::analyze_node(call_graph::NodeId const& node,
       intra_cp.analyze_instruction(insn, &state, insn == last_insn->insn);
     }
   }
-  if (ipa->wps_accessor) {
-    ipa->wps_accessor->stop_recording();
-  }
   for (auto& [insn, out_args] : UnorderedIterable(result)) {
     current_state->set(insn, out_args);
   }
   method_cache.push_front(std::make_shared<MethodCacheEntry>((MethodCacheEntry){
-      std::move(args), std::move(record), std::move(result)}));
+      std::move(args), ipa->take_wps_accessor_record(), std::move(result)}));
   ++m_stats.method_cache_misses;
 }
 
@@ -145,17 +138,25 @@ FixpointIterator::get_intraprocedural_analysis(const DexMethod* method) const {
 }
 
 IntraproceduralAnalysis::IntraproceduralAnalysis(
-    const NullCheckMethods* null_check_methods,
     std::unique_ptr<WholeProgramStateAccessor> wps_accessor,
     const cfg::ControlFlowGraph& cfg,
     InstructionAnalyzer<ConstantEnvironment> insn_analyzer,
+    InstructionAnalyzer<ConstantEnvironment> no_throw_analyzer,
     const ConstantEnvironment& env)
     : wps_accessor(std::move(wps_accessor)),
-      fp_iter(cfg,
-              std::move(insn_analyzer),
-              make_wps_aware_no_throw_analyzer(null_check_methods,
-                                               this->wps_accessor.get())) {
+      fp_iter(cfg, std::move(insn_analyzer), std::move(no_throw_analyzer)) {
+  if (this->wps_accessor) {
+    this->wps_accessor->start_recording();
+  }
   fp_iter.run(env);
+}
+
+WholeProgramStateAccessorRecord
+IntraproceduralAnalysis::take_wps_accessor_record() {
+  if (wps_accessor == nullptr) {
+    return {};
+  }
+  return wps_accessor->stop_recording();
 }
 
 const ArgumentDomain& FixpointIterator::get_entry_args(
@@ -181,10 +182,19 @@ bool FixpointIterator::method_cache_entry_matches(
   if (!mce.args.equals(args)) {
     return false;
   }
+  // Each value is compared the way WholeProgramStateAccessor read it: with a
+  // call graph, a callee's return value and parameter summary come straight
+  // from the partitions, also for methods that are not known.
   if (m_wps->has_call_graph()) {
     for (auto&& [method, val] :
          UnorderedIterable(mce.wps_accessor_record.method_dependencies)) {
       if (!m_wps->get_method_partition().get(method).equals(val)) {
+        return false;
+      }
+    }
+    for (auto&& [method, val] : UnorderedIterable(
+             mce.wps_accessor_record.method_param_env_dependencies)) {
+      if (!m_wps->get_method_param_partition().get(method).equals(val)) {
         return false;
       }
     }
@@ -195,16 +205,16 @@ bool FixpointIterator::method_cache_entry_matches(
         return false;
       }
     }
+    for (auto&& [method, val] : UnorderedIterable(
+             mce.wps_accessor_record.method_param_env_dependencies)) {
+      if (!m_wps->get_method_param_env(method).equals(val)) {
+        return false;
+      }
+    }
   }
   for (auto&& [field, val] :
        UnorderedIterable(mce.wps_accessor_record.field_dependencies)) {
     if (!m_wps->get_field_value(field).equals(val)) {
-      return false;
-    }
-  }
-  for (auto&& [method, val] : UnorderedIterable(
-           mce.wps_accessor_record.method_param_env_dependencies)) {
-    if (!m_wps->get_method_param_env(method).equals(val)) {
       return false;
     }
   }

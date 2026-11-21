@@ -59,15 +59,26 @@ ConstantEnvironment env_with_params(bool is_static,
                                     const IRCode* code,
                                     const ArgumentDomain& args);
 
+// Runs the intraprocedural fixpoint of one method. It records every
+// whole-program value it reads, from construction until
+// take_wps_accessor_record(), so that FixpointIterator can tell when a cached
+// result of the method is stale.
 struct IntraproceduralAnalysis {
   std::unique_ptr<WholeProgramStateAccessor> wps_accessor;
   intraprocedural::FixpointIterator fp_iter;
   IntraproceduralAnalysis(
-      const NullCheckMethods* null_check_methods,
       std::unique_ptr<WholeProgramStateAccessor> wps_accessor,
       const cfg::ControlFlowGraph& cfg,
       InstructionAnalyzer<ConstantEnvironment> insn_analyzer,
+      InstructionAnalyzer<ConstantEnvironment> no_throw_analyzer,
       const ConstantEnvironment& env);
+
+  /*
+   * Stops recording and returns the whole-program values read since
+   * construction: by the fixpoint iteration, including its edge transfer
+   * functions, and by any later walk over the instructions.
+   */
+  WholeProgramStateAccessorRecord take_wps_accessor_record();
 };
 
 using IntraproceduralAnalysisFactory =

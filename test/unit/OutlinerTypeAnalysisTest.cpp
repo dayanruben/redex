@@ -14,6 +14,7 @@
 #include <string>
 #include <vector>
 
+#include "ArtTypeCheck.h"
 #include "Creators.h"
 #include "Debug.h"
 #include "IRAssembler.h"
@@ -540,82 +541,6 @@ TEST_F(OutlinerTypeAnalysisTest, integral_type_join_covers_every_art_merge) {
 
 namespace art16 {
 
-// The integral register kinds of android-16.0.0_r1
-// `runtime/verifier/reg_type.h`, each group of constants in the enumerator
-// order the merge relies on.
-enum Kind : uint8_t {
-  kBoolean,
-  kByte,
-  kChar,
-  kShort,
-  kInteger,
-  kZero,
-  kBooleanConstant,
-  kPositiveByteConstant,
-  kPositiveShortConstant,
-  kCharConstant,
-  kByteConstant,
-  kShortConstant,
-  kIntegerConstant,
-  kNumKinds,
-};
-
-constexpr bool is_constant(uint8_t k) { return k >= kZero; }
-constexpr bool is_boolean_types(uint8_t k) {
-  return k == kBoolean || k == kZero || k == kBooleanConstant;
-}
-constexpr bool is_byte_types(uint8_t k) {
-  return k == kByte || k == kPositiveByteConstant || k == kByteConstant ||
-         is_boolean_types(k);
-}
-constexpr bool is_short_types(uint8_t k) {
-  return k == kShort || k == kPositiveShortConstant || k == kShortConstant ||
-         is_byte_types(k);
-}
-constexpr bool is_char_types(uint8_t k) {
-  return k == kChar || k == kCharConstant || k == kPositiveShortConstant ||
-         k == kPositiveByteConstant || is_boolean_types(k);
-}
-
-// `RegTypeMergeImpl::MergeKind` (`runtime/verifier/reg_type.cc`) on two
-// integral kinds.
-constexpr uint8_t merge(uint8_t a, uint8_t b) {
-  if (is_constant(a) && is_constant(b)) {
-    auto is_non_negative = [](uint8_t k) {
-      return k == kZero || k == kBooleanConstant ||
-             k == kPositiveByteConstant || k == kPositiveShortConstant ||
-             k == kCharConstant;
-    };
-    if (is_non_negative(a) == is_non_negative(b)) {
-      return a >= b ? a : b;
-    }
-    const uint8_t non_negative = is_non_negative(a) ? a : b;
-    const uint8_t can_be_negative = is_non_negative(a) ? b : a;
-    if (can_be_negative == kByteConstant &&
-        non_negative <= kPositiveByteConstant) {
-      return kByteConstant;
-    }
-    if (can_be_negative <= kShortConstant &&
-        non_negative <= kPositiveShortConstant) {
-      return kShortConstant;
-    }
-    return kIntegerConstant;
-  }
-  if (is_boolean_types(a) && is_boolean_types(b)) {
-    return kBoolean;
-  }
-  if (is_byte_types(a) && is_byte_types(b)) {
-    return kByte;
-  }
-  if (is_short_types(a) && is_short_types(b)) {
-    return kShort;
-  }
-  if (is_char_types(a) && is_char_types(b)) {
-    return kChar;
-  }
-  return kInteger;
-}
-
 outliner_impl::IntegralType to_integral_type(uint8_t k) {
   using IT = outliner_impl::IntegralType;
   switch (k) {
@@ -793,6 +718,62 @@ TEST_F(OutlinerTypeAnalysisTest,
   EXPECT_EQ(multisets, 2379u);
 }
 
+// Before android-16, ART held a constant by its value (`art_oracle`), not by a
+// kind. Its merge reaches the kind android-16's does, for the integral types
+// and the boundary values of every constant kind, so `ArtTypeCheck.h`
+// models both with android-16's kinds.
+TEST_F(OutlinerTypeAnalysisTest, pre16_merge_reaches_the_same_kinds) {
+  using art_oracle::Reg;
+  auto kind = [](const Reg& r) -> uint8_t {
+    switch (r.kind) {
+    case Reg::Boolean:
+      return art16::kBoolean;
+    case Reg::Byte:
+      return art16::kByte;
+    case Reg::Short:
+      return art16::kShort;
+    case Reg::Char:
+      return art16::kChar;
+    case Reg::Integer:
+      return art16::kInteger;
+    case Reg::Constant:
+      return art16::constant_kind(r.value);
+    }
+    not_reached();
+  };
+  std::vector<Reg> leaves{
+      {Reg::Boolean}, {Reg::Byte}, {Reg::Short}, {Reg::Char}, {Reg::Integer}};
+  const int64_t boundaries[] = {std::numeric_limits<int32_t>::min(),
+                                -32769,
+                                -32768,
+                                -129,
+                                -128,
+                                -1,
+                                0,
+                                1,
+                                2,
+                                127,
+                                128,
+                                32767,
+                                32768,
+                                65535,
+                                65536,
+                                std::numeric_limits<int32_t>::max()};
+  for (int64_t v : boundaries) {
+    leaves.push_back({Reg::Constant, v});
+  }
+  for (const auto& a : leaves) {
+    EXPECT_EQ(a.boolean_types(), art16::is_boolean_types(kind(a)));
+    EXPECT_EQ(a.byte_types(), art16::is_byte_types(kind(a)));
+    EXPECT_EQ(a.short_types(), art16::is_short_types(kind(a)));
+    EXPECT_EQ(a.char_types(), art16::is_char_types(kind(a)));
+    for (const auto& b : leaves) {
+      EXPECT_EQ(kind(art_oracle::merge(a, b)), art16::merge(kind(a), kind(b)))
+          << a.kind << " " << a.value << ", " << b.kind << " " << b.value;
+    }
+  }
+}
+
 namespace {
 
 // A method that defines a parameter of each integral type and a constant for
@@ -875,6 +856,219 @@ const DexType* type_of_every_merge(const std::vector<art_oracle::Reg>& values) {
 }
 
 } // namespace
+
+TEST_F(OutlinerTypeAnalysisTest, demand_accepts) {
+  using IT = outliner_impl::IntegralType;
+  const art::Demand none;
+  EXPECT_TRUE(none.accepts(IT::of(type::_int())));
+
+  const auto char_use = art::Demand::of_use(type::_char());
+  EXPECT_TRUE(char_use.accepts(IT::constant(65)));
+  EXPECT_TRUE(char_use.accepts(IT::of(type::_boolean())));
+  EXPECT_FALSE(char_use.accepts(IT::of(type::_byte())));
+  EXPECT_FALSE(char_use.accepts(IT::constant(-1)));
+  // `int` and `short` meet at `short`, which holds a `byte` but not a `char`.
+  auto narrowed = art::Demand::of_use(type::_int());
+  narrowed.meet_with(art::Demand::of_use(type::_short()));
+  EXPECT_TRUE(narrowed.accepts(IT::of(type::_byte())));
+  EXPECT_FALSE(narrowed.accepts(IT::of(type::_char())));
+  // A `boolean`, a `char` and 2: ART may merge the first two into `char`,
+  // which holds 2, or the `boolean` and 2 into `byte` first, which the `char`
+  // takes to `int`.
+  EXPECT_FALSE(char_use.accepts(
+      IT::join(IT::join(IT::of(type::_boolean()), IT::of(type::_char())),
+               IT::constant(2))));
+
+  // A use of a non-integral type accepts no integral value, constants
+  // included, whatever else is demanded.
+  const auto object = art::Demand::of_use(type::java_lang_Object());
+  EXPECT_FALSE(object.accepts(IT::of(type::_int())));
+  EXPECT_FALSE(object.accepts(IT::constant(0)));
+  EXPECT_FALSE(
+      art::Demand::of_use(type::_float()).accepts(IT::of(type::_int())));
+  auto mixed = art::Demand::of_use(type::_int());
+  mixed.meet_with(art::Demand::of_use(type::_float()));
+  EXPECT_FALSE(mixed.accepts(IT::constant(1)));
+
+  auto no_meet = art::Demand::of_use(type::_byte());
+  no_meet.meet_with(art::Demand::of_use(type::_char()));
+  EXPECT_TRUE(no_meet.accepts(IT::constant(65)));
+  EXPECT_TRUE(no_meet.accepts(IT::of(type::_boolean())));
+  EXPECT_FALSE(no_meet.accepts(IT::constant(200)));
+  EXPECT_FALSE(no_meet.accepts(IT::of(type::_byte())));
+
+  const auto unknown = art::Demand::unknown();
+  EXPECT_FALSE(unknown.accepts(IT::of(type::_boolean())));
+}
+
+// A parameter holds the passed values in every order ART may merge them.
+TEST_F(OutlinerTypeAnalysisTest, accepts_argument) {
+  auto constant = [](IROpcode op, int64_t literal) {
+    IRInstruction insn(op);
+    insn.set_dest(0);
+    insn.set_literal(literal);
+    return art::Value::constant(&insn);
+  };
+  auto join = [](std::initializer_list<art::Value> values) {
+    art::Value joined;
+    for (const auto& v : values) {
+      joined.join_with(v);
+    }
+    return joined;
+  };
+  const auto two = constant(OPCODE_CONST, 2);
+  const auto zero = constant(OPCODE_CONST, 0);
+  const auto wide_zero = constant(OPCODE_CONST_WIDE, 0);
+  const auto of = [](const DexType* t) { return art::Value::of_type(t); };
+
+  // Integral: a `boolean` or 2 is a `byte` in every order.
+  const auto boolean_or_two = join({of(type::_boolean()), two});
+  EXPECT_TRUE(art::accepts_argument(type::_byte(), boolean_or_two));
+  EXPECT_FALSE(art::accepts_argument(type::_char(), boolean_or_two));
+  EXPECT_FALSE(art::accepts_argument(type::_int(), of(type::_float())));
+  EXPECT_FALSE(art::accepts_argument(type::_int(), art::Value::unknown()));
+
+  // `float`, `long`, `double`: the type, or a constant of its width.
+  EXPECT_TRUE(
+      art::accepts_argument(type::_float(), join({of(type::_float()), two})));
+  EXPECT_FALSE(art::accepts_argument(type::_float(), wide_zero));
+  EXPECT_FALSE(art::accepts_argument(type::_float(), of(type::_int())));
+  EXPECT_TRUE(art::accepts_argument(type::_long(),
+                                    join({of(type::_long()), wide_zero})));
+  EXPECT_FALSE(art::accepts_argument(type::_long(), two));
+  EXPECT_FALSE(art::accepts_argument(type::_double(), of(type::_long())));
+  // A register that is 32-bit on one path and 64-bit on another has no type.
+  EXPECT_FALSE(art::accepts_argument(type::_long(), join({wide_zero, zero})));
+  EXPECT_FALSE(art::accepts_argument(
+      type::_double(), join({of(type::_double()), wide_zero, zero})));
+
+  ClassCreator i_creator(DexType::make_type("LAcceptI;"));
+  i_creator.set_access(ACC_INTERFACE | ACC_ABSTRACT);
+  i_creator.set_super(type::java_lang_Object());
+  auto* i_type = i_creator.create()->get_type();
+  ClassCreator a_creator(DexType::make_type("LAcceptA;"));
+  a_creator.set_super(type::java_lang_Object());
+  a_creator.add_interface(i_type);
+  auto* a_type = a_creator.create()->get_type();
+  ClassCreator b_creator(DexType::make_type("LAcceptB;"));
+  b_creator.set_super(type::java_lang_Object());
+  b_creator.add_interface(i_type);
+  auto* b_type = b_creator.create()->get_type();
+  auto* i_array = type::make_array_type(i_type);
+  auto* a_array = type::make_array_type(a_type);
+  auto* b_array = type::make_array_type(b_type);
+
+  // Any reference or zero is assigned to an interface; no primitive is.
+  EXPECT_TRUE(
+      art::accepts_argument(i_type, join({of(a_type), of(b_type), zero})));
+  EXPECT_FALSE(
+      art::accepts_argument(i_type, join({of(a_type), of(type::_int())})));
+  EXPECT_FALSE(
+      art::accepts_argument(type::java_lang_Object(), of(type::_float())));
+  // Arrays of classes merge monotonically: an unknown value is accepted.
+  EXPECT_TRUE(art::accepts_argument(a_array, art::Value::unknown()));
+
+  // An array of an interface holds only its own type and null.
+  EXPECT_TRUE(art::accepts_argument(i_array, join({of(i_array), zero})));
+  EXPECT_FALSE(art::accepts_argument(i_array, of(a_array)));
+  EXPECT_FALSE(
+      art::accepts_argument(i_array, join({of(a_array), of(b_array)})));
+  EXPECT_FALSE(art::accepts_argument(
+      i_array, of(type::make_array_type(type::java_lang_Object()))));
+  EXPECT_FALSE(art::accepts_argument(i_array, art::Value::unknown()));
+  EXPECT_TRUE(art::accepts_argument(
+      type::make_array_type(i_type, 2),
+      join({of(type::make_array_type(i_type, 2)), zero})));
+  EXPECT_FALSE(art::accepts_argument(type::make_array_type(i_type, 2),
+                                     of(type::make_array_type(a_type, 2))));
+  // An element class Redex cannot see, or never created, may be an interface.
+  auto* unseen_array = type::make_array_type(DexType::make_type("LUnseen;"));
+  EXPECT_FALSE(
+      art::accepts_argument(unseen_array, join({of(a_array), of(b_array)})));
+  auto* never_made_array = DexType::make_type("[LNeverMade;");
+  EXPECT_FALSE(art::accepts_argument(never_made_array, of(a_array)));
+  EXPECT_TRUE(art::accepts_argument(never_made_array, zero));
+  // Arrays of primitives and of `Object` merge monotonically.
+  EXPECT_TRUE(
+      art::accepts_argument(type::make_array_type(type::java_lang_Object()),
+                            join({of(a_array), of(b_array)})));
+  EXPECT_TRUE(art::accepts_argument(type::make_array_type(type::_int(), 2),
+                                    art::Value::unknown()));
+  EXPECT_FALSE(art::accepts_argument(nullptr, zero));
+}
+
+// A parameter declared from the value the caller passes is never wider than an
+// integral value the caller holds, and is refused when no declared type
+// satisfies the uses.
+TEST_F(OutlinerTypeAnalysisTest, declare_parameter_preferring_supply) {
+  auto use = [](const DexType* t) { return art::Demand::of_use(t); };
+  auto supply = [](const art::Value& v) { return [v]() { return v; }; };
+  const auto char_value = art::Value::of_type(type::_char());
+  IRInstruction constant(OPCODE_CONST);
+  constant.set_dest(0);
+  constant.set_literal(65);
+  const auto constant_value = art::Value::constant(&constant);
+  auto declare = [](const art::Demand& uses,
+                    const std::function<art::Value()>& value) {
+    return art::declare_parameter_preferring_supply(uses, value);
+  };
+
+  // Passed through: the value's own type, and `int` for constants alone.
+  EXPECT_EQ(declare(art::Demand(), supply(char_value)), type::_char());
+  EXPECT_EQ(declare(art::Demand(), supply(constant_value)), type::_int());
+  // An `int` use accepts the `char`, which stays `char`; a constant takes the
+  // widest type its uses accept.
+  EXPECT_EQ(declare(use(type::_int()), supply(char_value)), type::_char());
+  EXPECT_EQ(declare(use(type::_char()), supply(constant_value)), type::_char());
+  // A `byte` use does not accept a `char`.
+  EXPECT_EQ(declare(use(type::_byte()), supply(char_value)), std::nullopt);
+  // `byte` and `char` uses have no widest type; an unknown use refuses too.
+  auto no_meet = use(type::_byte());
+  no_meet.meet_with(use(type::_char()));
+  EXPECT_EQ(declare(no_meet, supply(constant_value)), std::nullopt);
+  EXPECT_EQ(declare(art::Demand::unknown(), supply(char_value)), std::nullopt);
+  // A value whose type cannot be told is refused, whether or not a use requires
+  // a type. A known value that is not integral is declared as it is when no use
+  // requires a type, and refused by an integral use.
+  EXPECT_EQ(declare(art::Demand(), supply(art::Value::unknown())),
+            std::nullopt);
+  EXPECT_EQ(declare(use(type::_int()), supply(art::Value::unknown())),
+            std::nullopt);
+  EXPECT_EQ(declare(art::Demand(),
+                    supply(art::Value::of_type(type::java_lang_String()))),
+            type::java_lang_String());
+  EXPECT_EQ(
+      declare(use(type::_int()), supply(art::Value::of_type(type::_float()))),
+      std::nullopt);
+  // A widest type of any other kind is declared when it holds the value.
+  EXPECT_EQ(declare(use(type::java_lang_Object()),
+                    supply(art::Value::of_type(type::java_lang_String()))),
+            type::java_lang_Object());
+  EXPECT_EQ(declare(use(type::_float()), supply(constant_value)),
+            type::_float());
+  EXPECT_EQ(declare(use(type::java_lang_Object()), supply(char_value)),
+            std::nullopt);
+}
+
+// `value_of_producers` keeps constants as constants, and a copy stands for the
+// definitions of what it copies.
+TEST_F(OutlinerTypeAnalysisTest, value_of_producers) {
+  auto* foo_method = assembler::method_from_string(R"(
+      (method (public static) "LFoo;.foo:()V" (
+        (const v0 65)
+        (move v1 v0)
+        (sput-short v0 "LFoo;.s:S")
+        (sput-char v1 "LFoo;.c:C")
+        (return-void)
+      )))");
+  foo_method->get_code()->build_cfg();
+  outliner_impl::OutlinerTypeAnalysis ota(foo_method);
+  const auto* copy = find_insn(foo_method, OPCODE_MOVE);
+  auto value = ota.value_of_producers({copy}).integral();
+  ASSERT_TRUE(value.has_value());
+  EXPECT_TRUE(value->is_constant());
+  EXPECT_TRUE(value->held_by(type::_char()));
+}
 
 // Checks `get_result_type` against ART's merge. The definitions are every set
 // of up to four drawn from a parameter of each integral type and the oracle's
@@ -1008,6 +1202,42 @@ TEST_F(OutlinerTypeAnalysisTest, get_result_type_merges_constants_by_value) {
   EXPECT_EQ(type_of(1, 65), type::_byte());
   EXPECT_EQ(type_of(1, 200), type::_short());
   EXPECT_EQ(type_of(4, 65), type::_char());
+}
+
+// A register holds either one 32-bit value or a 64-bit pair. A narrow `const 0`
+// has no fixed type, but it has a width: where it meets a `long` or a
+// `const-wide`, no type holds both, whatever the uses accept. Only a value
+// whose contributions all have one width has a type.
+TEST_F(OutlinerTypeAnalysisTest, get_result_type_of_mixed_widths) {
+  auto* foo_method = assembler::method_from_string(R"(
+      (method (public static) "LFoo;.foo:(J)V" (
+        (load-param-wide v0)
+        (const v2 0)
+        (const-wide v4 4294967296)
+        (const-wide v6 0)
+        (add-long v8 v2 v4)
+        (add-long v8 v6 v4)
+        (return-void)
+      )))");
+  foo_method->get_code()->build_cfg();
+  outliner_impl::OutlinerTypeAnalysis ota(foo_method);
+  auto* narrow_zero = find_insn(foo_method, OPCODE_CONST);
+  auto* wide_constant = find_insn(foo_method, OPCODE_CONST_WIDE);
+  auto* wide_zero = find_insn(foo_method, OPCODE_CONST_WIDE, 2);
+  auto* long_param = find_insn(foo_method, IOPCODE_LOAD_PARAM_WIDE);
+  // Mixed widths: a narrow constant beside a `long` producer, beside a
+  // `const-wide`, or beside an incoming `long`.
+  EXPECT_EQ(get_result_type(ota, {narrow_zero, long_param}, nullptr), nullptr);
+  EXPECT_EQ(get_result_type(ota, {narrow_zero, wide_constant}, nullptr),
+            nullptr);
+  EXPECT_EQ(get_result_type(ota, {narrow_zero}, type::_long()), nullptr);
+  // A `const-wide` beside a narrow type.
+  EXPECT_EQ(get_result_type(ota, {wide_constant}, type::_float()), nullptr);
+  // One width: wide constants and a `long` are a `long`.
+  EXPECT_EQ(get_result_type(ota, {wide_zero, wide_constant}, nullptr),
+            type::_long());
+  EXPECT_EQ(get_result_type(ota, {wide_zero, long_param}, nullptr),
+            type::_long());
 }
 
 // A register whose only definitions are undefined values, or that has none,
@@ -2000,4 +2230,211 @@ TEST_F(OutlinerTypeAnalysisTest,
   EXPECT_EQ(get_inferred_type(candidate, sput->src(0),
                               /* as_result */ true),
             nullptr);
+}
+
+namespace {
+
+// `Object <- LA <- {LB, LC}`, as real classes: combining the types the uses
+// require compares them with `type::check_cast`, which answers false for a type
+// with no `DexClass`.
+DexMethod* create_with_a_b_c(const std::string& method) {
+  ClassCreator object_creator(type::java_lang_Object());
+  object_creator.create();
+  ClassCreator a_creator(DexType::make_type("LA;"));
+  a_creator.set_super(type::java_lang_Object());
+  auto* a_type = a_creator.create()->get_type();
+  ClassCreator b_creator(DexType::make_type("LB;"));
+  b_creator.set_super(a_type);
+  b_creator.create();
+  ClassCreator c_creator(DexType::make_type("LC;"));
+  c_creator.set_super(a_type);
+  c_creator.create();
+
+  auto* foo_method = assembler::method_from_string(method);
+  foo_method->get_code()->build_cfg();
+  ClassCreator foo_creator(DexType::make_type("LFoo;"));
+  foo_creator.set_super(type::java_lang_Object());
+  foo_creator.add_method(foo_method);
+  foo_creator.create();
+  return foo_method;
+}
+
+} // namespace
+
+// The caller chooses which uses type a register. A value passed into a region
+// must satisfy the region's own uses; a value the region returns must satisfy
+// only the uses after it. Here the region is the block holding `useB`, and
+// `v0` is read as an `LB;` inside it and as an `LA;` after it. The same
+// definitions therefore give `LB;` or `LA;`, depending on the scope passed in.
+TEST_F(OutlinerTypeAnalysisTest, demand_of_uses_reads_the_scope_it_is_given) {
+  auto* foo_method = create_with_a_b_c(R"(
+      (method (public static) "LFoo;.twoSided:(LA;Z)V" (
+        (load-param-object v0)
+        (load-param v1)
+        (if-eqz v1 :out)
+        (invoke-static (v0) "LFoo;.useB:(LB;)V")
+        (:out)
+        (invoke-static (v0) "LFoo;.useA:(LA;)V")
+        (return-void)
+      )))");
+  auto& cfg = foo_method->get_code()->cfg();
+  outliner_impl::OutlinerTypeAnalysis ota(foo_method);
+  auto* anchor = find_invoke_of(foo_method, "useB");
+  auto* region = block_of(cfg, anchor);
+  auto seeds = ota.immediate_defs_at(anchor, anchor->src(0));
+
+  auto inside = [&](IRInstruction* insn) {
+    return block_of(cfg, insn) == region;
+  };
+  auto after = [&](IRInstruction* insn) { return !inside(insn); };
+  EXPECT_EQ(ota.demand_of_uses(seeds, inside).widest(),
+            DexType::get_type("LB;"));
+  EXPECT_EQ(ota.demand_of_uses(seeds, after).widest(),
+            DexType::get_type("LA;"));
+}
+
+// A value a region returns is constrained only by the uses its own definitions
+// reach. `v0` is written on both arms of a diamond: the region writes an `LB;`,
+// and the path that skips the region writes an `LC;` and reads it as an `LC;`.
+// Starting from every definition that reaches the join would let that read
+// require an `LC;` of the region's value, which is never an `LC;`.
+TEST_F(OutlinerTypeAnalysisTest, demand_of_uses_reads_only_its_seeds) {
+  auto* foo_method = create_with_a_b_c(R"(
+      (method (public static) "LFoo;.siblings:(Z)V" (
+        (load-param v1)
+        (if-eqz v1 :bypass)
+        (invoke-static () "LFoo;.makeB:()LB;")
+        (move-result-object v0)
+        (goto :join)
+        (:bypass)
+        (invoke-static () "LFoo;.makeC:()LC;")
+        (move-result-object v0)
+        (invoke-static (v0) "LFoo;.useC:(LC;)V")
+        (:join)
+        (invoke-static (v0) "LFoo;.useA:(LA;)V")
+        (return-void)
+      )))");
+  auto& cfg = foo_method->get_code()->cfg();
+  outliner_impl::OutlinerTypeAnalysis ota(foo_method);
+  auto* anchor = find_invoke_of(foo_method, "useA");
+  auto* region = block_of(cfg, find_invoke_of(foo_method, "makeB"));
+  auto after = [&](IRInstruction* insn) {
+    return block_of(cfg, insn) != region;
+  };
+
+  auto every_def = ota.immediate_defs_at(anchor, anchor->src(0));
+  EXPECT_EQ(ota.demand_of_uses(every_def, after).widest(),
+            DexType::get_type("LC;"));
+
+  auto own_defs = every_def;
+  own_defs.filter(
+      [&](IRInstruction* def) { return block_of(cfg, def) == region; });
+  ASSERT_EQ(own_defs.size(), 1u);
+  EXPECT_EQ(ota.demand_of_uses(own_defs, after).widest(),
+            DexType::get_type("LA;"));
+}
+
+// `supply_at` keeps the constants that reach an integral register as
+// constants, and gives an integral value only to an integral register.
+TEST_F(OutlinerTypeAnalysisTest, supply_at) {
+  auto* foo_method = assembler::method_from_string(R"(
+      (method (public static) "LFoo;.foo:(CLjava/lang/Object;)V" (
+        (load-param v0)
+        (load-param-object v1)
+        (const v2 1)
+        (int-to-float v3 v2)
+        (const v5 1065353216)
+        (sput-char v0 "LFoo;.c:C")
+        (sput v2 "LFoo;.i:I")
+        (sput v3 "LFoo;.f:F")
+        (sput v5 "LFoo;.g:F")
+        (sput-object v1 "LFoo;.o:Ljava/lang/Object;")
+        (return-void)
+      )))");
+  foo_method->get_code()->build_cfg();
+  outliner_impl::OutlinerTypeAnalysis ota(foo_method);
+  const auto* anchor = find_insn(foo_method, OPCODE_SPUT_CHAR);
+
+  {
+    // A char parameter is a char value.
+    auto supply = ota.supply_at(anchor, 0);
+    EXPECT_EQ(supply.upper(), type::_char());
+    auto value = supply.integral();
+    ASSERT_TRUE(value.has_value());
+    EXPECT_FALSE(value->is_constant());
+    EXPECT_EQ(value->type(), type::_char());
+  }
+
+  {
+    // A register that only a constant defines has a constant value, though
+    // `value_at` types it as `boolean` (a type that holds 1).
+    EXPECT_EQ(ota.value_at(anchor, 2).upper(), type::_boolean());
+    auto value = ota.supply_at(anchor, 2).integral();
+    ASSERT_TRUE(value.has_value());
+    EXPECT_TRUE(value->is_constant());
+  }
+
+  {
+    // A float has no integral value.
+    auto supply = ota.supply_at(anchor, 3);
+    EXPECT_EQ(supply.upper(), type::_float());
+    EXPECT_FALSE(supply.integral().has_value());
+  }
+
+  {
+    // Nor does a reference.
+    auto supply = ota.supply_at(anchor, 1);
+    EXPECT_EQ(supply.upper(), type::java_lang_Object());
+    EXPECT_FALSE(supply.integral().has_value());
+  }
+
+  {
+    // A literal used as a float is a float.
+    auto supply = ota.supply_at(anchor, 5);
+    EXPECT_EQ(supply.upper(), type::_float());
+    EXPECT_FALSE(supply.integral().has_value());
+  }
+}
+
+// Type inference joins `[LSupplyA;` and `[LSupplyB;` to the array of the
+// interface both classes implement, but ART merges them to `Object[]`. So
+// `supply_at` keeps both arrays, and an array of the interface does not hold
+// them, while `value_at` still gives one type to declare.
+TEST_F(OutlinerTypeAnalysisTest, supply_at_keeps_each_reference) {
+  ClassCreator object_creator(type::java_lang_Object());
+  object_creator.create();
+  ClassCreator i_creator(DexType::make_type("LSupplyI;"));
+  i_creator.set_access(ACC_INTERFACE | ACC_ABSTRACT);
+  i_creator.set_super(type::java_lang_Object());
+  auto* i_type = i_creator.create()->get_type();
+  for (const auto* name : {"LSupplyA;", "LSupplyB;"}) {
+    ClassCreator creator(DexType::make_type(name));
+    creator.set_super(type::java_lang_Object());
+    creator.add_interface(i_type);
+    creator.create();
+  }
+  auto* foo_method = assembler::method_from_string(R"(
+      (method (public static) "LFoo;.foo:(I)V" (
+        (load-param v0)
+        (if-eqz v0 :b)
+        (invoke-static () "LFoo;.as:()[LSupplyA;")
+        (move-result-object v1)
+        (goto :join)
+        (:b)
+        (invoke-static () "LFoo;.bs:()[LSupplyB;")
+        (move-result-object v1)
+        (:join)
+        (invoke-static (v1) "LFoo;.take:([Ljava/lang/Object;)V")
+        (return-void)
+      )))");
+  foo_method->get_code()->build_cfg();
+  outliner_impl::OutlinerTypeAnalysis ota(foo_method);
+  const auto* take = find_insn(foo_method, [](IRInstruction* insn) {
+    return insn->opcode() == OPCODE_INVOKE_STATIC && insn->srcs_size() == 1;
+  });
+  const auto supply = ota.supply_at(take, 1);
+  EXPECT_FALSE(art::accepts_argument(type::make_array_type(i_type), supply));
+  EXPECT_TRUE(art::accepts_argument(
+      type::make_array_type(type::java_lang_Object()), supply));
+  EXPECT_EQ(ota.value_at(take, 1).upper(), type::make_array_type(i_type));
 }

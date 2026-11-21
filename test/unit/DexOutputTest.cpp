@@ -6,10 +6,194 @@
  */
 
 #include "DexOutput.h"
+#include "Creators.h"
+#include "DexPosition.h"
+#include "IODIMetadata.h"
 #include "IODIPlan.h"
+#include "IRAssembler.h"
+#include "InstructionLowering.h"
+#include "RedexOptions.h"
+#include "RedexTest.h"
+#include "RedexTestUtils.h"
+#include "TypeUtil.h"
+#include <cstring>
+#include <fstream>
 #include <gtest/gtest.h>
 #include <json/reader.h>
 #include <json/value.h>
+
+class IODIMetadataTest : public RedexTest {};
+
+TEST_F(IODIMetadataTest, SerializationUsesMethodIdentityNotInsertionOrder) {
+  ClassCreator creator(DexType::make_type("LOrderedIodi;"));
+  creator.set_super(type::java_lang_Object());
+  std::vector<DexMethod*> methods;
+  for (size_t i = 0; i < 16; ++i) {
+    auto name = std::string("m") + (i < 10 ? "0" : "") + std::to_string(i);
+    auto* method = DexMethod::make_method("LOrderedIodi;." + name + ":()V")
+                       ->make_concrete(ACC_PUBLIC | ACC_STATIC, false);
+    creator.add_method(method);
+    methods.push_back(method);
+  }
+  creator.create();
+  ClassCreator second(DexType::make_type("LSecondOrderedIodi;"));
+  second.set_super(type::java_lang_Object());
+  auto* other = DexMethod::make_method("LSecondOrderedIodi;.a:()V")
+                    ->make_concrete(ACC_PUBLIC | ACC_STATIC, false);
+  second.add_method(other);
+  second.create();
+  std::vector<std::pair<std::string, uint64_t>> expected;
+  for (size_t i = 0; i < methods.size(); ++i) {
+    auto name =
+        std::string("OrderedIodi.m") + (i < 10 ? "0" : "") + std::to_string(i);
+    if (i % 3 != 0) {
+      name += "@" + std::to_string(i % 3);
+    }
+    expected.emplace_back(name, i + 1);
+  }
+  methods.push_back(other);
+  expected.emplace_back("SecondOrderedIodi.a@1", methods.size());
+  std::string first;
+  for (bool reverse : {false, true}) {
+    IODIMetadata metadata;
+    UnorderedMap<DexMethod*, uint64_t> ids;
+    for (size_t i = 0; i < methods.size(); ++i) {
+      const size_t index = reverse ? methods.size() - i - 1 : i;
+      metadata.set_iodi_layer(methods[index], index % 3);
+      ids.emplace(methods[index], index + 1);
+    }
+    std::ostringstream stream;
+    metadata.write(stream, ids);
+    const auto bytes = stream.str();
+    if (!reverse) {
+      first = bytes;
+    } else {
+      EXPECT_EQ(first, bytes);
+    }
+    ASSERT_GE(bytes.size(), 16u);
+    uint32_t count;
+    std::memcpy(&count, bytes.data() + 8, sizeof(count));
+    ASSERT_EQ(count, expected.size());
+    size_t offset = 16;
+    std::vector<std::pair<std::string, uint64_t>> actual;
+    for (uint32_t i = 0; i < count; ++i) {
+      ASSERT_GE(bytes.size() - offset, 10u);
+      uint16_t length;
+      uint64_t id;
+      std::memcpy(&length, bytes.data() + offset, sizeof(length));
+      std::memcpy(&id, bytes.data() + offset + 2, sizeof(id));
+      offset += 10;
+      ASSERT_GE(bytes.size() - offset, length);
+      actual.emplace_back(bytes.substr(offset, length), id);
+      offset += length;
+    }
+    EXPECT_EQ(actual, expected);
+    EXPECT_EQ(offset, bytes.size());
+  }
+}
+
+class MethodSymbolOrderTest : public RedexTest {};
+
+TEST_F(MethodSymbolOrderTest, EmitsRecordsInDexMethodIndexOrder) {
+  ClassCreator creator(DexType::make_type("LOrderedSymbols;"));
+  creator.set_super(type::java_lang_Object());
+  std::vector<uint32_t> expected_indices;
+  std::vector<std::string> expected_names;
+  for (uint32_t i = 0; i < 16; ++i) {
+    expected_indices.push_back(i);
+    expected_names.push_back(std::string("m") + (i < 10 ? "0" : "") +
+                             std::to_string(i));
+    const size_t index = (i * 7) % 16;
+    const auto name =
+        std::string("m") + (index < 10 ? "0" : "") + std::to_string(index);
+    auto* method =
+        DexMethod::make_method(std::string("LOrderedSymbols;.") + name + ":()V")
+            ->make_concrete(ACC_PUBLIC | ACC_STATIC, false);
+    method->set_code(assembler::ircode_from_string("((return-void))"));
+    creator.add_method(method);
+  }
+  DexStore store("classes");
+  store.add_classes({creator.create()});
+  DexStoresVector stores;
+  stores.push_back(std::move(store));
+  instruction_lowering::normalize_cfg(stores);
+  instruction_lowering::run(stores);
+  auto& classes = stores[0].get_dexen()[0];
+  auto temp = redex::make_tmp_dir("symbol-order-%%%%-%%%%");
+  redex::create_directories(temp.path + "/meta");
+  ConfigFiles config(Json::Value(Json::objectValue), temp.path);
+  const auto dex_path = temp.path + "/classes.dex";
+  std::unique_ptr<PositionMapper> mapper(
+      PositionMapper::make(temp.path + "/positions"));
+  DexOutput output(dex_path.c_str(), &classes,
+                   std::make_shared<GatheredTypes>(&classes), true, 0,
+                   &stores[0].get_name(), 0, DebugInfoKind::PerMethodDebug,
+                   nullptr, config, mapper.get(), nullptr, nullptr);
+  output.prepare(SortMode::DEFAULT, {SortMode::DEFAULT}, config, "dex\n035");
+  output.write();
+  std::ifstream input(config.metafile("redex-method-id-map.txt"));
+  uint32_t method_index;
+  uint32_t signature_word;
+  std::string name;
+  std::string class_name;
+  std::vector<uint32_t> indices;
+  std::vector<std::string> names;
+  while (input >> method_index >> signature_word >> name >> class_name) {
+    indices.push_back(method_index);
+    names.push_back(name);
+  }
+  EXPECT_EQ(indices, expected_indices);
+  EXPECT_EQ(names, expected_names);
+}
+class DexIoTest : public RedexTest {
+ public:
+  DexClasses classes;
+  std::string store_name{"classes"};
+  std::unique_ptr<PositionMapper> mapper{PositionMapper::make("")};
+
+  std::unique_ptr<DexOutput> make_output(const std::string& filename,
+                                         ConfigFiles& config) {
+    auto output = std::make_unique<DexOutput>(
+        filename.c_str(), &classes, std::make_shared<GatheredTypes>(&classes),
+        true, 0, &store_name, 0, DebugInfoKind::NoCustomSymbolication, nullptr,
+        config, mapper.get(), nullptr, nullptr);
+    output->prepare(SortMode::DEFAULT, {SortMode::DEFAULT}, config, "dex\n035");
+    return output;
+  }
+};
+
+TEST_F(DexIoTest, WritesCompleteDexAndRecordsItsByteCount) {
+  auto temp = redex::make_tmp_dir("dex-io-%%%%-%%%%");
+  redex::create_directories(temp.path + "/meta");
+  ConfigFiles config(Json::Value(Json::objectValue), temp.path);
+  const auto filename = temp.path + "/output.dex";
+  auto output = make_output(filename, config);
+  output->write();
+  EXPECT_GT(output->m_stats.num_bytes, 0);
+  EXPECT_EQ(redex::file_size(filename), output->m_stats.num_bytes);
+}
+
+TEST_F(DexIoTest, RejectsOpenFailureBeforeWritingSymbolFiles) {
+  auto temp = redex::make_tmp_dir("dex-io-%%%%-%%%%");
+  redex::create_directories(temp.path + "/meta");
+  ConfigFiles config(Json::Value(Json::objectValue), temp.path);
+  const auto filename = temp.path + "/missing/output.dex";
+  auto output = make_output(filename, config);
+  EXPECT_THROW(output->write(), RedexException);
+  EXPECT_FALSE(redex::exists(config.metafile("redex-full-rename-map.txt")));
+}
+
+#ifdef __linux__
+TEST_F(DexIoTest, RejectsWriteFailureBeforeWritingSymbolFiles) {
+  auto temp = redex::make_tmp_dir("dex-io-%%%%-%%%%");
+  redex::create_directories(temp.path + "/meta");
+  ConfigFiles config(Json::Value(Json::objectValue), temp.path);
+  const std::string filename("/dev/full");
+  auto output = make_output(filename, config);
+  EXPECT_THROW(output->write(), RedexException);
+  EXPECT_FALSE(redex::exists(config.metafile("redex-full-rename-map.txt")));
+}
+#endif
 
 TEST(DexOutput, checkMethodInstructionSizeLimit) {
 

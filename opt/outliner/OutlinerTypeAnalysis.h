@@ -102,8 +102,8 @@ class IntegralType {
 namespace art {
 
 // What ART's verifier may hold in a register: the type of every producer and
-// every constant that reaches it. `join` keeps each contribution; `upper()`
-// resolves them into one type.
+// every constant that reaches it, each one register wide or a wide pair.
+// `join` keeps each contribution; `upper()` resolves them into one type.
 class Value {
  public:
   // No value reaches the register.
@@ -113,6 +113,9 @@ class Value {
   static Value of_type(const DexType* t);
   // The value of a `const` or `const-wide`.
   static Value constant(const IRInstruction* insn);
+  // This value, to which only constants contribute, given the type `t` that the
+  // uses of those constants need. The constants keep their widths.
+  Value typed_by_uses(const DexType* t) const;
 
   void join_with(const Value& other);
 
@@ -125,13 +128,16 @@ class Value {
   bool is_constant() const;
   // The type of the register, at or above every contribution; nullptr when
   // a contribution is unknown, no type holds them all, or only constants
-  // contribute.
+  // contribute. No type holds a one-register value beside a wide pair, such
+  // as a `const 0` beside a `long`.
   const DexType* upper() const;
   // `upper()` when every order in which ART may merge the contributions ends
   // at that type, else nullptr (`IntegralType::exact_type`).
   const DexType* exact() const;
 
  private:
+  friend bool accepts_argument(const DexType* parameter, const Value& passed);
+
   bool m_unknown{false};
   // The integral producers.
   std::optional<IntegralType> m_integral;
@@ -141,6 +147,7 @@ class Value {
   UnorderedSet<const DexType*> m_references;
   std::optional<IntegralType> m_constants;
   bool m_wide_constant{false};
+  bool m_narrow_constant{false};
 };
 
 // What the uses of a register require of it: the type each use demands.
@@ -167,6 +174,12 @@ class Demand {
   // is no use, or no one type is accepted by every use: two classes or
   // categories, or `char` beside `byte` or `short`.
   const DexType* widest() const;
+  // Whether every use accepts the integral value `value`: every integral type a
+  // use needs holds it, so with no use any value is accepted. A use that needs
+  // any other type accepts no integral value. ART would take a constant at a
+  // `float` use, and 0 at a reference use, but this answers no for those too.
+  // When the type a use needs is unknown, nothing is accepted.
+  bool accepts(const IntegralType& value) const;
 
  private:
   bool m_unknown{false};
@@ -180,6 +193,46 @@ class Demand {
 // When the uses do not determine a type, the type of the value `supply` gives.
 const DexType* declare_parameter(const Demand& uses,
                                  const std::function<Value()>& supply);
+
+// Whether a parameter declared `parameter` holds `passed`, every value its
+// call passes, in every order in which ART may merge them. The call may pass
+// fewer values than the uses were verified with: when the entry is a loop
+// header whose back edge moves into the split, the call passes only the
+// values that reach the header from before the loop. Each is still at or
+// below the merge the uses were verified with. Only for an integral parameter
+// and for an array of interfaces does merge order change the answer; any
+// other parameter accepts a value of its kind (a reference for a reference,
+// a `float` for a `float`) in any order. A parameter that is an array of an
+// interface, or of a class Redex cannot see, is taken to hold only values of
+// exactly its type, or null; an unknown value is refused only there and at an
+// integral parameter. `passed` must list each value, not a join of them.
+[[nodiscard]] bool accepts_argument(const DexType* parameter,
+                                    const Value& passed);
+
+// The type to declare for a value passed into outlined code, or nullopt to
+// refuse the value; never nullptr. For an integral value it is never wider than
+// the type the caller holds, so a value the outlined code passes on keeps the
+// integral type ART gave it in the caller. `declare_parameter`, by contrast,
+// may widen a `char` to the `int` its uses accept.
+//
+//  - No use needs a type (the value is only passed on): the type of the value.
+//    A value defined only by constants has no single type, and `int` holds any
+//    of them. A value whose type cannot be told (an unknown contribution, or
+//    several without a common type), or that the type does not hold
+//    (`accepts_argument`), is refused.
+//  - The uses have a widest type: refuse a value it does not hold
+//    (`accepts_argument`). Otherwise declare the type of an integral value that
+//    is not only constants, and else that widest type. The type of the value is
+//    the least type above every order in which ART may merge its definitions,
+//    because outlined code need not keep the order ART verified the caller
+//    with.
+//  - The uses have no widest type, or the type a use needs is unknown: refuse.
+//    No declared type satisfies the uses.
+//
+// `supply` gives the value that reaches the register at the call, as the caller
+// holds it; it is called only when the uses do not refuse the value.
+std::optional<const DexType*> declare_parameter_preferring_supply(
+    const Demand& uses, const std::function<Value()>& supply);
 
 // The type of a value outlined code gives back. The caller's code after the
 // call was verified against the one type ART gave the register, so only a
@@ -208,8 +261,32 @@ class OutlinerTypeAnalysis {
       const std::optional<art::Value>& incoming,
       const Membership& candidate = {});
 
-  // The value of `reg` where `anchor` reads it.
+  // The value of `reg` where `anchor` reads it, typed for a declaration: its
+  // `supply_at`, except that a declared type is one type, not a set of values.
+  // So a reference takes the type that type inference gives the register, and
+  // a register only constants define takes a type from how the constants are
+  // used.
   art::Value value_at(const IRInstruction* anchor, reg_t reg);
+
+  // What reaches `reg` where `anchor` reads it, with constants kept as
+  // constants: the join of its definitions as ART types them
+  // (`value_of_producers`). A reference keeps the value of each producer too,
+  // where its producers are known: ART merges arrays whose elements share an
+  // interface to `Object[]`, wider than type inference's join of them, and
+  // `art::accepts_argument` must see each value. Floating-point and wide
+  // values take the type that type inference gives the register. A register
+  // that only constants define keeps those constants where their uses take
+  // them as integral values; a literal used as a float, a wide value or null
+  // takes that type, and a literal whose uses have no common type is unknown.
+  art::Value supply_at(const IRInstruction* anchor, reg_t reg);
+
+  // What reaches a register that `defs` define, with constants kept as
+  // constants: the join of the value of each producer as ART types it. A move
+  // or move-result stands for the producers of what it copies; the value is
+  // unknown when those are not known. ART types a constant by its value, an
+  // `and`, `or` or `xor` as `boolean` when every operand is boolean and as
+  // `int` otherwise, and any other producer by its result type.
+  art::Value value_of_producers(const UnorderedSet<const IRInstruction*>& defs);
 
   // What the instructions of `pc` require of the value `reg` holds on entry.
   // `result` is the register the candidate gives back, with its declared type.
@@ -259,6 +336,11 @@ class OutlinerTypeAnalysis {
 
   std::optional<UnorderedSet<const IRInstruction*>> get_defs(
       const UnorderedSet<const IRInstruction*>& insns);
+
+  // The definitions of `reg` that reach `anchor`; nullopt when they are not
+  // known (bottom or top).
+  std::optional<UnorderedSet<const IRInstruction*>> known_defs_at(
+      const IRInstruction* anchor, reg_t reg);
 
   const DexType* get_const_insns_type_demand(
       const Membership& candidate,

@@ -438,10 +438,11 @@ void TransitiveClosureMarkerWorker::push(const DexMethodRef* parent,
 
 void TransitiveClosureMarkerWorker::push_if_class_instantiable(
     const DexMethod* method) {
-  if ((method == nullptr) ||
-      m_shared_state->reachable_objects->marked(method)) {
+  if (method == nullptr) {
     return;
   }
+  // A method that is already marked still gets the conditional edge, so the
+  // recorded graph does not depend on marking order.
   TRACE(REACH, 4,
         "Conditionally marking method if declaring class is instantiable: %s",
         SHOW(method));
@@ -462,9 +463,11 @@ void TransitiveClosureMarkerWorker::push_if_class_instantiable(
 
 void TransitiveClosureMarkerWorker::push_if_class_instantiable(
     const DexField* field) {
-  if ((field == nullptr) || m_shared_state->reachable_objects->marked(field)) {
+  if (field == nullptr) {
     return;
   }
+  // A field that is already marked still gets the conditional edge, so the
+  // recorded graph does not depend on marking order.
   TRACE(REACH, 4,
         "Conditionally marking field if declaring class is instantiable: %s",
         SHOW(field));
@@ -476,15 +479,24 @@ void TransitiveClosureMarkerWorker::push_if_class_instantiable(
   }
 }
 
-void TransitiveClosureMarkerWorker::push_if_class_instantiable(
-    const DexClass* cls) {
-  if ((cls == nullptr) || m_shared_state->reachable_objects->marked(cls)) {
-    return;
-  }
+void TransitiveClosureMarkerWorker::push_class_if_instantiable(
+    const DexMethod* referrer, const DexClass* cls) {
+  // get_instantiable_dependency returns a dependency, the only way a class
+  // gets here, only for a class that is neither null nor external.
+  // instantiable() never visits an external class, so its referrers would
+  // never be read.
+  redex_assert(!cls->is_external());
+  // A class that is already marked still gets the edge from each referrer, so
+  // the recorded graph does not depend on marking order. Register the
+  // referrer before checking instantiability: otherwise another worker can
+  // finish visiting the instantiable class in between, and the edge is lost.
   TRACE(REACH, 4, "Conditionally marking class if instantiable: %s", SHOW(cls));
-  m_shared_state->cond_marked->if_class_instantiable.classes.insert(cls);
+  m_shared_state->cond_marked->stepped_over_referrers_if_class_instantiable
+      .update(cls, [&](auto*, auto& referrers, bool) {
+        referrers.insert(referrer);
+      });
   if (m_shared_state->reachable_aspects->instantiable_types.count(cls) != 0u) {
-    push(cls, cls);
+    push(referrer, cls);
   }
 }
 
@@ -541,10 +553,11 @@ void TransitiveClosureMarkerWorker::push_if_method_returning(
 
 void TransitiveClosureMarkerWorker::push_if_class_retained(
     const DexMethod* method) {
-  if ((method == nullptr) ||
-      m_shared_state->reachable_objects->marked(method)) {
+  if (method == nullptr) {
     return;
   }
+  // A method that is already marked still gets the conditional edge, so the
+  // recorded graph does not depend on marking order.
   TRACE(REACH, 4,
         "Conditionally marking method if declaring class is retained: %s",
         SHOW(method));
@@ -557,9 +570,11 @@ void TransitiveClosureMarkerWorker::push_if_class_retained(
 
 void TransitiveClosureMarkerWorker::push_if_class_retained(
     const DexField* field) {
-  if ((field == nullptr) || m_shared_state->reachable_objects->marked(field)) {
+  if (field == nullptr) {
     return;
   }
+  // A field that is already marked still gets the conditional edge, so the
+  // recorded graph does not depend on marking order.
   TRACE(REACH, 4,
         "Conditionally marking field if declaring class is retained: %s",
         SHOW(field));
@@ -720,8 +735,8 @@ MethodReferencesGatherer::MethodReferencesGatherer(
                               : default_gather_mie_with_gather_methods) {}
 
 std::optional<MethodReferencesGatherer::InstantiableDependency>
-MethodReferencesGatherer::get_instantiable_dependency(const IRInstruction* insn,
-                                                      References* refs) const {
+MethodReferencesGatherer::get_instantiable_dependency(
+    const IRInstruction* insn) const {
   auto op = insn->opcode();
   InstantiableDependency res;
   if (opcode::is_an_ifield_op(op)) {
@@ -737,14 +752,8 @@ MethodReferencesGatherer::get_instantiable_dependency(const IRInstruction* insn,
   } else if (opcode::is_instance_of(op)) {
     res.cls = type_class(insn->get_type());
     res.may_throw_if_uninstantiable = false;
-    if ((res.cls != nullptr) && !res.cls->is_external()) {
-      refs->classes_if_instantiable.push_back(res.cls);
-    }
   } else if (opcode::is_check_cast(op)) {
     res.cls = type_class(insn->get_type());
-    if ((res.cls != nullptr) && !res.cls->is_external()) {
-      refs->classes_if_instantiable.push_back(res.cls);
-    }
   }
   auto is_class_instantiable = [this](const auto* cls) -> bool {
     if (!m_shared_state->cfg_gathering_check_instantiable ||
@@ -1030,7 +1039,7 @@ void MethodReferencesGatherer::advance(const Advance& advance,
   auto advance_in_block = [this, refs](auto* block, auto& it) {
     for (; it != block->end(); ++it) {
       if (it->type == MFLOW_OPCODE) {
-        auto instantiable_dep = get_instantiable_dependency(it->insn, refs);
+        auto instantiable_dep = get_instantiable_dependency(it->insn);
         if (instantiable_dep) {
           return std::make_optional<Dependency>(*instantiable_dep);
         }
@@ -1129,6 +1138,14 @@ void MethodReferencesGatherer::advance(const Advance& advance,
         visit_throw_succs_if_last_insn(block, it);
         continue;
       }
+      // The walk steps over this instruction without gathering its type, so
+      // the class is kept only once it is instantiable, with this method as
+      // its retainer. An instruction the walk does not step over has its type
+      // gathered, which retains the class directly. get_instantiable_dependency
+      // returns a dependency only for a class that is neither null nor
+      // external.
+      refs->stepped_over_classes_if_instantiable.push_back(
+          instantiable_dep->cls);
       m_instructions_visited++;
       queue.push((CFGNeedle){block, std::next(it)});
       continue;
@@ -1260,8 +1277,9 @@ void TransitiveClosureMarkerWorker::gather_and_push(
   base_invoke_virtual_target(
       refs.base_invoke_virtual_targets_if_class_instantiable);
   instance_callable(refs.invoke_super_targets);
-  for (const auto* iface_cls : refs.classes_if_instantiable) {
-    push_if_class_instantiable(iface_cls);
+  for (const auto* stepped_over_cls :
+       refs.stepped_over_classes_if_instantiable) {
+    push_class_if_instantiable(meth, stepped_over_cls);
   }
   dynamically_referenced(refs.classes_dynamically_referenced);
   directly_instantiable(refs.new_instances);
@@ -1326,7 +1344,8 @@ bool References::maybe_from_code() const {
          !method_references_gatherer_dependencies_if_class_instantiable
               .empty() ||
          method_references_gatherer_dependency_if_instance_method_callable ||
-         !invoke_super_targets.empty() || returns;
+         !invoke_super_targets.empty() ||
+         !stepped_over_classes_if_instantiable.empty() || returns;
 }
 
 template <class Parent>
@@ -1423,8 +1442,12 @@ void TransitiveClosureMarkerWorker::visit_instantiable(const DexClass* cls) {
     instantiable(intf);
   }
   auto* cond_marked = m_shared_state->cond_marked;
-  if (cond_marked->if_class_instantiable.classes.count(cls) != 0u) {
-    push(cls, cls);
+  // instantiable() published cls before queuing this visit, so a referrer
+  // registered after this read sees it and pushes itself.
+  const auto referrers =
+      cond_marked->stepped_over_referrers_if_class_instantiable.get(cls, {});
+  for (const auto* referrer : UnorderedIterable(referrers)) {
+    push(referrer, cls);
   }
   for (auto const& f : cls->get_ifields()) {
     if (cond_marked->if_class_instantiable.fields.count(f) != 0u) {
@@ -1995,28 +2018,6 @@ std::unique_ptr<ReachableObjects> compute_reachable_objects(
   return reachable_objects;
 }
 
-void ReachableObjects::record_reachability(const DexMethodRef* member,
-                                           const DexClass* cls) {
-  // Each class member trivially retains its containing class; let's filter out
-  // this uninteresting information from our diagnostics.
-  if (member->get_class() == cls->get_type()) {
-    return;
-  }
-  m_retainers_of.update(ReachableObject(cls),
-                        [&](const ReachableObject&, ReachableObjectSet& set,
-                            bool /* exists */) { set.emplace(member); });
-}
-
-void ReachableObjects::record_reachability(const DexFieldRef* member,
-                                           const DexClass* cls) {
-  if (member->get_class() == cls->get_type()) {
-    return;
-  }
-  m_retainers_of.update(ReachableObject(cls),
-                        [&](const ReachableObject&, ReachableObjectSet& set,
-                            bool /* exists */) { set.emplace(member); });
-}
-
 template <class Object>
 void ReachableObjects::record_reachability(Object* parent, Object* object) {
   if (parent == object) {
@@ -2041,6 +2042,7 @@ void ReachableObjects::record_is_seed(Seed* seed) {
   m_retainers_of.update(
       ReachableObject(seed),
       [&](const ReachableObject&, ReachableObjectSet& set, bool /* exists */) {
+        bool has_reason = false;
         for (const auto& reason : UnorderedIterable(keep_reasons)) {
           // -keepnames rules are irrelevant when analyzing reachability
           if (reason->type == keep_reason::KEEP_RULE &&
@@ -2048,6 +2050,14 @@ void ReachableObjects::record_is_seed(Seed* seed) {
             continue;
           }
           set.emplace(reason);
+          has_reason = true;
+        }
+        // The kept methods of a seed class retain it, so a seed class without
+        // a recorded reason still needs a root above it, or it would sit in a
+        // loop with them that no root reaches. The generic seed stands in for
+        // the unrecorded reason.
+        if (!has_reason) {
+          set.emplace(ReachableObject());
         }
       });
 }
@@ -2623,8 +2633,8 @@ class RemovedEdgeRecorder {
 
   /*
    * `owner` is the class declaring `source`, or `source` itself when that is a
-   * class. Edges to it are dropped, mirroring how the reachability graph
-   * suppresses the trivial member-to-own-class reference.
+   * class. Edges to it are dropped, so that a removed member cannot keep its
+   * own removed class from being a root.
    */
   void record(const ReachableObject& source,
               const DexClass* owner,
@@ -2784,7 +2794,7 @@ void dump_graph(std::ostream& os, const ReachableObjectGraph& retainers_of) {
     __builtin_unreachable();
   };
 
-  bs::write_header(os, /* version */ 1);
+  bs::write_header(os, GRAPH_FORMAT_VERSION);
   bs::GraphWriter<ReachableObject, ReachableObjectHash> gw(
       write_reachable_object,
       [&](const ReachableObject& obj) -> std::vector<ReachableObject> {

@@ -121,12 +121,11 @@ DexMethod* find_most_specific_interface_method(const DexClass* cls,
         }
       }
     }
-    if (walk_through_super) {
-      // Keep walking up the class hierarchy to collect all interface methods
-      cur_cls = type_class(cur_cls->get_super_class());
-    } else {
-      cur_cls = nullptr;
+    if (!walk_through_super) {
+      break;
     }
+    // Keep walking up the class hierarchy to collect all interface methods
+    cur_cls = type_class(cur_cls->get_super_class());
   }
 
   if (candidates.empty()) {
@@ -544,6 +543,11 @@ DexField* resolve_field(const DexType* owner,
     cls = type_class(cls->get_super_class());
   }
   return nullptr;
+}
+
+bool is_external_call(const DexMethodRef* ref, const DexMethod* resolved) {
+  return resolved != nullptr ? resolved->is_external()
+                             : type_class_internal(ref->get_class()) == nullptr;
 }
 
 DexMethod* find_top_impl(const DexClass* cls,

@@ -12,11 +12,13 @@
 #include <string>
 #include <utility>
 
+#include "ArtTypeCheck.h"
 #include "BigBlocks.h"
 #include "DeterministicContainers.h"
 #include "DexAsm.h"
 #include "DexClass.h"
 #include "DexStore.h"
+#include "DexUtil.h"
 #include "IRAssembler.h"
 #include "IRCode.h"
 #include "OutliningProfileGuidanceImpl.h"
@@ -41,12 +43,22 @@ void run_passes(const std::vector<Pass*>& passes,
   // secondary dex
   store.add_classes(std::move(classes));
   stores.emplace_back(std::move(store));
+  auto methods = [&stores] {
+    std::vector<DexMethod*> all;
+    for (auto* cls : build_class_scope(stores)) {
+      auto ms = cls->get_all_methods();
+      all.insert(all.end(), ms.begin(), ms.end());
+    }
+    return all;
+  };
+  const method_splitting_test::ArtTypeCheckOfOutput art_check(methods());
   PassManager manager(passes);
 
   Json::Value conf_obj = Json::nullValue;
   ConfigFiles dummy_config(conf_obj);
   dummy_config.parse_global_config();
   manager.run_passes(stores, dummy_config);
+  EXPECT_EQ(art_check.violations(methods()), "");
 }
 
 struct InstructionSequenceOutlinerTest : public RedexTest {
@@ -307,6 +319,94 @@ TEST_F(InstructionSequenceOutlinerTest,
     }
   }
   EXPECT_CODE_EQ(expected_init_code.get(), outlined_init_code);
+}
+
+namespace {
+
+std::string repeat(const std::string& line, size_t n) {
+  std::string res;
+  for (size_t i = 0; i < n; i++) {
+    res += line;
+  }
+  return res;
+}
+
+bool contains_invoke_static(IRCode* code) {
+  for (const auto& mie : InstructionIterable(*code)) {
+    if (mie.insn->opcode() == OPCODE_INVOKE_STATIC) {
+      return true;
+    }
+  }
+  return false;
+}
+
+} // namespace
+
+// A constructor that calls its base constructor through a copy of `this`, as
+// a register allocator may do to line up the arguments of an
+// `invoke-direct/range`, has initialized `this` in the original register too.
+// The iputs on it after that call can be outlined.
+TEST_F(InstructionSequenceOutlinerTest,
+       iputsAfterBaseInitInvocationThroughACopy) {
+  create();
+
+  const auto iputs =
+      repeat(R"((iput-object v0 v0 "LC;.f:Ljava/lang/Object;"))", 14);
+  m_init->set_code(assembler::ircode_from_string(
+      R"((
+      (load-param-object v0)
+      (move-object v1 v0)
+      (invoke-direct (v1) "Ljava/lang/Object;.<init>:()V")
+      )" +
+      iputs + R"(
+      (return-void)
+    ))"));
+  m_other->set_code(assembler::ircode_from_string("((load-param-object v0)" +
+                                                  iputs + "(return-void))"));
+
+  run();
+
+  EXPECT_TRUE(contains_invoke_static(m_init->get_code()));
+}
+
+// When the base constructor call throws, `this` is still uninitialized in the
+// handler, so the handler's iputs on it must not be outlined: the outlined
+// method would receive an uninitialized object, which ART's verifier rejects.
+// Hand-written dex can catch the exception of a base constructor call; Java
+// and Kotlin cannot.
+TEST_F(InstructionSequenceOutlinerTest,
+       iputsInTheHandlerOfAThrowingBaseInitInvocation) {
+  create();
+
+  const auto iputs =
+      repeat(R"((iput-object v2 v0 "LC;.f:Ljava/lang/Object;"))", 14);
+  const std::string init_str = R"((
+      (load-param-object v0)
+      (const v2 0)
+      (.try_start t)
+      (invoke-direct (v0) "Ljava/lang/Object;.<init>:()V")
+      (.try_end t)
+      (return-void)
+      (.catch (t))
+      (move-exception v1)
+      )" + iputs + R"(
+      (throw v1)
+    ))";
+  m_init->set_code(assembler::ircode_from_string(init_str));
+  const std::string other_str =
+      "((load-param-object v0)(const v2 0)" + iputs + "(return-void))";
+  m_other->set_code(assembler::ircode_from_string(other_str));
+  for (const char* name : {"other2", "other3", "other4"}) {
+    auto* method = DexMethod::make_method(std::string("LC;.") + name + ":()V")
+                       ->make_concrete(ACC_PUBLIC, false);
+    method->set_code(assembler::ircode_from_string(other_str));
+    m_classes.front()->add_method(method);
+  }
+
+  run();
+
+  EXPECT_TRUE(contains_invoke_static(m_other->get_code()));
+  EXPECT_FALSE(contains_invoke_static(m_init->get_code()));
 }
 
 // Regression for the inverted null-check in throughput detection

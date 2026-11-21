@@ -12,6 +12,7 @@
 #include <gtest/gtest.h>
 
 #include "ControlFlow.h"
+#include "Creators.h"
 #include "DexClass.h"
 #include "IRAssembler.h"
 #include "MethodSplitterTestFixture.h"
@@ -92,27 +93,25 @@ TEST_F(MethodSplitterTestFixtureTest,
   EXPECT_TRUE(saw_cold);
 }
 
-// `regionTestConfig()` deliberately departs from the production defaults so
-// that tiny hand-written fixtures are splittable at all. Those departures are
-// what every region test silently depends on, so they are pinned here: if one
-// drifts back toward production, this fails in one obvious place instead of
-// turning a dozen unrelated fixtures un-splittable for no visible reason.
+// Every region test relies on `regionTestConfig()` lowering the production
+// size floors, so that a fixture a few dozen code units long is split at all.
+// The same small cold chain moves out under it, and stays in the host under
+// the production defaults with only region splitting turned on.
 TEST_F(MethodSplitterTestFixtureTest,
        FixtureSmoke_RegionTestConfigLowersProductionFloors) {
-  auto cfg = mt::regionTestConfig();
-  method_splitting_impl::Config prod;
+  const auto code = mt::hotColdHotCfg(mt::sputChain(20, "c"));
 
-  EXPECT_TRUE(cfg.enable_region_splitting)
-      << "region tests need the feature on; it is off by default";
+  auto lowered = mt::runSplitter("(I)V", code, mt::regionTestConfig());
+  EXPECT_EQ(mt::countFieldRefsIn(lowered, "c", mt::Where::AllSplits), 20u)
+      << mt::describeSelection(lowered);
+  EXPECT_EQ(mt::countFieldRefs(lowered.main_method, "c"), 0u);
 
-  // Fixtures are a few dozen code units, far below the production floors.
-  EXPECT_LT(cfg.min_hot_cold_split_size, prod.min_hot_cold_split_size);
-  EXPECT_LT(cfg.min_hot_split_size, prod.min_hot_split_size);
-  EXPECT_LE(cfg.min_hot_cold_split_size, 4u);
-  EXPECT_LE(cfg.min_hot_split_size, 4u);
-
-  // Block splitting must not fire and reshape a fixture's CFG under the test.
-  EXPECT_GT(cfg.split_block_size, prod.split_block_size);
+  method_splitting_impl::Config production;
+  production.enable_region_splitting = true;
+  auto unlowered = mt::runSplitter("(I)V", code, production);
+  EXPECT_TRUE(unlowered.region_splits.empty());
+  EXPECT_TRUE(unlowered.suffix_splits.empty());
+  EXPECT_EQ(mt::countFieldRefs(unlowered.main_method, "c"), 20u);
 }
 
 TEST_F(MethodSplitterTestFixtureTest,
@@ -137,4 +136,81 @@ TEST_F(MethodSplitterTestFixtureTest,
                            mt::regionTestConfig(), prefix);
   });
   EXPECT_TRUE(ok);
+}
+
+TEST_F(MethodSplitterTestFixtureTest, FixtureSmoke_SputChainStoresTheGivenReg) {
+  EXPECT_EQ(mt::sputChain(2, "x", "v3"),
+            "(sput v3 \"LFoo;.x_0:I\")\n(sput v3 \"LFoo;.x_1:I\")\n");
+}
+
+TEST_F(MethodSplitterTestFixtureTest, FixtureSmoke_SizedChainRoundsUp) {
+  EXPECT_EQ(mt::sizedChain(4, "c"), mt::sputChain(2, "c"));
+  EXPECT_EQ(mt::sizedChain(5, "c"), mt::sputChain(3, "c"));
+}
+
+// The hook gets the host before the splitter does: marked `no_outlining`
+// there, the host is not split, while the same code unmarked is.
+TEST_F(MethodSplitterTestFixtureTest, FixtureSmoke_BeforeSplitSeesTheHost) {
+  const auto code = mt::hotColdHotCfg(mt::sputChain(100, ""));
+  auto unmarked = mt::runSplitter("(I)V", code);
+  ASSERT_FALSE(unmarked.suffix_splits.empty());
+  DexMethod* seen = nullptr;
+  auto marked = mt::runSplitter("(I)V", code, mt::splitterTestConfig(), "LFoo",
+                                [&seen](DexMethod* m) {
+                                  seen = m;
+                                  m->rstate.set_no_outlining();
+                                });
+  EXPECT_EQ(seen, marked.main_method);
+  EXPECT_TRUE(marked.suffix_splits.empty());
+}
+
+TEST_F(MethodSplitterTestFixtureTest,
+       FixtureSmoke_TypeCheckFailureNamesErrors) {
+  auto make = [](const std::string& name, const std::string& code) {
+    auto* m = DexMethod::make_method("LTypeCheckSmoke;." + name + ":(I)V")
+                  ->make_concrete(ACC_PUBLIC | ACC_STATIC,
+                                  assembler::ircode_from_string(code),
+                                  /* is_virtual */ false);
+    m->get_code()->build_cfg();
+    return m;
+  };
+  EXPECT_EQ(mt::typeCheckFailure(make("good", R"(
+    (
+      (load-param v0)
+      (sput v0 "LFoo;.f:I")
+      (return-void)
+    ))")),
+            "");
+  EXPECT_NE(mt::typeCheckFailure(make("bad", R"(
+    (
+      (load-param v0)
+      (sput-object v0 "LFoo;.o:Ljava/lang/Object;")
+      (return-void)
+    ))")),
+            "");
+}
+
+// `typeCheckFailure` accepts what constructor inlining leaves when it inlines
+// a `Sub.<init>` that only calls `super()`: a `new-instance` of `Sub`
+// initialized by `Base.<init>`.
+TEST_F(MethodSplitterTestFixtureTest,
+       FixtureSmoke_TypeCheckFailureAcceptsASuperclassInit) {
+  ClassCreator base(DexType::make_type("LBaseTypeCheckSmoke;"));
+  base.set_super(type::java_lang_Object());
+  auto* base_type = base.create()->get_type();
+  ClassCreator sub(DexType::make_type("LSubTypeCheckSmoke;"));
+  sub.set_super(base_type);
+  sub.create();
+  auto* m = assembler::method_from_string(R"(
+    (method (public static) "LTypeCheckSmoke;.superInit:()V"
+      (
+        (new-instance "LSubTypeCheckSmoke;")
+        (move-result-pseudo-object v0)
+        (invoke-direct (v0) "LBaseTypeCheckSmoke;.<init>:()V")
+        (return-void)
+      )
+    )
+  )");
+  m->get_code()->build_cfg();
+  EXPECT_EQ(mt::typeCheckFailure(m), "");
 }

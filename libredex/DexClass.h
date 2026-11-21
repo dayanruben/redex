@@ -593,6 +593,9 @@ class DexProto {
 
   static DexProto* make_proto(const DexType* rtype, const DexTypeList* args);
 
+  // The proto of a descriptor such as "(I[Ljava/lang/String;)V".
+  static DexProto* make_proto(std::string_view descriptor);
+
   // Return an existing DexProto or nullptr if one does not exist.
   static DexProto* get_proto(const DexType* rtype, const DexTypeList* args);
 
@@ -1163,6 +1166,8 @@ class DexMethod : public DexMethodRef {
   template <typename C>
   void gather_callsites(C& lcallsite) const;
   template <typename C>
+  void gather_protos(C& lproto) const;
+  template <typename C>
   void gather_methodhandles(C& lmethodhandle) const;
 
   void gather_init_classes(std::vector<const DexType*>& ltype) const;
@@ -1420,6 +1425,8 @@ class DexClass {
   template <typename C>
   void gather_callsites(C& lcallsite) const;
   template <typename C>
+  void gather_protos(C& lproto) const;
+  template <typename C>
   void gather_methodhandles(C& lmethodhandle) const;
 
   void gather_load_types(UnorderedSet<const DexType*>& ltype) const;
@@ -1513,8 +1520,9 @@ inline DexClass* type_class_internal(const DexType* t) {
 }
 
 /**
- * For a set of classes, compute all referenced strings, types, fields and
- * methods, such that components are sorted and unique.
+ * For a set of classes, compute all referenced strings, types, fields,
+ * methods, call sites, method handles and protos (those referenced directly,
+ * see Gatherable::gather_protos), such that components are sorted and unique.
  */
 void gather_components(std::vector<const DexString*>& lstring,
                        std::vector<const DexType*>& ltype,
@@ -1522,6 +1530,7 @@ void gather_components(std::vector<const DexString*>& lstring,
                        std::vector<DexMethodRef*>& lmethod,
                        std::vector<DexCallSite*>& lcallsite,
                        std::vector<DexMethodHandle*>& lmethodhandle,
+                       std::vector<DexProto*>& lproto,
                        const DexClasses& classes,
                        bool exclude_loads = false);
 

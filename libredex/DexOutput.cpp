@@ -11,6 +11,7 @@
 #include <assert.h>
 #include <bitset>
 #include <boost/filesystem.hpp>
+#include <cerrno>
 #include <fcntl.h>
 #include <fstream>
 #include <functional>
@@ -19,7 +20,6 @@
 #include <limits>
 #include <memory>
 #include <stdlib.h>
-#include <sys/stat.h>
 #include <utility>
 
 #ifdef _MSC_VER
@@ -28,8 +28,6 @@
 #define open _open
 #define write _write
 #define close _close
-#define fstat _fstat64i32
-#define stat _stat64i32
 #define O_CREAT _O_CREAT
 #define O_TRUNC _O_TRUNC
 #define O_WRONLY _O_WRONLY
@@ -127,7 +125,7 @@ GatheredTypes::GatheredTypes(DexClasses* classes) : m_classes(classes) {
   build_method_map();
 
   gather_components(m_lstring, m_ltype, m_lfield, m_lmethod, m_lcallsite,
-                    m_lmethodhandle, *m_classes);
+                    m_lmethodhandle, m_lproto, *m_classes);
 }
 
 UnorderedSet<const DexString*> GatheredTypes::index_type_names() {
@@ -424,10 +422,11 @@ dexmethod_to_idx GatheredTypes::get_method_index(cmp_dmethod cmp) {
 dexproto_to_idx GatheredTypes::get_proto_index(cmp_dproto cmp) {
   // TODO: Profile and see whether a set first would be more efficient.
   std::vector<DexProto*> protos;
-  protos.reserve(m_lmethod.size() + m_lcallsite.size());
+  protos.reserve(m_lmethod.size() + m_lcallsite.size() + m_lproto.size());
   for (auto const& m : m_lmethod) {
     protos.push_back(m->get_proto());
   }
+  protos.insert(protos.end(), m_lproto.begin(), m_lproto.end());
   for (auto const& c : m_lcallsite) {
     protos.push_back(c->method_type());
     for (const auto& arg : c->args()) {
@@ -2472,7 +2471,10 @@ void write_method_mapping(const std::string& filename,
   assert_log(fd, "Can't open method mapping file %s: %s\n", filename.c_str(),
              strerror(errno));
   UnorderedSet<DexClass*> classes_in_dex(classes->begin(), classes->end());
-  for (const auto& it : UnorderedIterable(dodx->method_to_idx())) {
+  for (const auto& it : unordered_to_ordered(
+           dodx->method_to_idx(), [](const auto& left, const auto& right) {
+             return left.second < right.second;
+           })) {
     auto* method = it.first;
     auto idx = it.second;
 
@@ -2932,18 +2934,27 @@ void DexOutput::prepare(SortMode string_mode,
 }
 
 void DexOutput::write() {
-  struct stat st;
   int fd = open(m_filename, O_CREAT | O_TRUNC | O_WRONLY | O_BINARY, 0660);
-  if (fd == -1) {
-    perror("Error writing dex");
-    return;
+  always_assert_log(fd != -1, "Cannot open dex output %s: %s", m_filename,
+                    strerror(errno));
+  size_t written = 0;
+  while (written < m_offset) {
+    auto count = ::write(fd, m_output.get() + written, m_offset - written);
+    if (count == -1 && errno == EINTR) {
+      continue;
+    }
+    if (count <= 0) {
+      const auto error = errno;
+      close(fd);
+      always_assert_log(count > 0, "Cannot write dex output %s: %s", m_filename,
+                        strerror(error));
+    }
+    written += static_cast<size_t>(count);
   }
-  ::write(fd, m_output.get(), m_offset);
-  if (0 == fstat(fd, &st)) {
-    m_stats.num_bytes = st.st_size;
-  }
-  close(fd);
 
+  always_assert_log(close(fd) == 0, "Cannot close dex output %s: %s",
+                    m_filename, strerror(errno));
+  m_stats.num_bytes = static_cast<int64_t>(written);
   write_symbol_files();
 }
 

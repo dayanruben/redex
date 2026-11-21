@@ -332,6 +332,15 @@ Value Value::constant(const IRInstruction* insn) {
   Value v;
   v.m_constants = IntegralType::constant(insn->get_literal());
   v.m_wide_constant = insn->opcode() == OPCODE_CONST_WIDE;
+  v.m_narrow_constant = !v.m_wide_constant;
+  return v;
+}
+
+Value Value::typed_by_uses(const DexType* t) const {
+  always_assert(is_constant());
+  auto v = of_type(t);
+  v.m_wide_constant = m_wide_constant;
+  v.m_narrow_constant = m_narrow_constant;
   return v;
 }
 
@@ -346,6 +355,7 @@ void Value::join_with(const Value& other) {
     m_constants = IntegralType::join(m_constants, *other.m_constants);
   }
   m_wide_constant |= other.m_wide_constant;
+  m_narrow_constant |= other.m_narrow_constant;
 }
 
 std::optional<IntegralType> Value::integral() const {
@@ -365,7 +375,12 @@ bool Value::is_constant() const {
 }
 
 const DexType* Value::upper() const {
-  if (m_unknown) {
+  constexpr uint8_t kWidePrimitives = 2 | 4; // `long`, `double`
+  const bool wide = m_wide_constant || (m_primitives & kWidePrimitives) != 0;
+  const bool narrow = m_narrow_constant || m_integral ||
+                      (m_primitives & ~kWidePrimitives) != 0 ||
+                      !m_references.empty();
+  if (m_unknown || (wide && narrow)) {
     return nullptr;
   }
   const int kinds = (m_integral ? 1 : 0) + std::popcount(m_primitives) +
@@ -471,12 +486,86 @@ const DexType* Demand::widest() const {
   return *unordered_any(types);
 }
 
+bool Demand::accepts(const IntegralType& value) const {
+  if (m_unknown || m_primitives != 0 || !m_references.empty()) {
+    return false;
+  }
+  for (uint8_t k = 0; k < kNumIntegral; ++k) {
+    if ((m_integral & (1u << k)) != 0 && !value.held_by(integral_dex_type(k))) {
+      return false;
+    }
+  }
+  return true;
+}
+
 const DexType* declare_parameter(const Demand& uses,
                                  const std::function<Value()>& supply) {
   if (const auto* t = uses.widest()) {
     return t;
   }
   return supply().upper();
+}
+
+bool accepts_argument(const DexType* parameter, const Value& passed) {
+  if (parameter == nullptr) {
+    return false;
+  }
+  if (type::is_integral(parameter)) {
+    const auto integral = passed.integral();
+    return integral && integral->held_by(parameter);
+  }
+  if (const auto bit = primitive_bit(parameter); bit != 0) {
+    if (passed.m_integral || !passed.m_references.empty() ||
+        (passed.m_primitives & ~bit) != 0) {
+      return false;
+    }
+    const bool wide = parameter != type::_float();
+    return wide ? !passed.m_narrow_constant : !passed.m_wide_constant;
+  }
+  if (passed.m_integral || passed.m_primitives != 0 || passed.m_wide_constant) {
+    return false;
+  }
+  // nullptr when the element type was never created, so no class defines it.
+  const auto* element = type::get_element_type_if_array(parameter);
+  if (element == parameter ||
+      (element != nullptr &&
+       (type::is_primitive(element) || element == type::java_lang_Object()))) {
+    return true;
+  }
+  const auto* cls = element == nullptr ? nullptr : type_class(element);
+  if (cls != nullptr && !is_interface(cls)) {
+    return true;
+  }
+  // An array of an interface, or of a class Redex cannot see.
+  return !passed.m_unknown &&
+         unordered_all_of(passed.m_references, [parameter](const DexType* t) {
+           return t == parameter;
+         });
+}
+
+std::optional<const DexType*> declare_parameter_preferring_supply(
+    const Demand& uses, const std::function<Value()>& supply) {
+  if (uses.is_none()) {
+    const auto value = supply();
+    if (const auto integral = value.integral()) {
+      return integral->is_constant() ? type::_int() : integral->type();
+    }
+    if (const auto* t = value.upper(); accepts_argument(t, value)) {
+      return t;
+    }
+    return std::nullopt;
+  }
+  // `widest()` is also nullptr when the type a use needs is unknown.
+  const auto* widest = uses.widest();
+  if (widest == nullptr) {
+    return std::nullopt;
+  }
+  const auto value = supply();
+  if (!accepts_argument(widest, value)) {
+    return std::nullopt;
+  }
+  const auto integral = value.integral();
+  return integral && !integral->is_constant() ? integral->type() : widest;
 }
 
 const DexType* declare_result(const Value& returned) {
@@ -546,8 +635,8 @@ art::Value OutlinerTypeAnalysis::value_of_assignments(
   return value_of_defs(*defs, incoming ? *incoming : art::Value(), candidate);
 }
 
-art::Value OutlinerTypeAnalysis::value_at(const IRInstruction* anchor,
-                                          reg_t reg) {
+art::Value OutlinerTypeAnalysis::supply_at(const IRInstruction* anchor,
+                                           reg_t reg) {
   const auto& env = m_type_environments->at(anchor);
   switch (env.get_type(reg).element()) {
   case IRType::BOTTOM:
@@ -559,15 +648,27 @@ art::Value OutlinerTypeAnalysis::value_at(const IRInstruction* anchor,
   case IRType::INT: {
     // Type inference tells neither constants nor `boolean`, `byte`, `short`,
     // `char` and `int` apart; go back to the definitions.
-    auto defs = m_reaching_defs_environments->at(anchor).get(reg);
-    if (defs.is_bottom() || defs.is_top()) {
+    auto defs = known_defs_at(anchor, reg);
+    if (!defs) {
       return art::Value::unknown();
     }
-    return value_of_defs(UnorderedSet<const IRInstruction*>(
-                             defs.elements().begin(), defs.elements().end()),
-                         art::Value(), /* candidate */ {});
+    auto value = value_of_producers(*defs);
+    if (value.is_constant()) {
+      const auto typed = value_of_defs(*defs, art::Value(), /* candidate */ {});
+      const auto* type = typed.upper();
+      if (type == nullptr || !type::is_integral(type)) {
+        return typed;
+      }
+    }
+    return value;
   }
   case IRType::REFERENCE: {
+    // Type inference joins the references, and its join of arrays whose
+    // elements share an interface (`[LA;` and `[LB;` give `[LI;`) is narrower
+    // than ART's merge (`[Ljava/lang/Object;`), so keep each producer's value.
+    if (auto defs = known_defs_at(anchor, reg)) {
+      return value_of_producers(*defs);
+    }
     auto dex_type = env.get_dex_type(reg);
     return art::Value::of_type(dex_type ? *dex_type : nullptr);
   }
@@ -586,6 +687,48 @@ art::Value OutlinerTypeAnalysis::value_at(const IRInstruction* anchor,
     // shouldn't happen for any input, but we don't need to fight that here
     return art::Value::unknown();
   }
+}
+
+art::Value OutlinerTypeAnalysis::value_of_producers(
+    const UnorderedSet<const IRInstruction*>& defs) {
+  art::Value value;
+  UnorderedSet<const IRInstruction*> copies;
+  for (const auto* def : UnorderedIterable(defs)) {
+    if (opcode::is_a_move(def->opcode()) ||
+        opcode::is_move_result_any(def->opcode())) {
+      copies.insert(def);
+    } else {
+      value.join_with(value_of_def(def));
+    }
+  }
+  if (!copies.empty()) {
+    auto producers = get_defs(copies);
+    if (!producers) {
+      return art::Value::unknown();
+    }
+    for (const auto* producer : UnorderedIterable(*producers)) {
+      value.join_with(value_of_def(producer));
+    }
+  }
+  return value;
+}
+
+art::Value OutlinerTypeAnalysis::value_at(const IRInstruction* anchor,
+                                          reg_t reg) {
+  const auto& env = m_type_environments->at(anchor);
+  if (env.get_type(reg).element() == IRType::REFERENCE) {
+    auto dex_type = env.get_dex_type(reg);
+    return art::Value::of_type(dex_type ? *dex_type : nullptr);
+  }
+  auto value = supply_at(anchor, reg);
+  if (!value.is_constant()) {
+    return value;
+  }
+  // `supply_at` keeps constants only for a register whose definitions it
+  // knows.
+  auto defs = known_defs_at(anchor, reg);
+  redex_assert(defs.has_value());
+  return value_of_defs(*defs, art::Value(), /* candidate */ {});
 }
 
 art::Demand OutlinerTypeAnalysis::demand_of_use(IRInstruction* use,
@@ -1331,6 +1474,16 @@ const DexType* OutlinerTypeAnalysis::get_type_demand(IRInstruction* insn,
 }
 
 std::optional<UnorderedSet<const IRInstruction*>>
+OutlinerTypeAnalysis::known_defs_at(const IRInstruction* anchor, reg_t reg) {
+  auto defs = m_reaching_defs_environments->at(anchor).get(reg);
+  if (defs.is_bottom() || defs.is_top()) {
+    return std::nullopt;
+  }
+  return UnorderedSet<const IRInstruction*>(defs.elements().begin(),
+                                            defs.elements().end());
+}
+
+std::optional<UnorderedSet<const IRInstruction*>>
 OutlinerTypeAnalysis::get_defs(
     const UnorderedSet<const IRInstruction*>& insns) {
   UnorderedSet<const IRInstruction*> res;
@@ -1513,16 +1666,22 @@ art::Value OutlinerTypeAnalysis::value_of_defs(
     const UnorderedSet<const IRInstruction*>& defs,
     art::Value value,
     const Membership& candidate) {
-  UnorderedSet<const IRInstruction*> const_insns;
-  for (const auto* def : UnorderedIterable(defs)) {
-    if (def->opcode() == OPCODE_CONST || def->opcode() == OPCODE_CONST_WIDE) {
-      const_insns.insert(def);
-    }
-    value.join_with(value_of_def(def));
-  }
+  // `defs` are producers: a copy among them would hide the constants it copies
+  // from the scan below.
+  always_assert(unordered_none_of(defs, [](const IRInstruction* def) {
+    return opcode::is_a_move(def->opcode()) ||
+           opcode::is_move_result_any(def->opcode());
+  }));
+  value.join_with(value_of_producers(defs));
   if (value.is_constant()) {
     // Constants alone give a register no type; their uses do.
-    return art::Value::of_type(
+    UnorderedSet<const IRInstruction*> const_insns;
+    for (const auto* def : UnorderedIterable(defs)) {
+      if (def->opcode() == OPCODE_CONST || def->opcode() == OPCODE_CONST_WIDE) {
+        const_insns.insert(def);
+      }
+    }
+    return value.typed_by_uses(
         get_const_insns_type_demand(candidate, const_insns));
   }
   return value;

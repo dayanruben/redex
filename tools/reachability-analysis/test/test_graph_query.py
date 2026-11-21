@@ -103,6 +103,49 @@ class GraphQueryTest(unittest.TestCase):
 
         self.assertEqual([], json.loads(output))
 
+    def test_roots_list_an_instance_that_nothing_retains(self):
+        # Two instances of one annotation type: one carried by a kept class,
+        # one that nothing retains. The second is a root, although its name
+        # is shared with a retained instance.
+        graph = ReachabilityGraph()
+        root = ReachableObject(ReachableObjectType.SEED, "<SEED>")
+        kept = ReachableObject(ReachableObjectType.CLASS, "LKept;")
+        held_marker = ReachableObject(ReachableObjectType.ANNO, "LMarker;")
+        loose_marker = ReachableObject(ReachableObjectType.ANNO, "LMarker;")
+        for node in (root, kept, held_marker, loose_marker):
+            graph.add_node(node)
+        graph.add_edge(kept, root)
+        graph.add_edge(held_marker, kept)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_file = self._write_graph_db(graph, temp_dir)
+            output = self._run_db(db_file, "json", "roots")
+
+        self.assertEqual(
+            [
+                {"type": "ANNO", "name": "LMarker;"},
+                {"type": "SEED", "name": "<SEED>"},
+            ],
+            json.loads(output),
+        )
+
+    def test_roots_list_each_root_instance_of_one_name(self):
+        # One keep rule in two config files: two seeds with one printed name,
+        # each keeping its own class.
+        graph = ReachabilityGraph()
+        first = ReachableObject(ReachableObjectType.SEED, "KEEP: r")
+        second = ReachableObject(ReachableObjectType.SEED, "KEEP: r")
+        a = ReachableObject(ReachableObjectType.CLASS, "LA;")
+        b = ReachableObject(ReachableObjectType.CLASS, "LB;")
+        for node in (first, second, a, b):
+            graph.add_node(node)
+        graph.add_edge(a, first)
+        graph.add_edge(b, second)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_file = self._write_graph_db(graph, temp_dir)
+            output = self._run_db(db_file, "json", "roots")
+
+        self.assertEqual([{"type": "SEED", "name": "KEEP: r"}] * 2, json.loads(output))
+
     def test_rejects_invalid_catalog_metadata(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             db_file = self._copy_db(temp_dir)
@@ -163,6 +206,42 @@ class GraphQueryTest(unittest.TestCase):
             ],
             json.loads(output),
         )
+
+    def test_semantic_roots_lists_each_seed_instance(self):
+        # `-keep class Foo` in two config files: two seeds with one printed
+        # name, both keeping LFoo;.
+        graph = ReachabilityGraph()
+        foo = ReachableObject(ReachableObjectType.CLASS, "LFoo;")
+        graph.add_node(foo)
+        for _ in range(2):
+            seed = ReachableObject(ReachableObjectType.SEED, "KEEP: -keep class Foo")
+            graph.add_node(seed)
+            graph.add_edge(foo, seed)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_file = self._write_graph_db(graph, temp_dir)
+            output = self._run_db(db_file, "json", "semantic-roots")
+
+        row = {"type": "CLASS", "name": "LFoo;", "reason": "KEEP: -keep class Foo"}
+        self.assertEqual([row, row], json.loads(output))
+
+    def test_neighbors_lists_each_seed_instance(self):
+        # One keep rule in two config files: two seeds with one printed name,
+        # both keeping LA;.
+        graph = ReachabilityGraph()
+        a = ReachableObject(ReachableObjectType.CLASS, "LA;")
+        graph.add_node(a)
+        for _ in range(2):
+            seed = ReachableObject(ReachableObjectType.SEED, "KEEP: r")
+            graph.add_node(seed)
+            graph.add_edge(a, seed)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_file = self._write_graph_db(graph, temp_dir)
+            output = self._run_db(
+                db_file, "json", "neighbors", "LA;", "--direction", "retainers"
+            )
+
+        row = {"direction": "retainer", "type": "SEED", "name": "KEEP: r"}
+        self.assertEqual([row, row], json.loads(output))
 
     def test_neighbors_labels_both_edge_directions(self):
         output = self._run("csv", "neighbors", "LFoo;")
@@ -433,6 +512,64 @@ class GraphQueryTest(unittest.TestCase):
         self.assertEqual(
             "Error: Node 'target' is not reachable from any root\n",
             result.stderr,
+        )
+
+    def _write_json_adapter_db(self, directory):
+        # @JsonAdapter(FooAdapter.class) class Foo {} and
+        # @JsonAdapter(BarAdapter.class) class Bar {}, each kept by its own
+        # rule: one annotation node per instance, each naming its own adapter.
+        graph = ReachabilityGraph()
+        for owner in ("Foo", "Bar"):
+            seed = ReachableObject(
+                ReachableObjectType.SEED, f"KEEP: -keep class {owner}"
+            )
+            cls = ReachableObject(ReachableObjectType.CLASS, f"L{owner};")
+            anno = ReachableObject(ReachableObjectType.ANNO, "LJsonAdapter;")
+            adapter = ReachableObject(ReachableObjectType.CLASS, f"L{owner}Adapter;")
+            for node in (seed, cls, anno, adapter):
+                graph.add_node(node)
+            graph.add_edge(cls, seed)
+            graph.add_edge(anno, cls)
+            graph.add_edge(adapter, anno)
+        return self._write_graph_db(graph, directory)
+
+    def test_paths_keep_annotation_instances_apart(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_file = self._write_json_adapter_db(temp_dir)
+            to_root = json.loads(
+                self._run_db(db_file, "json", "path-to-root", "LFooAdapter;")
+            )
+            no_path = json.loads(
+                self._run_db(db_file, "json", "path", "LBar;", "LFooAdapter;")
+            )
+            from_type = json.loads(
+                self._run_db(
+                    db_file,
+                    "json",
+                    "path",
+                    "LJsonAdapter;",
+                    "LBarAdapter;",
+                    "--from-kind",
+                    "anno",
+                )
+            )
+
+        self.assertEqual(
+            [
+                ("CLASS", "LFooAdapter;"),
+                ("ANNO", "LJsonAdapter;"),
+                ("CLASS", "LFoo;"),
+                ("SEED", "KEEP: -keep class Foo"),
+            ],
+            [(row["type"], row["name"]) for row in to_root],
+        )
+        self.assertEqual(
+            [{"status": "no path", "step": "", "type": "", "name": ""}], no_path
+        )
+        # A path from an annotation type starts at any of its instances.
+        self.assertEqual(
+            [("ANNO", "LJsonAdapter;"), ("CLASS", "LBarAdapter;")],
+            [(row["type"], row["name"]) for row in from_type],
         )
 
     def test_dominated_disambiguates_class_and_annotation_names(self):
@@ -750,6 +887,143 @@ class GraphQueryTest(unittest.TestCase):
         self.assertEqual(1, result.returncode)
         self.assertIn("target", result.stderr)
         self.assertIn("not reachable from any root", result.stderr)
+
+    def _write_annotation_instances_db(self, directory):
+        # Two classes each carry an instance of the same annotation type, and
+        # each instance names a class nothing else retains. The dump keeps one
+        # node per instance.
+        graph = ReachabilityGraph()
+        root = ReachableObject(ReachableObjectType.SEED, "<SEED>")
+        first = ReachableObject(ReachableObjectType.CLASS, "LFirst;")
+        second = ReachableObject(ReachableObjectType.CLASS, "LSecond;")
+        first_marker = ReachableObject(ReachableObjectType.ANNO, "LMarker;")
+        second_marker = ReachableObject(ReachableObjectType.ANNO, "LMarker;")
+        named_by_first = ReachableObject(ReachableObjectType.CLASS, "LNamedByFirst;")
+        named_by_second = ReachableObject(ReachableObjectType.CLASS, "LNamedBySecond;")
+        for node in (
+            root,
+            first,
+            second,
+            first_marker,
+            second_marker,
+            named_by_first,
+            named_by_second,
+        ):
+            graph.add_node(node)
+        graph.add_edge(first, root)
+        graph.add_edge(second, root)
+        graph.add_edge(first_marker, first)
+        graph.add_edge(second_marker, second)
+        graph.add_edge(named_by_first, first_marker)
+        graph.add_edge(named_by_second, second_marker)
+        return self._write_graph_db(graph, directory)
+
+    def test_dominators_lists_each_instance_in_a_chain(self):
+        # @Adapter class B, retained through A's @Adapter instance, and
+        # @Adapter class C, retained through B's.
+        graph = ReachabilityGraph()
+        seed = ReachableObject(ReachableObjectType.SEED, "<SEED>")
+        a = ReachableObject(ReachableObjectType.CLASS, "LA;")
+        first = ReachableObject(ReachableObjectType.ANNO, "LAdapter;")
+        b = ReachableObject(ReachableObjectType.CLASS, "LB;")
+        second = ReachableObject(ReachableObjectType.ANNO, "LAdapter;")
+        c = ReachableObject(ReachableObjectType.CLASS, "LC;")
+        chain = (seed, a, first, b, second, c)
+        for node in chain:
+            graph.add_node(node)
+        for retainer, retained in zip(chain, chain[1:]):
+            graph.add_edge(retained, retainer)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_file = self._write_graph_db(graph, temp_dir)
+            output = self._run_db(db_file, "json", "dominators", "LC;")
+
+        self.assertEqual(
+            [
+                {"type": "ANNO", "name": "LAdapter;"},
+                {"type": "CLASS", "name": "LB;"},
+                {"type": "ANNO", "name": "LAdapter;"},
+                {"type": "CLASS", "name": "LA;"},
+                {"type": "SEED", "name": "<SEED>"},
+            ],
+            json.loads(output),
+        )
+
+    def test_annotation_instances_dominate_separately(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_file = self._write_annotation_instances_db(temp_dir)
+            dominated = json.loads(
+                self._run_db(db_file, "json", "dominated", "LFirst;")
+            )
+            count = json.loads(
+                self._run_db(db_file, "json", "retained-count", "LFirst;")
+            )
+            dominators = json.loads(
+                self._run_db(db_file, "json", "dominators", "LNamedByFirst;")
+            )
+            marker_count = json.loads(
+                self._run_db(
+                    db_file, "json", "retained-count", "LMarker;", "--kind", "anno"
+                )
+            )
+            marker_dominated = json.loads(
+                self._run_db(db_file, "json", "dominated", "LMarker;", "--kind", "anno")
+            )
+            marker_dominators = json.loads(
+                self._run_db(
+                    db_file, "json", "dominators", "LMarker;", "--kind", "anno"
+                )
+            )
+
+        self.assertEqual(
+            [
+                {"type": "ANNO", "name": "LMarker;"},
+                {"type": "CLASS", "name": "LFirst;"},
+                {"type": "CLASS", "name": "LNamedByFirst;"},
+            ],
+            dominated,
+        )
+        self.assertEqual(3, count[0]["retained_count"])
+        self.assertEqual(
+            [
+                {"type": "ANNO", "name": "LMarker;"},
+                {"type": "CLASS", "name": "LFirst;"},
+                {"type": "SEED", "name": "<SEED>"},
+            ],
+            dominators,
+        )
+        # Both instances together dominate themselves and what each names;
+        # each instance is its own row.
+        self.assertEqual(4, marker_count[0]["retained_count"])
+        self.assertEqual(
+            [
+                {"type": "ANNO", "name": "LMarker;"},
+                {"type": "ANNO", "name": "LMarker;"},
+                {"type": "CLASS", "name": "LNamedByFirst;"},
+                {"type": "CLASS", "name": "LNamedBySecond;"},
+            ],
+            marker_dominated,
+        )
+        # Only what lies above both instances dominates the annotation type.
+        self.assertEqual([{"type": "SEED", "name": "<SEED>"}], marker_dominators)
+
+    def test_nothing_dominates_instances_when_one_is_a_root(self):
+        graph = ReachabilityGraph()
+        root = ReachableObject(ReachableObjectType.SEED, "<SEED>")
+        held = ReachableObject(ReachableObjectType.CLASS, "LHeld;")
+        held_marker = ReachableObject(ReachableObjectType.ANNO, "LMarker;")
+        loose_marker = ReachableObject(ReachableObjectType.ANNO, "LMarker;")
+        for node in (root, held, held_marker, loose_marker):
+            graph.add_node(node)
+        graph.add_edge(held, root)
+        graph.add_edge(held_marker, held)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_file = self._write_graph_db(graph, temp_dir)
+            dominators = json.loads(
+                self._run_db(
+                    db_file, "json", "dominators", "LMarker;", "--kind", "anno"
+                )
+            )
+        self.assertEqual([], dominators)
 
     def test_new_nodes_returns_marker_predecessors_and_filters_kind(self):
         with tempfile.TemporaryDirectory() as temp_dir:
