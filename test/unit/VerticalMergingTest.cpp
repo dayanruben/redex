@@ -5,14 +5,18 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+#include <utility>
+
 #include <gtest/gtest.h>
 
 #include "ConfigFiles.h"
+#include "ControlFlow.h"
 #include "Creators.h"
 #include "DexClass.h"
 #include "IRAssembler.h"
 #include "PassManager.h"
 #include "RedexTest.h"
+#include "ScopedCFG.h"
 #include "TypeUtil.h"
 #include "VerticalMerging.h"
 
@@ -39,6 +43,21 @@ DexClass* create_user(const std::string& code) {
   method->set_code(assembler::ircode_from_string(code));
   creator.add_method(method);
   return creator.create();
+}
+
+// `Parent` and its only subclass `Child`, which is abstract and has no methods.
+std::pair<DexClass*, DexClass*> create_parent_and_abstract_child() {
+  ClassCreator parent_creator(DexType::make_type("Lcom/redextest/Parent;"));
+  parent_creator.set_access(ACC_PUBLIC);
+  parent_creator.set_super(type::java_lang_Object());
+  add_init(parent_creator, "Lcom/redextest/Parent;",
+           "Ljava/lang/Object;.<init>:()V");
+  auto* parent = parent_creator.create();
+
+  ClassCreator child_creator(DexType::make_type("Lcom/redextest/Child;"));
+  child_creator.set_access(ACC_PUBLIC | ACC_ABSTRACT);
+  child_creator.set_super(parent->get_type());
+  return {parent, child_creator.create()};
 }
 
 size_t run_pass_on(const std::vector<DexClass*>& classes) {
@@ -174,18 +193,7 @@ TEST_F(VerticalMergingTest, mergesAbstractClassUsedInCast) {
 // `Child` is abstract, has no methods and is never instantiated, so it could
 // merge into `Parent`, but `Child.class` would then be `Parent.class`.
 TEST_F(VerticalMergingTest, keepsAbstractSubclassWithClassLiteral) {
-  ClassCreator parent_creator(DexType::make_type("Lcom/redextest/Parent;"));
-  parent_creator.set_access(ACC_PUBLIC);
-  parent_creator.set_super(type::java_lang_Object());
-  add_init(parent_creator, "Lcom/redextest/Parent;",
-           "Ljava/lang/Object;.<init>:()V");
-  auto* parent = parent_creator.create();
-
-  ClassCreator child_creator(DexType::make_type("Lcom/redextest/Child;"));
-  child_creator.set_access(ACC_PUBLIC | ACC_ABSTRACT);
-  child_creator.set_super(parent->get_type());
-  auto* child = child_creator.create();
-
+  auto [parent, child] = create_parent_and_abstract_child();
   auto* user = create_user(R"(
     (
       (new-instance "Lcom/redextest/Parent;")
@@ -199,4 +207,522 @@ TEST_F(VerticalMergingTest, keepsAbstractSubclassWithClassLiteral) {
 
   EXPECT_EQ(run_pass_on({parent, child, user}), 3);
   EXPECT_EQ(child->get_super_class(), parent->get_type());
+}
+
+constexpr const char* kSynchronizedOnImplCallsS = R"(
+  (
+    (const-class "Lcom/redextest/Impl;")
+    (move-result-pseudo-object v0)
+    (monitor-enter v0)
+    (invoke-static () "Lcom/redextest/Base;.s:()V")
+    (monitor-exit v0)
+    (new-instance "Lcom/redextest/Impl;")
+    (move-result-pseudo-object v1)
+    (invoke-direct (v1) "Lcom/redextest/Impl;.<init>:()V")
+    (return-object v1)
+  )
+)";
+
+// Java: `abstract class Base { static synchronized native void s(); }` and
+// `synchronized (Impl.class) { Base.s(); }`. The runtime binds `s` to `Base`
+// by name and locks `Base.class` around it; moving `s` to `Impl` would break
+// the binding and make both locks `Impl.class`.
+TEST_F(VerticalMergingTest, keepsClassWithStaticSynchronizedNativeMethod) {
+  auto* s =
+      DexMethod::make_method("Lcom/redextest/Base;.s:()V")
+          ->make_concrete(
+              ACC_PUBLIC | ACC_STATIC | ACC_SYNCHRONIZED | ACC_NATIVE, false);
+  base->add_method(s);
+
+  EXPECT_EQ(run_pass(create_user(kSynchronizedOnImplCallsS)), 3);
+  EXPECT_EQ(s->get_class(), base->get_type());
+}
+
+// Java: `abstract class Base { native int n(); }`.
+TEST_F(VerticalMergingTest, keepsClassWithNativeMethod) {
+  auto* n = DexMethod::make_method("Lcom/redextest/Base;.n:()I")
+                ->make_concrete(ACC_PUBLIC | ACC_NATIVE, true);
+  base->add_method(n);
+
+  EXPECT_EQ(run_pass(create_user(kNewImpl)), 3);
+  EXPECT_EQ(n->get_class(), base->get_type());
+}
+
+// The merger keeps its methods and its name, so its native methods stay bound.
+TEST_F(VerticalMergingTest, mergesIntoClassWithNativeMethod) {
+  auto* n = DexMethod::make_method("Lcom/redextest/Impl;.n:()I")
+                ->make_concrete(ACC_PUBLIC | ACC_NATIVE, true);
+  impl->add_method(n);
+
+  EXPECT_EQ(run_pass(create_user(kNewImpl)), 2);
+  EXPECT_EQ(n->get_class(), impl->get_type());
+}
+
+// d8 compiles `static synchronized void s() {}` to a method that locks
+// `Base.class` with `const-class` and `monitor-enter`, and keeps only
+// `ACC_DECLARED_SYNCHRONIZED`, which has no effect at run time. The class
+// literal keeps `Base` from being merged away.
+TEST_F(VerticalMergingTest, keepsClassWithStaticSynchronizedMethod) {
+  auto* s = DexMethod::make_method("Lcom/redextest/Base;.s:()V")
+                ->make_concrete(
+                    ACC_PUBLIC | ACC_STATIC | ACC_DECLARED_SYNCHRONIZED, false);
+  s->set_code(assembler::ircode_from_string(R"(
+    (
+      (const-class "Lcom/redextest/Base;")
+      (move-result-pseudo-object v0)
+      (monitor-enter v0)
+      (monitor-exit v0)
+      (return-void)
+    )
+  )"));
+  base->add_method(s);
+
+  EXPECT_EQ(run_pass(create_user(kSynchronizedOnImplCallsS)), 3);
+  EXPECT_EQ(s->get_class(), base->get_type());
+}
+
+// Java: `abstract class Child extends Parent { static native void m(); }`.
+// `Child` has no code, so it could merge into `Parent`, which would move `m`.
+TEST_F(VerticalMergingTest, keepsAbstractSubclassWithNativeMethod) {
+  auto [parent, child] = create_parent_and_abstract_child();
+  auto* m = DexMethod::make_method("Lcom/redextest/Child;.m:()V")
+                ->make_concrete(ACC_PUBLIC | ACC_STATIC | ACC_NATIVE, false);
+  child->add_method(m);
+  auto* user = create_user(R"(
+    (
+      (new-instance "Lcom/redextest/Parent;")
+      (move-result-pseudo-object v0)
+      (invoke-direct (v0) "Lcom/redextest/Parent;.<init>:()V")
+      (return-object v0)
+    )
+  )");
+
+  EXPECT_EQ(run_pass_on({parent, child, user}), 3);
+  EXPECT_EQ(m->get_class(), child->get_type());
+}
+
+namespace {
+
+// Every place a class literal can name a class `X`.
+enum class Site {
+  kConstClass, // `const-class` in code
+  kClassFieldValue, // `static final Class<?> TAG = X.class;`
+  kObjectFieldValue, // `static final Object TAG = X.class;`
+  kClassAnnotation, // `@Anno(X.class) class User`
+  kMethodAnnotation, // `@Anno(X.class) void m(Object o)`
+  kParameterAnnotation, // `void m(@Anno(X.class) Object o)`
+  kFieldAnnotation, // `@Anno(X.class) Object f;`
+  kAnnotationArray, // `@Anno({X.class})`
+  kNestedAnnotation, // `@Outer(@Anno(X.class))`
+};
+
+std::unique_ptr<DexAnnotationSet> annotation_naming(DexType* type,
+                                                    bool in_array = false,
+                                                    bool nested = false) {
+  std::unique_ptr<DexEncodedValue> element =
+      std::make_unique<DexEncodedValueType>(type);
+  if (in_array) {
+    auto* values = new DexEncodedValueArray::Storage();
+    values->push_back(std::move(element));
+    element = std::make_unique<DexEncodedValueArray>(values);
+  }
+  auto anno = std::make_unique<DexAnnotation>(
+      DexType::make_type("Lcom/redextest/Anno;"), DAV_RUNTIME);
+  if (nested) {
+    EncodedAnnotations elements;
+    elements.emplace_back(DexString::make_string("value"), std::move(element));
+    anno->add_element("value", std::make_unique<DexEncodedValueAnnotation>(
+                                   DexType::make_type("Lcom/redextest/Inner;"),
+                                   std::move(elements)));
+  } else {
+    anno->add_element("value", std::move(element));
+  }
+  auto anno_set = std::make_unique<DexAnnotationSet>();
+  anno_set->add_annotation(std::move(anno));
+  return anno_set;
+}
+
+// Adds a class literal naming `type` to `user`, at `site`.
+void add_class_literal(DexClass* user, Site site, DexType* type) {
+  auto add_field = [&](DexType* field_type) {
+    auto* field =
+        DexField::make_field(user->get_type(), DexString::make_string("TAG"),
+                             field_type)
+            ->make_concrete(ACC_PUBLIC | ACC_STATIC | ACC_FINAL,
+                            std::make_unique<DexEncodedValueType>(type));
+    user->add_field(field);
+  };
+  // Annotations go on members before `make_concrete`, which rejects them.
+  auto add_annotated_method =
+      [&](std::unique_ptr<DexAnnotationSet> annos,
+          std::unique_ptr<DexAnnotationSet> param_annos) {
+        auto* method = dynamic_cast<DexMethod*>(DexMethod::make_method(
+            "Lcom/redextest/User;.m:(Ljava/lang/Object;)V"));
+        if (annos != nullptr) {
+          ASSERT_TRUE(method->attach_annotation_set(std::move(annos)));
+        }
+        if (param_annos != nullptr) {
+          method->attach_param_annotation_set(0, std::move(param_annos));
+        }
+        method->make_concrete(ACC_PUBLIC | ACC_STATIC, false);
+        method->set_code(assembler::ircode_from_string(
+            "((load-param-object v0) (return-void))"));
+        user->add_method(method);
+      };
+  switch (site) {
+  case Site::kConstClass: {
+    auto* method = DexMethod::make_method(
+                       "Lcom/redextest/User;.literal:()Ljava/lang/Object;")
+                       ->make_concrete(ACC_PUBLIC | ACC_STATIC, false);
+    method->set_code(assembler::ircode_from_string(
+        "((const-class \"" + type->str_copy() +
+        "\") (move-result-pseudo-object v0) (return-object v0))"));
+    user->add_method(method);
+    break;
+  }
+  case Site::kClassFieldValue:
+    add_field(type::java_lang_Class());
+    break;
+  case Site::kObjectFieldValue:
+    add_field(type::java_lang_Object());
+    break;
+  case Site::kClassAnnotation:
+    ASSERT_TRUE(user->attach_annotation_set(annotation_naming(type)));
+    break;
+  case Site::kMethodAnnotation:
+    add_annotated_method(annotation_naming(type), nullptr);
+    break;
+  case Site::kParameterAnnotation:
+    add_annotated_method(nullptr, annotation_naming(type));
+    break;
+  case Site::kFieldAnnotation: {
+    auto* field = dynamic_cast<DexField*>(
+        DexField::make_field(user->get_type(), DexString::make_string("f"),
+                             type::java_lang_Object()));
+    ASSERT_TRUE(field->attach_annotation_set(annotation_naming(type)));
+    field->make_concrete(ACC_PUBLIC);
+    user->add_field(field);
+    break;
+  }
+  case Site::kAnnotationArray:
+    ASSERT_TRUE(user->attach_annotation_set(
+        annotation_naming(type, /* in_array */ true)));
+    break;
+  case Site::kNestedAnnotation:
+    ASSERT_TRUE(user->attach_annotation_set(
+        annotation_naming(type, /* in_array */ false, /* nested */ true)));
+    break;
+  }
+}
+
+class VerticalMergingLiteralTest : public VerticalMergingTest,
+                                   public ::testing::WithParamInterface<Site> {
+};
+
+constexpr const char* kNewParent = R"(
+  (
+    (new-instance "Lcom/redextest/Parent;")
+    (move-result-pseudo-object v0)
+    (invoke-direct (v0) "Lcom/redextest/Parent;.<init>:()V")
+    (return-object v0)
+  )
+)";
+
+} // namespace
+
+// The class a literal names keeps its identity when it absorbs its parent.
+TEST_P(VerticalMergingLiteralTest, mergesIntoClassNamedByLiteral) {
+  auto* user = create_user(kNewImpl);
+  add_class_literal(user, GetParam(), impl->get_type());
+
+  EXPECT_EQ(run_pass(user), 2);
+  EXPECT_EQ(impl->get_super_class(), type::java_lang_Object());
+}
+
+// Merging the named parent away would make the literal name its subclass.
+TEST_P(VerticalMergingLiteralTest, keepsParentNamedByLiteral) {
+  auto* user = create_user(kNewImpl);
+  add_class_literal(user, GetParam(), base->get_type());
+
+  EXPECT_EQ(run_pass(user), 3);
+  EXPECT_EQ(impl->get_super_class(), base->get_type());
+}
+
+// Merging the named subclass away would make the literal name its parent.
+TEST_P(VerticalMergingLiteralTest, keepsSubclassNamedByLiteral) {
+  auto [parent, child] = create_parent_and_abstract_child();
+  auto* user = create_user(kNewParent);
+  add_class_literal(user, GetParam(), child->get_type());
+
+  EXPECT_EQ(run_pass_on({parent, child, user}), 3);
+  EXPECT_EQ(child->get_super_class(), parent->get_type());
+}
+
+INSTANTIATE_TEST_SUITE_P(CodeAndStaticValues,
+                         VerticalMergingLiteralTest,
+                         ::testing::Values(Site::kConstClass,
+                                           Site::kClassFieldValue,
+                                           Site::kObjectFieldValue));
+
+INSTANTIATE_TEST_SUITE_P(Annotations,
+                         VerticalMergingLiteralTest,
+                         ::testing::Values(Site::kClassAnnotation,
+                                           Site::kMethodAnnotation,
+                                           Site::kParameterAnnotation,
+                                           Site::kFieldAnnotation,
+                                           Site::kAnnotationArray,
+                                           Site::kNestedAnnotation));
+
+// Java: `@Anno(Impl.class) abstract class Base {}`. `Base` merges into `Impl`,
+// which then carries the annotation naming itself.
+TEST_F(VerticalMergingTest, mergesParentWhoseAnnotationNamesSubclass) {
+  ASSERT_TRUE(base->attach_annotation_set(annotation_naming(impl->get_type())));
+
+  EXPECT_EQ(run_pass(create_user(kNewImpl)), 2);
+  ASSERT_NE(impl->get_anno_set(), nullptr);
+  EXPECT_EQ(impl->get_anno_set()->size(), 1);
+}
+
+namespace {
+
+// Java: `Base[][] a = new Base[2][3];`, as d8 compiles it, with `<extra>`
+// inserted after the class literal is loaded into v3.
+std::string allocate_multi_dimensional_array(const std::string& extra,
+                                             const std::string& component) {
+  return R"(
+    (
+      (const v0 2)
+      (const v1 3)
+      (filled-new-array (v0 v1) "[I")
+      (move-result-object v2)
+      (const-class "Lcom/redextest/Base;")
+      (move-result-pseudo-object v3)
+      )" +
+         extra + R"(
+      (invoke-static ()" +
+         component +
+         R"( v2) "Ljava/lang/reflect/Array;.newInstance:(Ljava/lang/Class;[I)Ljava/lang/Object;")
+      (move-result-object v4)
+      (check-cast v4 "[[Lcom/redextest/Base;")
+      (move-result-pseudo-object v5)
+      (new-instance "Lcom/redextest/Impl;")
+      (move-result-pseudo-object v6)
+      (invoke-direct (v6) "Lcom/redextest/Impl;.<init>:()V")
+      (return-object v5)
+    )
+  )";
+}
+
+const DexType* get_const_class_type(DexClass* user) {
+  cfg::ScopedCFG cfg(user->get_dmethods().front()->get_code());
+  for (const auto& mie : cfg::InstructionIterable(*cfg)) {
+    if (opcode::is_const_class(mie.insn->opcode())) {
+      return mie.insn->get_type();
+    }
+  }
+  return nullptr;
+}
+
+} // namespace
+
+// A class literal that only names the component type of `Array.newInstance`
+// allocates an array, like `new Base[2]`, so `Base` still merges and the array
+// becomes an `Impl[][]`.
+TEST_F(VerticalMergingTest, mergesAbstractComponentOfMultiDimensionalArray) {
+  auto* user = create_user(allocate_multi_dimensional_array("", "v3"));
+
+  EXPECT_EQ(run_pass(user), 2);
+  EXPECT_EQ(get_const_class_type(user), impl->get_type());
+}
+
+TEST_F(VerticalMergingTest, mergesAbstractComponentPassedThroughMove) {
+  auto* user = create_user(
+      allocate_multi_dimensional_array("(move-object v7 v3)", "v7"));
+
+  EXPECT_EQ(run_pass(user), 2);
+}
+
+// Java: `Base[] a = (Base[]) Array.newInstance(Base.class, 2);`.
+TEST_F(VerticalMergingTest, mergesAbstractComponentOfArrayNewInstance) {
+  auto* user = create_user(R"(
+    (
+      (const v0 2)
+      (const-class "Lcom/redextest/Base;")
+      (move-result-pseudo-object v1)
+      (invoke-static (v1 v0) "Ljava/lang/reflect/Array;.newInstance:(Ljava/lang/Class;I)Ljava/lang/Object;")
+      (move-result-object v2)
+      (new-instance "Lcom/redextest/Impl;")
+      (move-result-pseudo-object v3)
+      (invoke-direct (v3) "Lcom/redextest/Impl;.<init>:()V")
+      (return-object v2)
+    )
+  )");
+
+  EXPECT_EQ(run_pass(user), 2);
+}
+
+// The literal also reaches `map.put(Base.class, a)`, which observes its
+// identity.
+TEST_F(VerticalMergingTest, keepsAbstractComponentWithOtherUse) {
+  auto* user = create_user(allocate_multi_dimensional_array(
+      R"((invoke-static (v3) "Lcom/redextest/User;.observe:(Ljava/lang/Class;)V"))",
+      "v3"));
+
+  EXPECT_EQ(run_pass(user), 3);
+}
+
+// No `Child` is ever created, so `Child` could merge into `Parent`, which drops
+// its instance methods. But the static method `Child.call` calls the private
+// method `Child.p` without virtual dispatch, and would then call a method that
+// no longer exists.
+TEST_F(VerticalMergingTest, keepsSubclassWhosePrivateMethodIsCalled) {
+  ClassCreator parent_creator(DexType::make_type("Lcom/redextest/Parent;"));
+  parent_creator.set_access(ACC_PUBLIC);
+  parent_creator.set_super(type::java_lang_Object());
+  add_init(parent_creator, "Lcom/redextest/Parent;",
+           "Ljava/lang/Object;.<init>:()V");
+  auto* parent = parent_creator.create();
+
+  ClassCreator child_creator(DexType::make_type("Lcom/redextest/Child;"));
+  child_creator.set_access(ACC_PUBLIC | ACC_FINAL);
+  child_creator.set_super(parent->get_type());
+  add_init(child_creator, "Lcom/redextest/Child;",
+           "Lcom/redextest/Parent;.<init>:()V");
+  child_creator.add_method(assembler::method_from_string(R"(
+    (method (private) "Lcom/redextest/Child;.p:()V"
+     (
+      (load-param-object v0)
+      (return-void)
+     )
+    )
+  )"));
+  child_creator.add_method(assembler::method_from_string(R"(
+    (method (public static) "Lcom/redextest/Child;.call:(Lcom/redextest/Child;)V"
+     (
+      (load-param-object v0)
+      (invoke-direct (v0) "Lcom/redextest/Child;.p:()V")
+      (return-void)
+     )
+    )
+  )"));
+  auto* child = child_creator.create();
+
+  auto* user = create_user(R"(
+    (
+      (new-instance "Lcom/redextest/Parent;")
+      (move-result-pseudo-object v0)
+      (invoke-direct (v0) "Lcom/redextest/Parent;.<init>:()V")
+      (const v1 0)
+      (invoke-static (v1) "Lcom/redextest/Child;.call:(Lcom/redextest/Child;)V")
+      (return-object v0)
+    )
+  )");
+
+  EXPECT_EQ(run_pass_on({parent, child, user}), 3);
+  EXPECT_EQ(child->get_super_class(), parent->get_type());
+}
+
+namespace {
+
+// `Parent` and its only subclass `Child`, which both define `m`, and a user
+// that creates a `Parent` and calls `Child.call` but never creates a `Child`,
+// so `Child` could merge into `Parent`, which drops its instance methods.
+struct SuperCallClasses {
+  DexClass* parent;
+  DexClass* child;
+  DexClass* user;
+};
+
+SuperCallClasses create_super_call_classes(const std::string& child_m,
+                                           const std::string& child_call) {
+  ClassCreator parent_creator(DexType::make_type("Lcom/redextest/Parent;"));
+  parent_creator.set_access(ACC_PUBLIC);
+  parent_creator.set_super(type::java_lang_Object());
+  add_init(parent_creator, "Lcom/redextest/Parent;",
+           "Ljava/lang/Object;.<init>:()V");
+  parent_creator.add_method(assembler::method_from_string(R"(
+    (method (public) "Lcom/redextest/Parent;.m:()V"
+     (
+      (load-param-object v0)
+      (return-void)
+     )
+    )
+  )"));
+  auto* parent = parent_creator.create();
+
+  ClassCreator child_creator(DexType::make_type("Lcom/redextest/Child;"));
+  child_creator.set_access(ACC_PUBLIC | ACC_FINAL);
+  child_creator.set_super(parent->get_type());
+  add_init(child_creator, "Lcom/redextest/Child;",
+           "Lcom/redextest/Parent;.<init>:()V");
+  child_creator.add_method(assembler::method_from_string(child_m));
+  child_creator.add_method(assembler::method_from_string(child_call));
+  auto* child = child_creator.create();
+
+  auto* user = create_user(R"(
+    (
+      (new-instance "Lcom/redextest/Parent;")
+      (move-result-pseudo-object v0)
+      (invoke-direct (v0) "Lcom/redextest/Parent;.<init>:()V")
+      (const v1 0)
+      (invoke-static (v1) "Lcom/redextest/Child;.call:(Lcom/redextest/Child;)V")
+      (return-object v0)
+    )
+  )");
+  return {parent, child, user};
+}
+
+} // namespace
+
+// Java: `void m() { super.m(); }` in `Child`. javac names the direct
+// superclass, `Parent`, in the invoke-super, which merging `Child` into
+// `Parent` does not affect: the call goes away with `Child.m`.
+TEST_F(VerticalMergingTest, mergesSubclassWhoseMethodCallsSuper) {
+  auto classes = create_super_call_classes(R"(
+    (method (public) "Lcom/redextest/Child;.m:()V"
+     (
+      (load-param-object v0)
+      (invoke-super (v0) "Lcom/redextest/Parent;.m:()V")
+      (return-void)
+     )
+    )
+  )",
+                                           R"(
+    (method (public static) "Lcom/redextest/Child;.call:(Lcom/redextest/Child;)V"
+     (
+      (load-param-object v0)
+      (return-void)
+     )
+    )
+  )");
+
+  EXPECT_EQ(run_pass_on({classes.parent, classes.child, classes.user}), 2);
+}
+
+// In generated code (javac never names the current class in an invoke-super),
+// the static method `Child.call` makes an invoke-super that names `Child`
+// itself, which calls `Parent.m`. Merging `Child` into `Parent` would move
+// `call` into `Parent` and drop `Child.m`, leaving the invoke-super naming a
+// method that no longer exists.
+TEST_F(VerticalMergingTest, keepsSubclassNamedByInvokeSuper) {
+  auto classes = create_super_call_classes(R"(
+    (method (public) "Lcom/redextest/Child;.m:()V"
+     (
+      (load-param-object v0)
+      (return-void)
+     )
+    )
+  )",
+                                           R"(
+    (method (public static) "Lcom/redextest/Child;.call:(Lcom/redextest/Child;)V"
+     (
+      (load-param-object v0)
+      (invoke-super (v0) "Lcom/redextest/Child;.m:()V")
+      (return-void)
+     )
+    )
+  )");
+
+  EXPECT_EQ(run_pass_on({classes.parent, classes.child, classes.user}), 3);
+  EXPECT_EQ(classes.child->get_super_class(), classes.parent->get_type());
 }

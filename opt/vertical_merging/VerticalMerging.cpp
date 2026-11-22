@@ -18,6 +18,9 @@
 #include "DexUtil.h"
 #include "EditableCfgAdapter.h"
 #include "IROpcode.h"
+#include "Lazy.h"
+#include "LiveRange.h"
+#include "MethodUtil.h"
 #include "PassManager.h"
 #include "RClass.h"
 #include "Resolver.h"
@@ -85,6 +88,34 @@ void record_dont_merge_state(const DexType* type,
   auto [current, emplaced] = dont_merge_status->emplace(element_type, state);
   if (!emplaced && *current < state) {
     current->store(state);
+  }
+}
+
+/**
+ * A class literal is a class's identity, which code can compare, key a map on
+ * or lock, so the class it names, even an abstract one, must not be merged
+ * away. It may still be the merger, which keeps its name. The literal is the
+ * same value whether it is a `const-class` in code, the constant value of a
+ * static field (which `FinalInlinePassV2` makes from a `const-class` in
+ * `<clinit>`), or an annotation element. The pass does not rewrite types in
+ * static values or annotations, so this rule also keeps those values correct.
+ */
+void record_class_literal(const DexType* type,
+                          DontMergeStatus* dont_merge_status) {
+  record_dont_merge_state(type, kConditional, dont_merge_status);
+}
+
+/**
+ * Records the class literals in an encoded value, including those nested in
+ * arrays and annotations. The only other types it gathers are the types of
+ * nested annotations, which are interfaces and never merged.
+ */
+void record_class_literals(const DexEncodedValue& value,
+                           DontMergeStatus* dont_merge_status) {
+  std::vector<const DexType*> types;
+  value.gather_types(types);
+  for (const auto* type : types) {
+    record_class_literal(type, dont_merge_status);
   }
 }
 
@@ -352,13 +383,9 @@ size_t record_annotation(const Scope& scope,
                          bool record_type_like_string_refs,
                          DontMergeStatus* dont_merge_status) {
   AtomicStatCounter<size_t> type_like_string_refs{0};
-  // Remove class if it is the type of an annotation.
-  // TODO(suree404): Merge the classes even though it appears in annotation?
   walk::parallel::annotations(scope, [&](DexAnnotation* anno) {
-    std::vector<const DexType*> types_in_anno;
-    anno->gather_types(types_in_anno);
-    for (const auto& type : types_in_anno) {
-      record_dont_merge_state(type, kStrict, dont_merge_status);
+    for (const auto& elem : anno->anno_elems()) {
+      record_class_literals(*elem.encoded_value, dont_merge_status);
     }
     if (anno->type() == type::dalvik_annotation_Signature() ||
         anno->type()->str() == "Lkotlin/Metadata;") {
@@ -373,6 +400,32 @@ size_t record_annotation(const Scope& scope,
 }
 
 /**
+ * d8 compiles `new T[n][m]` to `Array.newInstance(T.class, new int[] {n, m})`.
+ * When code passes a class literal only as the element type to
+ * `Array.newInstance`, the literal just picks the type of the arrays to
+ * allocate, as `new-array` does, and its identity is never observed. The same
+ * holds for a literal that nothing uses.
+ */
+bool is_array_component_type(IRInstruction* const_class,
+                             const live_range::DefUseChains& def_use_chains) {
+  auto it = def_use_chains.find(const_class);
+  if (it == def_use_chains.end()) {
+    return true;
+  }
+  return unordered_all_of(it->second, [](const live_range::Use& use) {
+    if (opcode::is_a_move(use.insn->opcode())) {
+      return true;
+    }
+    if (use.src_index != 0 || !use.insn->has_method()) {
+      return false;
+    }
+    const auto* callee = use.insn->get_method();
+    return callee == method::java_lang_reflect_Array_newInstance() ||
+           callee == method::java_lang_reflect_Array_newInstance_dimensions();
+  });
+}
+
+/**
  * 1. Analyze type usages.
  * 2. To simplify the method/field references updating, exclude the pure refs.
  * When ResolveRefsPass runs before the pass, the step should not drop many
@@ -382,90 +435,100 @@ size_t record_code_reference(const Scope& scope,
                              bool record_type_like_string_refs,
                              DontMergeStatus* dont_merge_status) {
   AtomicStatCounter<size_t> type_like_string_refs{0};
-  walk::parallel::opcodes(
-      scope,
-      [dont_merge_status, &type_like_string_refs, record_type_like_string_refs](
-          DexMethod* /*method*/, IRInstruction* insn) {
-        if (insn->has_type()) {
-          const auto* type = type::get_element_type_if_array(insn->get_type());
-          if (type == nullptr) {
-            return;
-          }
-          if (opcode::is_instance_of(insn->opcode())) {
-            // We don't want to merge class if either merger or
-            // mergeable was ever accessed in instance_of to prevent
-            // semantic error.
-            record_dont_merge_state(type, kStrict, dont_merge_status);
-            return;
-          } else {
-            DexClass* cls = type_class(type);
-            // A class literal is the type's identity, which code can compare
-            // or key a map on, so unlike other type references it keeps even
-            // an abstract type from being merged away.
-            if ((cls != nullptr) &&
-                (!is_abstract(cls) || opcode::is_const_class(insn->opcode()))) {
-              // Keep the referenced type from being the mergeable.
-              record_dont_merge_state(type, kConditional, dont_merge_status);
-              TRACE(VMERGE, 9, "dont_merge %s as mergeable for type usage: %s",
-                    SHOW(type), SHOW(insn));
-            }
-          }
-        } else if (opcode::is_const_string(insn->opcode())) {
-          auto* type = java_names::get_element_type_from_external_name(
-              insn->get_string()->str());
-          if (type != nullptr) {
-            type_like_string_refs++;
-            if (record_type_like_string_refs) {
-              record_dont_merge_state(type, kStrict, dont_merge_status);
-              TRACE(VMERGE, 9,
-                    "dont_merge %s for type-like string reference: %s",
-                    SHOW(type), SHOW(insn));
-            }
-          }
-        } else if (insn->has_field()) {
-          DexField* field = resolve_field(insn->get_field());
-          if (field != nullptr) {
-            bool resolve_differently =
-                field->get_class() != insn->get_field()->get_class();
-            if (resolve_differently) {
-              // If a field reference need to be resolved, don't merge as
-              // renaming it might cause problems.
-              // If a field that can't be renamed is being referenced. Don't
-              // merge it as we need the field and this field can't be renamed
-              // if having collision.
-              // TODO(suree404): can improve.
-              record_dont_merge_state(field->get_class(), kStrict,
-                                      dont_merge_status);
-              record_dont_merge_state(insn->get_field()->get_class(), kStrict,
-                                      dont_merge_status);
-            }
-          } else {
-            record_dont_merge_state(insn->get_field()->get_class(),
-                                    kConditional, dont_merge_status);
-          }
-        } else if (insn->has_method()) {
-          auto* callee_ref = insn->get_method();
-          if (opcode::is_invoke_super(insn->opcode())) {
-            // The only allowed pure ref is in invoke-super.
-            return;
-          }
-          if (!is_internal_def(callee_ref)) {
-            record_dont_merge_state(callee_ref->get_class(), kStrict,
-                                    dont_merge_status);
-            TRACE(VMERGE, 9, "dont_merge %s for pure ref %s",
-                  SHOW(callee_ref->get_class()), SHOW(callee_ref));
-            DexMethod* callee =
-                resolve_method_deprecated(callee_ref, MethodSearch::Any);
-            if (callee != nullptr) {
-              record_dont_merge_state(callee->get_class(), kStrict,
-                                      dont_merge_status);
-              TRACE(VMERGE, 9,
-                    "dont_merge %s for it may be invoked as a pure ref %s",
-                    SHOW(callee->get_class()), SHOW(callee_ref));
-            }
+  walk::parallel::code(scope, [&](DexMethod* /*method*/, IRCode& code) {
+    auto& cfg = code.cfg();
+    // Built only for methods with a class literal, which most methods lack.
+    Lazy<live_range::DefUseChains> def_use_chains([&cfg] {
+      return live_range::MoveAwareChains(
+                 cfg, /* ignore_unreachable */ false,
+                 [](const IRInstruction* insn) {
+                   return opcode::is_const_class(insn->opcode());
+                 })
+          .get_def_use_chains();
+    });
+    for (const auto& mie : cfg::InstructionIterable(cfg)) {
+      auto* insn = mie.insn;
+      if (insn->has_type()) {
+        const auto* type = type::get_element_type_if_array(insn->get_type());
+        if (type == nullptr) {
+          continue;
+        }
+        if (opcode::is_instance_of(insn->opcode())) {
+          // We don't want to merge class if either merger or
+          // mergeable was ever accessed in instance_of to prevent
+          // semantic error.
+          record_dont_merge_state(type, kStrict, dont_merge_status);
+          continue;
+        } else if (opcode::is_const_class(insn->opcode()) &&
+                   !is_array_component_type(insn, *def_use_chains)) {
+          record_class_literal(type, dont_merge_status);
+          TRACE(VMERGE, 9, "dont_merge %s as mergeable for class literal: %s",
+                SHOW(type), SHOW(insn));
+        } else {
+          DexClass* cls = type_class(type);
+          if ((cls != nullptr) && !is_abstract(cls)) {
+            // Keep the referenced type from being the mergeable.
+            record_dont_merge_state(type, kConditional, dont_merge_status);
+            TRACE(VMERGE, 9, "dont_merge %s as mergeable for type usage: %s",
+                  SHOW(type), SHOW(insn));
           }
         }
-      });
+      } else if (opcode::is_const_string(insn->opcode())) {
+        auto* type = java_names::get_element_type_from_external_name(
+            insn->get_string()->str());
+        if (type != nullptr) {
+          type_like_string_refs++;
+          if (record_type_like_string_refs) {
+            record_dont_merge_state(type, kStrict, dont_merge_status);
+            TRACE(VMERGE, 9, "dont_merge %s for type-like string reference: %s",
+                  SHOW(type), SHOW(insn));
+          }
+        }
+      } else if (insn->has_field()) {
+        DexField* field = resolve_field(insn->get_field());
+        if (field != nullptr) {
+          bool resolve_differently =
+              field->get_class() != insn->get_field()->get_class();
+          if (resolve_differently) {
+            // If a field reference need to be resolved, don't merge as
+            // renaming it might cause problems.
+            // If a field that can't be renamed is being referenced. Don't
+            // merge it as we need the field and this field can't be renamed
+            // if having collision.
+            // TODO(suree404): can improve.
+            record_dont_merge_state(field->get_class(), kStrict,
+                                    dont_merge_status);
+            record_dont_merge_state(insn->get_field()->get_class(), kStrict,
+                                    dont_merge_status);
+          }
+        } else {
+          record_dont_merge_state(insn->get_field()->get_class(), kConditional,
+                                  dont_merge_status);
+        }
+      } else if (insn->has_method()) {
+        auto* callee_ref = insn->get_method();
+        if (opcode::is_invoke_super(insn->opcode())) {
+          // The only allowed pure ref is in invoke-super.
+          continue;
+        }
+        if (!is_internal_def(callee_ref)) {
+          record_dont_merge_state(callee_ref->get_class(), kStrict,
+                                  dont_merge_status);
+          TRACE(VMERGE, 9, "dont_merge %s for pure ref %s",
+                SHOW(callee_ref->get_class()), SHOW(callee_ref));
+          DexMethod* callee =
+              resolve_method_deprecated(callee_ref, MethodSearch::Any);
+          if (callee != nullptr) {
+            record_dont_merge_state(callee->get_class(), kStrict,
+                                    dont_merge_status);
+            TRACE(VMERGE, 9,
+                  "dont_merge %s for it may be invoked as a pure ref %s",
+                  SHOW(callee->get_class()), SHOW(callee_ref));
+          }
+        }
+      }
+    }
+  });
   return type_like_string_refs.load();
 }
 
@@ -473,10 +536,19 @@ size_t record_code_reference(const Scope& scope,
  * When a method is native or not renamable, we can not change its signature.
  * Record a type as don't merge as a mergeable if it's used in a such method's
  * signature.
+ *
+ * A native method is also bound to its declaring class: the runtime links it by
+ * the class's name, and a `static synchronized` native method locks the class's
+ * `Class` object. Merging moves the mergeable's methods into the merger, so the
+ * declaring class of a native method must not be the mergeable.
  */
 void record_method_signature(const Scope& scope,
                              DontMergeStatus* dont_merge_status) {
   walk::parallel::methods(scope, [&](DexMethod* method) {
+    if (is_native(method)) {
+      record_dont_merge_state(method->get_class(), kConditional,
+                              dont_merge_status);
+    }
     if (is_native(method) || !can_rename(method)) {
       DexProto* proto = method->get_proto();
       record_dont_merge_state(proto->get_rtype(), kConditional,
@@ -592,8 +664,56 @@ void remove_unrenamable_collisions(ClassMap* mergeable_to_merger) {
 }
 
 /**
- * Don't merge a class if it is a field's type and this field can't be
- * renamed, of if it appeared in a field value.
+ * Merging a class into its superclass drops its instance methods and moves its
+ * static methods into the superclass. A virtual call of a dropped method is
+ * redirected to the superclass (see `resolve_virtual_calls_to_merger`), but an
+ * invoke-direct or invoke-super that names the class, from code that stays,
+ * would name a class that no longer exists, so such a class is not merged.
+ * Naming the superclass instead would change what an invoke-super calls, since
+ * it resolves from the superclass of the class whose code holds it.
+ */
+void remove_nonvirtual_calls_of_dropped_methods(const Scope& scope,
+                                                ClassMap* mergeable_to_merger) {
+  // The class `type` if merging drops its instance methods, or nullptr.
+  auto get_dropping = [&](const DexType* type) -> DexClass* {
+    auto* cls = type_class(type);
+    // A null `cls`, of a type without a class, is not a key, so it is never
+    // dereferenced.
+    auto it = mergeable_to_merger->find(cls);
+    if (it == mergeable_to_merger->end() ||
+        cls->get_super_class() != it->second->get_type()) {
+      return nullptr;
+    }
+    return cls;
+  };
+  ConcurrentSet<DexClass*> to_delete;
+  walk::parallel::code(scope, [&](DexMethod* caller, IRCode& code) {
+    if (!is_static(caller) && get_dropping(caller->get_class()) != nullptr) {
+      return;
+    }
+    for (const auto& mie : cfg::InstructionIterable(code.cfg())) {
+      auto* insn = mie.insn;
+      if (!opcode::is_invoke_direct(insn->opcode()) &&
+          !opcode::is_invoke_super(insn->opcode())) {
+        continue;
+      }
+      auto* callee_ref = insn->get_method();
+      if (auto* cls = get_dropping(callee_ref->get_class())) {
+        TRACE(VMERGE, 5, "Exclude %s: %s calls %s without virtual dispatch",
+              SHOW(cls), SHOW(caller), SHOW(callee_ref));
+        to_delete.insert(cls);
+      }
+    }
+  });
+  for (DexClass* cls : UnorderedIterable(to_delete)) {
+    mergeable_to_merger->erase(cls);
+  }
+}
+
+/**
+ * A field that cannot be renamed keeps its type and its class from being merged
+ * away. A static field's value can name classes as class literals and
+ * type-like strings, like code does.
  */
 size_t record_field_reference(const Scope& scope,
                               bool record_type_like_string_refs,
@@ -601,19 +721,11 @@ size_t record_field_reference(const Scope& scope,
   AtomicStatCounter<size_t> type_like_string_refs{0};
   walk::parallel::fields(scope, [&](DexField* field) {
     if (auto* value = field->get_static_value()) {
+      record_class_literals(*value, dont_merge_status);
       std::vector<const DexString*> strings;
       value->gather_strings(strings);
       type_like_string_refs += record_type_like_strings(
           strings, record_type_like_string_refs, dont_merge_status);
-    }
-    if (is_static(field) && field->get_type() == type::java_lang_Class()) {
-      // Checking type which might be stored as class in field.
-      auto* value = field->get_static_value();
-      if (value != nullptr && value->evtype() == DEVT_TYPE) {
-        record_dont_merge_state(
-            dynamic_cast<DexEncodedValueType*>(value)->type(), kStrict,
-            dont_merge_status);
-      }
     }
     if (!can_rename(field)) {
       record_dont_merge_state(field->get_type(), kConditional,
@@ -1082,6 +1194,7 @@ size_t VerticalMergingPass::merge_round(
 
   remove_both_have_clinit(&mergeable_to_merger);
   remove_unrenamable_collisions(&mergeable_to_merger);
+  remove_nonvirtual_calls_of_dropped_methods(scope, &mergeable_to_merger);
   resolve_virtual_calls_to_merger(scope, mergeable_to_merger);
 
   merge_classes(scope, mergeable_to_merger);

@@ -10,7 +10,6 @@
 #include "Creators.h"
 #include "Debug.h"
 #include "DexStore.h"
-#include "ModelMethodMerger.h"
 #include "RefChecker.h"
 #include "Show.h"
 #include "Trace.h"
@@ -43,26 +42,6 @@ std::string_view get_merger_package_name(const DexType* root_type) {
     }
   }
   return pkg_name;
-}
-
-bool can_preserve_field_type(const DexType* field_type,
-                             const DexType* parent,
-                             const RefChecker& ref_checker) {
-  if (!ref_checker.check_type(field_type)) {
-    return false;
-  }
-  const auto* element_type = type::get_element_type_if_array(field_type);
-  if (type::is_primitive(element_type)) {
-    return true;
-  }
-  const auto* cls = type_class(element_type);
-  if (cls == nullptr) {
-    return false;
-  }
-  const auto access = get_visibility(cls);
-  return access == ACC_PUBLIC ||
-         (access == 0 && type::get_package_name(element_type) ==
-                             get_merger_package_name(parent));
 }
 
 } // namespace
@@ -169,7 +148,8 @@ std::vector<DexField*> create_merger_fields(
     if (type != nullptr &&
         (type::is_primitive(type) || type == type::java_lang_Object() ||
          type == type::java_lang_String() ||
-         !can_preserve_field_type(type, parent, ref_checker))) {
+         !ref_checker.check_type_from_package(
+             type, get_merger_package_name(parent)))) {
       type = nullptr;
     }
   }
@@ -297,7 +277,7 @@ void patch_iget(cfg::ControlFlowGraph& cfg,
   case OPCODE_IGET_OBJECT: {
     auto move_insn_it = cfg.move_result_of(it);
     auto dest = move_insn_it->insn->dest();
-    auto cast = ModelMethodMerger::make_check_cast(original_field_type, dest);
+    auto cast = make_check_cast(original_field_type, dest);
     cfg.insert_after(move_insn_it, cast);
     if ((prev_sb != nullptr) && !disable_violation_fixes) {
       // Duplicate the last seen source block and place it after the iterator

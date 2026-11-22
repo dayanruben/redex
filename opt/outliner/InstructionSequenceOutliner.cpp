@@ -85,6 +85,7 @@
 #include "DexLimits.h"
 #include "DexPosition.h"
 #include "DexStoreUtil.h"
+#include "DexStructure.h"
 #include "DexUtil.h"
 #include "IRCode.h"
 #include "IRInstruction.h"
@@ -525,17 +526,20 @@ static Candidate normalize(
     result.emplace(out_reg->first, c.res_type);
   }
   c.arg_types.reserve(arg_regs.size());
-  // Each call site passes the register as ART typed it where that site's copy
-  // of the sequence starts: the same values, merged in the same order, that
-  // ART verified the uses against. So a parameter of the widest type every use
-  // accepts holds every value a call passes, and no `art::accepts_argument`
-  // check is needed, as long as each use's type is one ART checks it against.
-  // A type a use takes from Redex's inferred type, such as an array operand's,
-  // is not checked here.
+  // The widest type every use accepts holds every value this call site passes,
+  // because the site passes the values ART verified those uses against, merged
+  // in the same order. When the uses give no type, the parameter takes the join
+  // of the passed values, which need not hold them: an `A[]` and a `B[]` join
+  // to `I[]`, which ART's merge of them, `Object[]`, does not fit. A parameter
+  // that does not hold them is left untyped, which drops this copy of the
+  // sequence.
   for (auto reg : arg_regs) {
-    c.arg_types.push_back(art::declare_parameter(
+    const auto* type = art::declare_parameter(
         type_analysis.demand_in_candidate(pc, reg, result),
-        [&]() { return type_analysis.value_at(anchor, reg); }));
+        [&]() { return type_analysis.value_at(anchor, reg); });
+    const bool holds =
+        art::accepts_argument(type, type_analysis.supply_at(anchor, reg));
+    c.arg_types.push_back(holds ? type : nullptr);
   }
   return c;
 }
@@ -629,6 +633,15 @@ static bool append_to_partial_candidate(
   for (size_t i = 0; i < insn->srcs_size(); i++) {
     auto src = insn->src(i);
     if (pcn->defined_regs.count(src) == 0u) {
+      // An argument must not be an uninitialized object: ART rejects passing
+      // one. A comparison may read one, unlike most instructions; the call of
+      // its constructor and a copy of it are refused above and below.
+      if (opcode::is_a_conditional_branch(opcode)) {
+        auto uninitialized = uninitialized_envs->at(insn).get(src);
+        if (!uninitialized.get_constant() || *uninitialized.get_constant()) {
+          return false;
+        }
+      }
       pc->in_regs.insert(src);
       if (insn->src_is_wide(i)) {
         pc->in_regs.insert(src + 1);
@@ -2108,7 +2121,7 @@ class DexState {
   DexClasses& m_dex;
   size_t m_dex_id;
   UnorderedSet<const DexType*> m_type_refs;
-  size_t m_method_refs_count;
+  MethodRefRoom m_method_ref_room;
   UnorderedMap<const DexType*, size_t> m_class_ids;
   size_t max_type_refs;
 
@@ -2123,15 +2136,15 @@ class DexState {
            size_t dex_id,
            size_t reserved_trefs,
            size_t reserved_mrefs)
-      : m_mgr(mgr), m_dex(dex), m_dex_id(dex_id) {
-    UnorderedSet<DexMethodRef*> method_refs;
+      : m_mgr(mgr),
+        m_dex(dex),
+        m_dex_id(dex_id),
+        m_method_ref_room(MethodRefRoom::for_dex(dex, reserved_mrefs)) {
     std::vector<const DexType*> init_classes;
     for (auto* cls : dex) {
-      cls->gather_methods(method_refs);
       cls->gather_types(m_type_refs);
       cls->gather_init_classes(init_classes);
     }
-    m_method_refs_count = method_refs.size() + reserved_mrefs;
 
     walk::classes(dex, [&class_ids = m_class_ids](DexClass* cls) {
       class_ids.emplace(cls->get_type(), class_ids.size());
@@ -2175,7 +2188,7 @@ class DexState {
   }
 
   bool can_insert_method_ref() {
-    if (m_method_refs_count >= kMaxMethodRefs) {
+    if (!m_method_ref_room.can_add()) {
       m_mgr.incr_metric("kMaxMethodRefs", 1);
       TRACE(ISO, 2, "[invoke sequence outliner] hit kMaxMethodRefs");
       return false;
@@ -2183,11 +2196,7 @@ class DexState {
     return true;
   }
 
-  void insert_method_ref() {
-    always_assert(can_insert_method_ref());
-    m_method_refs_count++;
-    always_assert(m_method_refs_count <= kMaxMethodRefs);
-  }
+  void insert_method_ref() { m_method_ref_room.add(); }
 
   // insert at beginning of dex, but after canary class, if any
   void insert_outlined_class(DexClass* outlined_cls) {
@@ -3405,11 +3414,9 @@ void InstructionSequenceOutliner::run_pass(DexStoresVector& stores,
   mgr.incr_metric("num_ordered_methods", methods_global_order.size());
   XStoreRefs xstores(stores, config.normal_primary_dex());
   size_t dex_id{0};
-  const auto& interdex_metrics = mgr.get_interdex_metrics();
-  auto it = interdex_metrics.find(interdex::METRIC_RESERVED_MREFS);
-  size_t reserved_mrefs = it == interdex_metrics.end() ? 0 : it->second;
-  it = interdex_metrics.find(interdex::METRIC_RESERVED_TREFS);
-  size_t reserved_trefs = it == interdex_metrics.end() ? 0 : it->second;
+  auto reserved = interdex::get_interdex_reserved_refs(mgr);
+  size_t reserved_mrefs = reserved.mrefs;
+  size_t reserved_trefs = reserved.trefs;
   TRACE(
       ISO, 2,
       "[invoke sequence outliner] found %zu reserved trefs, %zu reserved mrefs",

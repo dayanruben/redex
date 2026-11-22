@@ -143,6 +143,9 @@ class EnumUpcastDetector {
     case OPCODE_APUT_OBJECT:
       process_aput_object(insn, env);
       break;
+    case OPCODE_FILLED_NEW_ARRAY:
+      process_filled_new_array(insn, env);
+      break;
     case OPCODE_IPUT_OBJECT:
       process_isput_object(insn, env);
       reject(insn, insn->get_field()->get_class(),
@@ -241,6 +244,22 @@ class EnumUpcastDetector {
   }
 
   /**
+   * Process filled-new-array when we reach the fixpoint: like aput-object, it
+   * stores each source into an array, here of a known component type.
+   */
+  void process_filled_new_array(const IRInstruction* insn,
+                                const EnumTypeEnvironment* env) const {
+    const DexType* elem = type::make_array_component_type(insn->get_type());
+    if (elem == nullptr || type::is_primitive(elem)) {
+      return;
+    }
+    for (auto src : insn->srcs()) {
+      reject_if_inconsistent(insn, env->get(src), elem,
+                             UnsafeType::kUsageCastFilledNewArray);
+    }
+  }
+
+  /**
    * Process aput-object instruction when we reach the fixpoint.
    */
   void process_aput_object(const IRInstruction* insn,
@@ -251,7 +270,9 @@ class EnumUpcastDetector {
     EnumTypes elem_types = env->get(insn->src(0));
     UnorderedSet<const DexType*> acceptable_elem_types;
     for (const DexType* type : array_types.elements()) {
-      const DexType* elem = type::make_array_element_type(type);
+      // The stored value must have the array's component type, which for an
+      // array of arrays is itself an array type.
+      const DexType* elem = type::make_array_component_type(type);
       if ((elem != nullptr) && !type::is_primitive(elem)) {
         acceptable_elem_types.insert(elem); // An array of one type of objects.
       }
