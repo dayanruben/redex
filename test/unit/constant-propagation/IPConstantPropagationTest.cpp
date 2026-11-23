@@ -7,6 +7,7 @@
 
 #include "IPConstantPropagation.h"
 
+#include <limits>
 #include <signal.h>
 #include <tuple>
 
@@ -15,6 +16,7 @@
 
 #include "ConfigFiles.h"
 #include "ConstantPropagationRuntimeAssert.h"
+#include "ConstructorParams.h"
 #include "Creators.h"
 #include "DebugUtils.h"
 #include "DefinitelyAssignedIFields.h"
@@ -3732,4 +3734,1598 @@ TEST_F(InterproceduralConstantPropagationTest,
                 .get(CURRENT_PARTITION_LABEL)
                 .get(0),
             SignedConstantDomain(5));
+}
+
+namespace {
+
+// Creates the class `type` with the instance field `field:I`, which its
+// constructor `(I)V` sets to its argument, plus the root methods `roots` and
+// the non-root methods `others`.
+DexClass* create_class_with_int_field(
+    const std::string& type,
+    const std::string& field,
+    const std::vector<std::string>& roots,
+    const std::vector<std::string>& others = {}) {
+  ClassCreator creator(DexType::make_type(type));
+  creator.set_super(type::java_lang_Object());
+  creator.add_field(DexField::make_field(type + "." + field + ":I")
+                        ->make_concrete(ACC_PUBLIC));
+  creator.add_method(assembler::method_from_string(R"(
+    (method (public constructor) ")" + type + R"(.<init>:(I)V"
+     (
+      (load-param-object v0)
+      (load-param v1)
+      (invoke-direct (v0) "Ljava/lang/Object;.<init>:()V")
+      (iput v1 v0 ")" + type + "." + field + R"(:I")
+      (return-void)
+     )
+    )
+  )"));
+  for (const auto& method : roots) {
+    auto* m = assembler::method_from_string(method);
+    m->rstate.set_root();
+    creator.add_method(m);
+  }
+  for (const auto& method : others) {
+    creator.add_method(assembler::method_from_string(method));
+  }
+  return creator.create();
+}
+
+// `make` creates every Foo with f = 7, so `read` folds to 7 unless reachable
+// code writes another value to `f`.
+const char* const kMakeWithConst = R"(
+    (method (public static) "LFoo;.make:()LFoo;"
+     (
+      (new-instance "LFoo;")
+      (move-result-pseudo-object v0)
+      (const v1 7)
+      (invoke-direct (v0 v1) "LFoo;.<init>:(I)V")
+      (return-object v0)
+     )
+    )
+)";
+
+const char* const kRead = R"(
+    (method (public static) "LFoo;.read:(LFoo;)I"
+     (
+      (load-param-object v0)
+      (iget v0 "LFoo;.f:I")
+      (move-result-pseudo v1)
+      (return v1)
+     )
+    )
+)";
+
+void run_ipcp(const Scope& scope,
+              ConfigFiles& conf,
+              const InterproceduralConstantPropagationPass::Config& config) {
+  walk::code(scope, [](DexMethod*, IRCode& code) { code.build_cfg(); });
+  InterproceduralConstantPropagationPass(config).run(make_simple_stores(scope),
+                                                     conf);
+}
+
+// With no heap-analysis iterations, every whole-program value is Top, and no
+// field or method is ever Bottom.
+InterproceduralConstantPropagationPass::Config config_with_heap_analysis() {
+  InterproceduralConstantPropagationPass::Config config;
+  config.max_heap_analysis_iterations = 3;
+  return config;
+}
+
+bool contains_const(const std::string& method, int64_t value) {
+  auto& cfg = DexMethod::get_method(method)->as_def()->get_code()->cfg();
+  for (const auto& mie : cfg::InstructionIterable(cfg)) {
+    if (mie.insn->opcode() == OPCODE_CONST &&
+        mie.insn->get_literal() == value) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// Wraps `insns`, which can throw, in a try block whose handler, for
+// `exception`, writes 99 to `LFoo;.f:I` (the object in `foo_reg`); without
+// `in_try`, the write follows `insns` directly.
+std::string set_f_after(const std::string& insns,
+                        const std::string& exception,
+                        const std::string& foo_reg,
+                        bool in_try) {
+  const std::string set_f =
+      "(const v9 99)\n(iput v9 " + foo_reg + " \"LFoo;.f:I\")\n(return-void)\n";
+  if (!in_try) {
+    return insns + set_f;
+  }
+  return "(.try_start a)\n" + insns + "(.try_end a)\n(return-void)\n" +
+         "(.catch (a) \"" + exception + "\")\n" + set_f;
+}
+
+// `fail` never returns. Returns whether `LFoo;.read` folds to 7 after a method
+// calls `fail` and then writes 99 to `f`, in a handler when `in_try`.
+bool read_folds_after_call_of_fail(ConfigFiles& conf, bool in_try) {
+  const char* const fail = R"(
+    (method (public static) "LFoo;.fail:()I"
+     (
+      (new-instance "Ljava/lang/RuntimeException;")
+      (move-result-pseudo-object v0)
+      (invoke-direct (v0) "Ljava/lang/RuntimeException;.<init>:()V")
+      (throw v0)
+     )
+    )
+  )";
+  const std::string call_and_set =
+      R"((method (public static) "LFoo;.callAndSet:(LFoo;)V" (
+      (load-param-object v0)
+      )" +
+      set_f_after("(invoke-static () \"LFoo;.fail:()I\")\n(move-result v1)\n",
+                  "Ljava/lang/RuntimeException;", "v0", in_try) +
+      "))";
+  run_ipcp({create_class_with_int_field(
+               "LFoo;", "f", {kMakeWithConst, kRead, call_and_set}, {fail})},
+           conf, config_with_heap_analysis());
+  return contains_const("LFoo;.read:(LFoo;)I", 7);
+}
+
+// Bar's only constructor calls `fail`, which never returns, before it assigns
+// `g`. Since every constructor assigns `g` before any read, IPCP does not start
+// it at 0, and that one write is unreachable. So no Bar is ever constructed,
+// `g` never holds a value, and a read of it can only throw a
+// `NullPointerException`. Returns whether `LFoo;.read` folds to 7 after a
+// method reads `g` and then writes 99 to `f`, in a handler when `in_try`.
+bool read_folds_after_read_of_field_without_value(ConfigFiles& conf,
+                                                  bool in_try) {
+  const char* const fail = R"(
+    (method (public static) "LBar;.fail:()V"
+     (
+      (new-instance "Ljava/lang/RuntimeException;")
+      (move-result-pseudo-object v0)
+      (invoke-direct (v0) "Ljava/lang/RuntimeException;.<init>:()V")
+      (throw v0)
+     )
+    )
+  )";
+  const char* const make_bar = R"(
+    (method (public static) "LBar;.make:()LBar;"
+     (
+      (new-instance "LBar;")
+      (move-result-pseudo-object v0)
+      (const v1 5)
+      (invoke-direct (v0 v1) "LBar;.<init>:(I)V")
+      (return-object v0)
+     )
+    )
+  )";
+  const std::string read_and_set =
+      R"((method (public static) "LBar;.readAndSet:(LBar;LFoo;)V" (
+      (load-param-object v0)
+      (load-param-object v1)
+      )" +
+      set_f_after("(iget v0 \"LBar;.g:I\")\n(move-result-pseudo v2)\n",
+                  "Ljava/lang/NullPointerException;", "v1", in_try) +
+      "))";
+  ClassCreator bar(DexType::make_type("LBar;"));
+  bar.set_super(type::java_lang_Object());
+  bar.add_field(DexField::make_field("LBar;.g:I")->make_concrete(ACC_PUBLIC));
+  bar.add_method(assembler::method_from_string(R"(
+    (method (public constructor) "LBar;.<init>:(I)V"
+     (
+      (load-param-object v0)
+      (load-param v1)
+      (invoke-direct (v0) "Ljava/lang/Object;.<init>:()V")
+      (invoke-static () "LBar;.fail:()V")
+      (iput v1 v0 "LBar;.g:I")
+      (return-void)
+     )
+    )
+  )"));
+  bar.add_method(assembler::method_from_string(fail));
+  for (const std::string& root : {std::string(make_bar), read_and_set}) {
+    auto* m = assembler::method_from_string(root);
+    m->rstate.set_root();
+    bar.add_method(m);
+  }
+  run_ipcp({bar.create(),
+            create_class_with_int_field("LFoo;", "f", {kMakeWithConst, kRead})},
+           conf, config_with_heap_analysis());
+  return contains_const("LFoo;.read:(LFoo;)I", 7);
+}
+
+} // namespace
+
+// The exception of `fail` reaches the handler, so `f` is not always 7.
+TEST_F(InterproceduralConstantPropagationTest,
+       callOfMethodThatNeverReturnsKeepsItsHandler) {
+  EXPECT_FALSE(read_folds_after_call_of_fail(conf, /* in_try */ true));
+}
+
+// The write after the call never runs, so `f` is always 7.
+TEST_F(InterproceduralConstantPropagationTest,
+       callOfMethodThatNeverReturnsCutsOffWhatFollows) {
+  EXPECT_TRUE(read_folds_after_call_of_fail(conf, /* in_try */ false));
+}
+
+// The NullPointerException of the read reaches the handler, so `f` is not
+// always 7.
+TEST_F(InterproceduralConstantPropagationTest,
+       readOfInstanceFieldThatNeverHoldsAValueKeepsItsHandler) {
+  EXPECT_FALSE(
+      read_folds_after_read_of_field_without_value(conf, /* in_try */ true));
+}
+
+// The write after the read never runs, so `f` is always 7.
+TEST_F(InterproceduralConstantPropagationTest,
+       readOfInstanceFieldThatNeverHoldsAValueCutsOffWhatFollows) {
+  EXPECT_TRUE(
+      read_folds_after_read_of_field_without_value(conf, /* in_try */ false));
+}
+
+// `LFoo;.<clinit>` sets `x` to 1, calls `LHelper;.copy`, and then calls a
+// method on null, so it never completes normally and `x` holds no value after
+// it. `copy` runs while the initializer is still running: its read of `x`
+// completes, so it copies 1 to `LBar;.z`, and reads of `z` must not fold to its
+// initial value, 0.
+TEST_F(InterproceduralConstantPropagationTest,
+       staticFieldReadWhileItsFailingClassInitializerRunsCompletes) {
+  ClassCreator bar_creator(DexType::make_type("LBar;"));
+  bar_creator.set_super(type::java_lang_Object());
+  bar_creator.add_field(DexField::make_field("LBar;.z:I")
+                            ->make_concrete(ACC_PUBLIC | ACC_STATIC));
+  auto* read = assembler::method_from_string(R"(
+    (method (public static) "LBar;.read:()I"
+      (
+        (sget "LBar;.z:I")
+        (move-result-pseudo v0)
+        (return v0)
+      )
+    )
+  )");
+  read->rstate.set_root();
+  bar_creator.add_method(read);
+
+  ClassCreator helper_creator(DexType::make_type("LHelper;"));
+  helper_creator.set_super(type::java_lang_Object());
+  helper_creator.add_method(assembler::method_from_string(R"(
+    (method (public static) "LHelper;.copy:()V"
+      (
+        (sget "LFoo;.x:I")
+        (move-result-pseudo v0)
+        (sput v0 "LBar;.z:I")
+        (return-void)
+      )
+    )
+  )"));
+
+  ClassCreator foo_creator(DexType::make_type("LFoo;"));
+  foo_creator.set_super(type::java_lang_Object());
+  foo_creator.add_field(DexField::make_field("LFoo;.x:I")
+                            ->make_concrete(ACC_PUBLIC | ACC_STATIC));
+  foo_creator.add_method(assembler::method_from_string(R"(
+    (method (public static constructor) "LFoo;.<clinit>:()V"
+      (
+        (const v0 1)
+        (sput v0 "LFoo;.x:I")
+        (invoke-static () "LHelper;.copy:()V")
+        (const v1 0)
+        (invoke-virtual (v1) "Ljava/lang/Object;.hashCode:()I")
+        (return-void)
+      )
+    )
+  )"));
+  Scope scope{bar_creator.create(), helper_creator.create(),
+              foo_creator.create()};
+  const auto original_read = assembler::to_s_expr(read->get_code());
+  walk::code(scope, [](DexMethod*, IRCode& code) { code.build_cfg(); });
+  PassImpl::Config config;
+  config.max_heap_analysis_iterations = 3;
+  config.use_multiple_callee_callgraph = true;
+
+  PassImpl(config).run(make_simple_stores(scope), conf);
+
+  read->get_code()->clear_cfg();
+  EXPECT_EQ(assembler::to_s_expr(read->get_code()), original_read);
+}
+
+// The WholeProgramState and FixpointIterator operations behind a search for
+// field values, on two instance fields: `Foo.f`, assigned 7 by every
+// constructor call and so definitely assigned, and `Bar.h`, not assigned by the
+// constructor and set to 3 by `set`. The static field `Bar.s` is 5, and
+// `Bar.t` is 1 or, after `setT`, 2.
+namespace {
+
+// Adds `methods` and the root methods `roots` to `creator`.
+void add_methods(ClassCreator* creator,
+                 const std::vector<std::string>& methods,
+                 const std::vector<std::string>& roots = {}) {
+  for (const auto& method : methods) {
+    creator->add_method(assembler::method_from_string(method));
+  }
+  for (const auto& root : roots) {
+    auto* m = assembler::method_from_string(root);
+    m->rstate.set_root();
+    creator->add_method(m);
+  }
+}
+
+// The constructor `<init>:()V` of `type`, which only calls Object's.
+std::string default_constructor(const std::string& type) {
+  return R"((method (public constructor) ")" + type + R"(.<init>:()V" (
+      (load-param-object v0)
+      (invoke-direct (v0) "Ljava/lang/Object;.<init>:()V")
+      (return-void)
+    )))";
+}
+
+// Creates the class `type` with the public instance fields `fields`, its
+// default constructor, the methods `methods` and the root methods `roots`.
+DexClass* create_class(const std::string& type,
+                       const std::vector<std::string>& fields,
+                       const std::vector<std::string>& methods,
+                       const std::vector<std::string>& roots) {
+  ClassCreator creator(DexType::make_type(type));
+  creator.set_super(type::java_lang_Object());
+  for (const auto& field : fields) {
+    creator.add_field(DexField::make_field(field)->make_concrete(ACC_PUBLIC));
+  }
+  add_methods(&creator, methods);
+  add_methods(&creator, {default_constructor(type)}, roots);
+  return creator.create();
+}
+
+void build_cfgs(const Scope& scope) {
+  walk::code(scope, [](DexMethod*, IRCode& code) {
+    code.build_cfg();
+    code.cfg().calculate_exit_block();
+  });
+}
+
+// Runs the first IPCP run over `scope`, which assumes nothing about fields and
+// methods, recording what the methods write to instance fields.
+std::unique_ptr<FixpointIterator> bootstrap_recording_field_writes(
+    InterproceduralConstantPropagationTest* test, const Scope& scope) {
+  auto fp_iter = InterproceduralConstantPropagationPass().analyze(
+      scope, &test->m_immut_analyzer_state, &test->m_api_level_analyzer_state,
+      &test->m_string_analyzer_state, &test->m_package_name_state,
+      test->m_null_check_methods);
+  fp_iter->start_recording_field_writes(scope);
+  fp_iter->run(Domain{{CURRENT_PARTITION_LABEL, ArgumentDomain()}});
+  return fp_iter;
+}
+
+} // namespace
+
+struct FieldSearchTest : public InterproceduralConstantPropagationTest {
+  FieldSearchTest() {
+    ClassCreator bar(DexType::make_type("LBar;"));
+    bar.set_super(type::java_lang_Object());
+    bar.add_field(DexField::make_field("LBar;.h:I")->make_concrete(ACC_PUBLIC));
+    for (const char* name : {"LBar;.s:I", "LBar;.t:I"}) {
+      bar.add_field(
+          DexField::make_field(name)->make_concrete(ACC_PUBLIC | ACC_STATIC));
+    }
+    bar.add_field(DexField::make_field("LBar;.v:I")
+                      ->make_concrete(ACC_PUBLIC | ACC_STATIC | ACC_VOLATILE));
+    bar.add_method(assembler::method_from_string(R"(
+      (method (public static constructor) "LBar;.<clinit>:()V"
+       (
+        (const v0 5)
+        (sput v0 "LBar;.s:I")
+        (const v0 1)
+        (sput v0 "LBar;.t:I")
+        (const v0 6)
+        (sput v0 "LBar;.v:I")
+        (return-void)
+       )
+      )
+    )"));
+    add_methods(&bar, {default_constructor("LBar;")},
+                {R"(
+      (method (public static) "LBar;.setT:()V"
+       (
+        (const v0 2)
+        (sput v0 "LBar;.t:I")
+        (return-void)
+       )
+      )
+    )",
+                 R"(
+      (method (public static) "LBar;.make:()LBar;"
+       (
+        (new-instance "LBar;")
+        (move-result-pseudo-object v0)
+        (invoke-direct (v0) "LBar;.<init>:()V")
+        (return-object v0)
+       )
+      )
+    )",
+                 R"(
+      (method (public static) "LBar;.set:(LBar;)V"
+       (
+        (load-param-object v0)
+        (const v1 3)
+        (iput v1 v0 "LBar;.h:I")
+        (return-void)
+       )
+      )
+    )"});
+    scope = {create_class_with_int_field("LFoo;", "f", {kMakeWithConst, kRead}),
+             bar.create()};
+    build_cfgs(scope);
+    definitely_assigned =
+        definitely_assigned_ifields::get_definitely_assigned_ifields(scope);
+    f = DexField::get_field("LFoo;.f:I")->as_def();
+    h = DexField::get_field("LBar;.h:I")->as_def();
+  }
+
+  // Runs only the first IPCP run, which assumes nothing about fields and
+  // methods, recording what the methods write to instance fields.
+  std::unique_ptr<FixpointIterator> bootstrap() {
+    return bootstrap_recording_field_writes(this, scope);
+  }
+
+  std::unique_ptr<WholeProgramState> collect(const FixpointIterator& fp_iter) {
+    auto graph = method_override_graph::build_graph(scope);
+    return std::make_unique<WholeProgramState>(
+        scope, fp_iter,
+        method_override_graph::get_non_true_virtuals(*graph, scope),
+        UnorderedSet<const DexType*>(), definitely_assigned,
+        /* call_graph */ nullptr);
+  }
+
+  std::unique_ptr<WholeProgramState> start(const FixpointIterator& fp_iter) {
+    auto graph = method_override_graph::build_graph(scope);
+    return WholeProgramState::make_field_search_start(
+        scope, fp_iter,
+        method_override_graph::get_non_true_virtuals(*graph, scope),
+        UnorderedSet<const DexType*>(), definitely_assigned,
+        /* call_graph */ nullptr);
+  }
+
+  static SignedConstantDomain zero_or_three() {
+    return SignedConstantDomain(0).join(SignedConstantDomain(3));
+  }
+
+  Scope scope;
+  UnorderedSet<const DexField*> definitely_assigned;
+  const DexField* f{nullptr};
+  const DexField* h{nullptr};
+};
+
+// `f` is assigned by every constructor before any read, so it starts with no
+// value; `h` starts at 0. The statics `s` and `v` keep the values of the class
+// initializer, as collecting a run's field values keeps them, volatile or not;
+// `t` is unknown, because `setT` writes it too.
+TEST_F(FieldSearchTest, searchStartsAtInitialAndClassInitializerValues) {
+  auto fp_iter = bootstrap();
+  const auto* s = DexField::get_field("LBar;.s:I")->as_def();
+  const auto* t = DexField::get_field("LBar;.t:I")->as_def();
+  auto start_state = start(*fp_iter);
+  EXPECT_TRUE(start_state->get_field_value(f).is_bottom());
+  EXPECT_EQ(start_state->get_field_value(h), SignedConstantDomain(0));
+  EXPECT_EQ(start_state->get_field_value(s), SignedConstantDomain(5));
+  EXPECT_TRUE(start_state->get_field_value(t).is_top());
+  const auto* v = DexField::get_field("LBar;.v:I")->as_def();
+  EXPECT_EQ(start_state->get_field_value(v), SignedConstantDomain(6));
+  EXPECT_EQ(collect(*fp_iter)->get_field_value(v), SignedConstantDomain(6));
+  EXPECT_TRUE(start_state
+                  ->get_return_value(
+                      DexMethod::get_method("LFoo;.make:()LFoo;")->as_def())
+                  .is_top());
+}
+
+// The first run writes 7 to `f` (the constructor called by `make`) and 3 to
+// `h` (`set`); the initial values are not writes. The run's state tracks no
+// fields, yet the writes are recorded, because a later state may reuse the
+// cached results.
+TEST_F(FieldSearchTest, collectFieldWritesReturnsWhatTheRunWrites) {
+  auto fp_iter = bootstrap();
+  auto writes = fp_iter->collect_field_writes();
+  EXPECT_EQ(writes.bindings().size(), 2u);
+  EXPECT_EQ(writes.get(f), SignedConstantDomain(7));
+  EXPECT_EQ(writes.get(h), SignedConstantDomain(3));
+}
+
+// `set9` is neither a root nor called, so no call graph node represents it,
+// yet its write of 9 to `v` counts, as it does when collecting a run's field
+// values.
+TEST_F(InterproceduralConstantPropagationTest,
+       fieldWritesIncludeMethodsWithoutCallGraphNode) {
+  Scope scope{create_class("LOrph;", {"LOrph;.v:I"}, {R"(
+    (method (public static) "LOrph;.set9:(LOrph;)V"
+     (
+      (load-param-object v0)
+      (const v1 9)
+      (iput v1 v0 "LOrph;.v:I")
+      (return-void)
+     )
+    )
+  )"},
+                           {})};
+  build_cfgs(scope);
+  auto fp_iter = bootstrap_recording_field_writes(this, scope);
+  const auto* v = DexField::get_field("LOrph;.v:I")->as_def();
+  EXPECT_EQ(fp_iter->collect_field_writes().get(v), SignedConstantDomain(9));
+  EXPECT_EQ(fp_iter->rerun_incrementally(/* max_growing_sweeps */ 20).get(v),
+            SignedConstantDomain(9));
+}
+
+// The collected writes joined into the start give what collecting the run's
+// field values gives.
+TEST_F(FieldSearchTest, fieldWritesJoinedIntoTheStartGiveTheCollectedValues) {
+  auto fp_iter = bootstrap();
+  auto collected = collect(*fp_iter);
+  auto start_state = start(*fp_iter);
+  start_state->grow_field_values(fp_iter->collect_field_writes(),
+                                 std::numeric_limits<size_t>::max());
+  for (const auto* field : {f, h}) {
+    EXPECT_EQ(start_state->get_field_value(field),
+              collected->get_field_value(field))
+        << show(field);
+  }
+}
+
+// From the start, `f` gets its first value, which is not growth, and `h` grows
+// from 0 to [0, 3]. With no growth allowed, `h` is widened to Top.
+TEST_F(FieldSearchTest, growFieldValuesWidensAFieldGrownMoreThanTheDelay) {
+  auto fp_iter = bootstrap();
+  auto writes = fp_iter->collect_field_writes();
+  fp_iter->set_whole_program_state(start(*fp_iter));
+  auto growth = fp_iter->grow_field_values(writes, /* widening_delay */ 0);
+  EXPECT_EQ(growth.grown, 2u);
+  EXPECT_EQ(growth.widened, 1u);
+  const auto& wps = fp_iter->get_whole_program_state();
+  EXPECT_EQ(wps.get_field_value(f), SignedConstantDomain(7));
+  EXPECT_TRUE(wps.get_field_value(h).is_top());
+  EXPECT_EQ(fp_iter->grow_field_values(writes, 0).grown, 0u);
+}
+
+// With one growth allowed, `h` keeps its value [0, 3].
+TEST_F(FieldSearchTest, growFieldValuesKeepsAFieldGrownWithinTheDelay) {
+  auto fp_iter = bootstrap();
+  auto writes = fp_iter->collect_field_writes();
+  fp_iter->set_whole_program_state(start(*fp_iter));
+  auto growth = fp_iter->grow_field_values(writes, /* widening_delay */ 1);
+  EXPECT_EQ(growth.grown, 2u);
+  EXPECT_EQ(growth.widened, 0u);
+  const auto& wps = fp_iter->get_whole_program_state();
+  EXPECT_EQ(wps.get_field_value(f), SignedConstantDomain(7));
+  EXPECT_EQ(wps.get_field_value(h), zero_or_three());
+  EXPECT_EQ(fp_iter->grow_field_values(writes, 1).grown, 0u);
+}
+
+namespace {
+
+// `relay` passes `Foo.g` (0, or 7 once `setG` ran) to `Qux.make`, whose
+// constructor stores it in `q`, and starts `count`, which stores its growing
+// argument in `r` and calls itself. So `g`'s growth reaches `q` only through
+// arguments, and `count`'s argument grows along a recursive call.
+DexClass* create_qux() {
+  ClassCreator qux(DexType::make_type("LQux;"));
+  qux.set_super(type::java_lang_Object());
+  for (const char* name : {"LQux;.q:I", "LQux;.r:I"}) {
+    qux.add_field(DexField::make_field(name)->make_concrete(ACC_PUBLIC));
+  }
+  add_methods(&qux, {R"(
+    (method (public constructor) "LQux;.<init>:(I)V"
+     (
+      (load-param-object v0)
+      (load-param v1)
+      (invoke-direct (v0) "Ljava/lang/Object;.<init>:()V")
+      (iput v1 v0 "LQux;.q:I")
+      (return-void)
+     )
+    )
+  )",
+                     R"(
+    (method (public static) "LQux;.make:(I)LQux;"
+     (
+      (load-param v0)
+      (new-instance "LQux;")
+      (move-result-pseudo-object v1)
+      (invoke-direct (v1 v0) "LQux;.<init>:(I)V")
+      (return-object v1)
+     )
+    )
+  )",
+                     R"(
+    (method (public static) "LQux;.count:(LQux;I)V"
+     (
+      (load-param-object v0)
+      (load-param v1)
+      (iput v1 v0 "LQux;.r:I")
+      (const v2 100)
+      (if-ge v1 v2 :done)
+      (add-int/lit v3 v1 1)
+      (invoke-static (v0 v3) "LQux;.count:(LQux;I)V")
+      (:done)
+      (return-void)
+     )
+    )
+  )"});
+  return qux.create();
+}
+
+const char* const kSetG = R"(
+    (method (public static) "LFoo;.setG:(LFoo;)V"
+     (
+      (load-param-object v0)
+      (const v1 7)
+      (iput v1 v0 "LFoo;.g:I")
+      (return-void)
+     )
+    )
+)";
+
+const char* const kRelay = R"(
+    (method (public static) "LFoo;.relay:(LFoo;)V"
+     (
+      (load-param-object v0)
+      (iget v0 "LFoo;.g:I")
+      (move-result-pseudo v1)
+      (invoke-static (v1) "LQux;.make:(I)LQux;")
+      (move-result-object v2)
+      (const v3 0)
+      (invoke-static (v2 v3) "LQux;.count:(LQux;I)V")
+      (return-void)
+     )
+    )
+)";
+
+} // namespace
+
+namespace {
+
+constexpr size_t kMaxGrowingSweeps = 20;
+
+// The outcome of a search for the values of the instance fields of a scope.
+struct FieldSearch {
+  std::unique_ptr<FixpointIterator> fp_iter;
+  // For each requested field, its final value and the writes to it collected
+  // under the final entry arguments.
+  std::vector<ConstantValue> values;
+};
+
+// Searches for the values of the instance fields of `scope`, bringing the
+// analysis up to date after each growth either with rerun_incrementally() or
+// with a full run. With `collect_before_rerun`, also collects the writes
+// before each incremental rerun, which must not change its outcome.
+FieldSearch search_field_values(InterproceduralConstantPropagationTest* test,
+                                const Scope& scope,
+                                bool incremental,
+                                const std::vector<std::string>& fields,
+                                size_t max_growing_sweeps = kMaxGrowingSweeps,
+                                bool collect_before_rerun = false) {
+  auto fp_iter = bootstrap_recording_field_writes(test, scope);
+  auto definitely_assigned =
+      definitely_assigned_ifields::get_definitely_assigned_ifields(scope);
+  auto graph = method_override_graph::build_graph(scope);
+  fp_iter->set_whole_program_state(WholeProgramState::make_field_search_start(
+      scope, *fp_iter,
+      method_override_graph::get_non_true_virtuals(*graph, scope),
+      UnorderedSet<const DexType*>(), definitely_assigned,
+      /* call_graph */ nullptr));
+  fp_iter->run(Domain{{CURRENT_PARTITION_LABEL, ArgumentDomain()}});
+  auto writes = fp_iter->collect_field_writes();
+  size_t rounds = 0;
+  while (fp_iter->grow_field_values(writes, 2).grown != 0) {
+    always_assert(++rounds < 50);
+    if (incremental) {
+      if (collect_before_rerun) {
+        fp_iter->collect_field_writes();
+      }
+      writes = fp_iter->rerun_incrementally(max_growing_sweeps);
+    } else {
+      fp_iter->run(Domain{{CURRENT_PARTITION_LABEL, ArgumentDomain()}});
+      writes = fp_iter->collect_field_writes();
+    }
+  }
+  auto collected = fp_iter->collect_field_writes();
+  FieldSearch search;
+  for (const auto& name : fields) {
+    const auto* field = DexField::get_field(name)->as_def();
+    search.values.push_back(
+        fp_iter->get_whole_program_state().get_field_value(field));
+    search.values.push_back(collected.get(field));
+  }
+  search.fp_iter = std::move(fp_iter);
+  return search;
+}
+
+// Whether every method of `scope` has the same entry and exit states in `a`
+// as in `b`, or with `at_least`, states in `a` at least as large as in `b`.
+bool states_match(const FieldSearch& a,
+                  const FieldSearch& b,
+                  const Scope& scope,
+                  bool at_least = false) {
+  auto matches = [&](const Domain& x, const Domain& y) {
+    return at_least ? y.leq(x) : x.equals(y);
+  };
+  bool match = true;
+  walk::methods(scope, [&](DexMethod* method) {
+    const auto& graph_a = a.fp_iter->get_call_graph();
+    const auto& graph_b = b.fp_iter->get_call_graph();
+    if (!graph_a.has_node(method) || !graph_b.has_node(method)) {
+      match = match && !graph_a.has_node(method) && !graph_b.has_node(method);
+      return;
+    }
+    const auto& node_a = graph_a.node(method);
+    const auto& node_b = graph_b.node(method);
+    match = match &&
+            matches(a.fp_iter->get_entry_state_at(node_a),
+                    b.fp_iter->get_entry_state_at(node_b)) &&
+            matches(a.fp_iter->get_exit_state_at(node_a),
+                    b.fp_iter->get_exit_state_at(node_b));
+  });
+  return match;
+}
+
+// `writeG` writes 1 to `Rev.g` unless `Rev.f` is 0, and `setF` writes an
+// unknown value to `Rev.f`. The run before the search, where `Rev.f` is
+// unknown, caches a result of `writeG` that writes `Rev.g`; the search starts
+// with `Rev.f` at 0, where `writeG` writes nothing, until `Rev.f` grows back to
+// unknown and the first cached result matches again.
+Scope create_revived_cache_entry() {
+  return {create_class("LRev;", {"LRev;.f:I", "LRev;.g:I"}, {},
+                       {R"(
+    (method (public static) "LRev;.writeG:(LRev;)V"
+     (
+      (load-param-object v0)
+      (iget v0 "LRev;.f:I")
+      (move-result-pseudo v1)
+      (if-eqz v1 :done)
+      (const v2 1)
+      (iput v2 v0 "LRev;.g:I")
+      (:done)
+      (return-void)
+     )
+    )
+  )",
+                        R"(
+    (method (public static) "LRev;.setF:(LRev;I)V"
+     (
+      (load-param-object v0)
+      (load-param v1)
+      (iput v1 v0 "LRev;.f:I")
+      (return-void)
+     )
+    )
+  )"})};
+}
+
+// `a(c, x)` writes x to `Cyc.r` and, once `Cyc.flag` is set, calls `b(c, 5)`;
+// `b(c, y)` calls `a(c, y)`; `start` calls both with 0. Only `setFlag` sets the
+// flag, so the recursive call first grows the argument of `a` in an
+// incremental rerun.
+Scope create_flagged_recursion() {
+  return {create_class("LCyc;", {"LCyc;.flag:I", "LCyc;.r:I"},
+                       {R"(
+    (method (public static) "LCyc;.a:(LCyc;I)V"
+     (
+      (load-param-object v0)
+      (load-param v1)
+      (iput v1 v0 "LCyc;.r:I")
+      (iget v0 "LCyc;.flag:I")
+      (move-result-pseudo v2)
+      (if-eqz v2 :done)
+      (const v3 5)
+      (invoke-static (v0 v3) "LCyc;.b:(LCyc;I)V")
+      (:done)
+      (return-void)
+     )
+    )
+  )",
+                        R"(
+    (method (public static) "LCyc;.b:(LCyc;I)V"
+     (
+      (load-param-object v0)
+      (load-param v1)
+      (invoke-static (v0 v1) "LCyc;.a:(LCyc;I)V")
+      (return-void)
+     )
+    )
+  )"},
+                       {R"(
+    (method (public static) "LCyc;.start:()LCyc;"
+     (
+      (new-instance "LCyc;")
+      (move-result-pseudo-object v0)
+      (invoke-direct (v0) "LCyc;.<init>:()V")
+      (const v1 0)
+      (invoke-static (v0 v1) "LCyc;.a:(LCyc;I)V")
+      (invoke-static (v0 v1) "LCyc;.b:(LCyc;I)V")
+      (return-object v0)
+     )
+    )
+  )",
+                        R"(
+    (method (public static) "LCyc;.setFlag:(LCyc;)V"
+     (
+      (load-param-object v0)
+      (const v1 1)
+      (iput v1 v0 "LCyc;.flag:I")
+      (return-void)
+     )
+    )
+  )"})};
+}
+
+// `count(x)` writes x to `Counter.r` and calls `count(x + 1)` while x is
+// below `Counter.limit`, which only `setLimit` writes. The search learns the
+// limit in its second round; from then on, each pass over the call graph
+// grows the argument of the recursive call by one.
+Scope create_counter(int limit) {
+  return {create_class("LCounter;", {"LCounter;.limit:I", "LCounter;.r:I"}, {R"(
+    (method (public static) "LCounter;.count:(LCounter;I)V"
+     (
+      (load-param-object v0)
+      (load-param v1)
+      (iget v0 "LCounter;.limit:I")
+      (move-result-pseudo v2)
+      (if-ge v1 v2 :done)
+      (iput v1 v0 "LCounter;.r:I")
+      (add-int/lit v3 v1 1)
+      (invoke-static (v0 v3) "LCounter;.count:(LCounter;I)V")
+      (:done)
+      (return-void)
+     )
+    )
+  )"},
+                       {R"(
+    (method (public static) "LCounter;.start:()LCounter;"
+     (
+      (new-instance "LCounter;")
+      (move-result-pseudo-object v0)
+      (invoke-direct (v0) "LCounter;.<init>:()V")
+      (const v1 0)
+      (invoke-static (v0 v1) "LCounter;.count:(LCounter;I)V")
+      (return-object v0)
+     )
+    )
+  )",
+                        R"(
+    (method (public static) "LCounter;.setLimit:(LCounter;)V"
+     (
+      (load-param-object v0)
+      (const v1 )" + std::to_string(limit) +
+                            R"()
+      (iput v1 v0 "LCounter;.limit:I")
+      (return-void)
+     )
+    )
+  )"})};
+}
+
+// `Bar.setViaImm` reads the final field `Imm.a` of an object it constructs, in
+// a try block, and then writes 9 to `Bar.g`. The immutable-attribute analysis
+// answers the read itself, so the whole-program value of `Imm.a` is read only
+// by the no-throw edge, which cuts off the rest of the block while `Imm.a` has
+// no value. `Bar.callSet` calls it with `Bar.h`, which differs between the
+// first run and a search, so a search cannot reuse the first run's result.
+Scope create_write_behind_immutable_read() {
+  ClassCreator imm(DexType::make_type("LImm;"));
+  imm.set_super(type::java_lang_Object());
+  imm.add_field(
+      DexField::make_field("LImm;.a:I")->make_concrete(ACC_PUBLIC | ACC_FINAL));
+  imm.add_method(assembler::method_from_string(R"(
+    (method (public constructor) "LImm;.<init>:(I)V"
+     (
+      (load-param-object v0)
+      (load-param v1)
+      (invoke-direct (v0) "Ljava/lang/Object;.<init>:()V")
+      (iput v1 v0 "LImm;.a:I")
+      (return-void)
+     )
+    )
+  )"));
+  auto* bar = create_class("LBar;", {"LBar;.g:I", "LBar;.h:I"}, {R"(
+    (method (public static) "LBar;.setViaImm:(LBar;I)V"
+     (
+      (load-param-object v0)
+      (load-param v5)
+      (new-instance "LImm;")
+      (move-result-pseudo-object v1)
+      (const v2 5)
+      (invoke-direct (v1 v2) "LImm;.<init>:(I)V")
+      (.try_start a)
+      (iget v1 "LImm;.a:I")
+      (move-result-pseudo v3)
+      (.try_end a)
+      (const v4 9)
+      (iput v4 v0 "LBar;.g:I")
+      (return-void)
+      (.catch (a) "Ljava/lang/NullPointerException;")
+      (return-void)
+     )
+    )
+  )"},
+                           {R"(
+    (method (public static) "LBar;.callSet:(LBar;)V"
+     (
+      (load-param-object v0)
+      (iget v0 "LBar;.h:I")
+      (move-result-pseudo v1)
+      (invoke-static (v0 v1) "LBar;.setViaImm:(LBar;I)V")
+      (return-void)
+     )
+    )
+  )"});
+  return {imm.create(), bar};
+}
+
+} // namespace
+
+// Searching for field values with rerun_incrementally() after each growth
+// reaches the same field values and analysis states as with a full run after
+// each growth.
+TEST_F(InterproceduralConstantPropagationTest,
+       rerunIncrementallyMatchesFullRuns) {
+  auto* foo = create_class_with_int_field("LFoo;", "f",
+                                          {kMakeWithConst, kSetG, kRelay});
+  foo->add_field(DexField::make_field("LFoo;.g:I")->make_concrete(ACC_PUBLIC));
+  Scope scope{foo, create_qux()};
+  build_cfgs(scope);
+  std::vector<std::string> fields{"LFoo;.g:I", "LQux;.q:I", "LQux;.r:I"};
+  auto full = search_field_values(this, scope, /* incremental */ false, fields);
+  auto incremental =
+      search_field_values(this, scope, /* incremental */ true, fields);
+  EXPECT_EQ(incremental.values, full.values);
+  EXPECT_TRUE(states_match(incremental, full, scope));
+  // `q` holds `g`'s values; `r` keeps growing and is widened.
+  ConstantValue zero_or_seven =
+      SignedConstantDomain(0).join(SignedConstantDomain(7));
+  EXPECT_EQ(full.values[0], zero_or_seven);
+  EXPECT_EQ(full.values[2], zero_or_seven);
+  EXPECT_EQ(full.values[4], ConstantValue::top());
+}
+
+// Allowed no growing sweep at all, the incremental rerun sets the argument of
+// `a` to Top as soon as the recursive call grows it, so `r` is Top where the
+// full runs find 0 or 5: less precise, but sound.
+TEST_F(InterproceduralConstantPropagationTest,
+       rerunIncrementallySetsArgumentsThatRecursionGrowsToTop) {
+  auto scope = create_flagged_recursion();
+  build_cfgs(scope);
+  std::vector<std::string> fields{"LCyc;.r:I"};
+  auto full = search_field_values(this, scope, /* incremental */ false, fields);
+  EXPECT_EQ(
+      full.values[0],
+      ConstantValue(SignedConstantDomain(0).join(SignedConstantDomain(5))));
+  auto incremental =
+      search_field_values(this, scope, /* incremental */ true, fields);
+  EXPECT_EQ(incremental.values, full.values);
+  EXPECT_TRUE(states_match(incremental, full, scope));
+  auto capped = search_field_values(this, scope, /* incremental */ true, fields,
+                                    /* max_growing_sweeps */ 0);
+  EXPECT_EQ(capped.values[0], ConstantValue::top());
+  EXPECT_TRUE(states_match(capped, full, scope, /* at_least */ true));
+}
+
+// With a limit of 40, the argument of the recursive call grows for 40 passes
+// over the call graph, longer than incremental reruns follow such growth
+// before they set the argument to Top. Here the full runs lose the same
+// precision, so both reach the same values.
+TEST_F(InterproceduralConstantPropagationTest,
+       rerunIncrementallyMatchesFullRunsForALongRecursion) {
+  auto scope = create_counter(40);
+  build_cfgs(scope);
+  std::vector<std::string> fields{"LCounter;.r:I"};
+  auto full = search_field_values(this, scope, /* incremental */ false, fields);
+  auto incremental =
+      search_field_values(this, scope, /* incremental */ true, fields);
+  EXPECT_EQ(incremental.values, full.values);
+  EXPECT_TRUE(states_match(incremental, full, scope, /* at_least */ true));
+}
+
+// A method that calls itself counts as recursion too: allowed no growing sweep
+// at all, the incremental reruns set the argument of `count` to Top as soon as
+// its recursive call grows it, where the full runs know it is not negative.
+TEST_F(InterproceduralConstantPropagationTest,
+       rerunIncrementallySetsArgumentsThatSelfRecursionGrowsToTop) {
+  auto scope = create_counter(5);
+  build_cfgs(scope);
+  std::vector<std::string> fields{"LCounter;.r:I"};
+  auto full = search_field_values(this, scope, /* incremental */ false, fields);
+  auto capped = search_field_values(this, scope, /* incremental */ true, fields,
+                                    /* max_growing_sweeps */ 0);
+  EXPECT_TRUE(states_match(capped, full, scope, /* at_least */ true));
+  EXPECT_FALSE(states_match(capped, full, scope));
+}
+
+// With a limit of 5, the incremental reruns follow the recursion to the end.
+TEST_F(InterproceduralConstantPropagationTest,
+       rerunIncrementallyMatchesFullRunsForAShortRecursion) {
+  auto scope = create_counter(5);
+  build_cfgs(scope);
+  std::vector<std::string> fields{"LCounter;.r:I"};
+  auto full = search_field_values(this, scope, /* incremental */ false, fields);
+  auto incremental =
+      search_field_values(this, scope, /* incremental */ true, fields);
+  EXPECT_EQ(incremental.values, full.values);
+  EXPECT_TRUE(states_match(incremental, full, scope));
+}
+
+// When `Rev.f` grows back to unknown, `writeG` switches to the result cached
+// before the search, and its write to `Rev.g` must be seen.
+TEST_F(InterproceduralConstantPropagationTest,
+       rerunIncrementallySeesTheWritesOfACacheEntryThatMatchesAgain) {
+  auto scope = create_revived_cache_entry();
+  build_cfgs(scope);
+  std::vector<std::string> fields{"LRev;.g:I"};
+  auto full = search_field_values(this, scope, /* incremental */ false, fields);
+  EXPECT_EQ(
+      full.values[0],
+      ConstantValue(SignedConstantDomain(0).join(SignedConstantDomain(1))));
+  auto incremental =
+      search_field_values(this, scope, /* incremental */ true, fields);
+  EXPECT_EQ(incremental.values, full.values);
+  EXPECT_TRUE(states_match(incremental, full, scope));
+}
+
+// When `Imm.a` gets its value, the cached result of `setViaImm` must be redone,
+// or its write of 9 to `Bar.g` would stay unseen.
+TEST_F(InterproceduralConstantPropagationTest,
+       cachedResultIsRedoneWhenAValueReadOnAnEdgeGrows) {
+  auto scope = create_write_behind_immutable_read();
+  build_cfgs(scope);
+  immutable_state::analyze_constructors(scope, &m_immut_analyzer_state);
+  ConstantValue zero_or_nine =
+      SignedConstantDomain(0).join(SignedConstantDomain(9));
+  for (bool incremental : {false, true}) {
+    auto search = search_field_values(this, scope, incremental, {"LBar;.g:I"});
+    EXPECT_EQ(search.values[0], zero_or_nine) << incremental;
+  }
+}
+
+// `copyPlusOne` writes `Foo.f + 1` to `f`. After `f` grows from no value to 7,
+// its cached result no longer matches, so the incremental rerun analyzes it
+// again and sees the write of 8.
+TEST_F(FieldSearchTest, rerunIncrementallyAnalyzesAStaleMethodAgain) {
+  ClassCreator copier(DexType::make_type("LCopier;"));
+  copier.set_super(type::java_lang_Object());
+  add_methods(&copier, {}, {R"(
+    (method (public static) "LCopier;.copyPlusOne:(LFoo;)V"
+     (
+      (load-param-object v0)
+      (iget v0 "LFoo;.f:I")
+      (move-result-pseudo v1)
+      (add-int/lit v1 v1 1)
+      (iput v1 v0 "LFoo;.f:I")
+      (return-void)
+     )
+    )
+  )"});
+  scope.push_back(copier.create());
+  build_cfgs(scope);
+  auto fp_iter = bootstrap();
+  fp_iter->set_whole_program_state(start(*fp_iter));
+  fp_iter->run(Domain{{CURRENT_PARTITION_LABEL, ArgumentDomain()}});
+  auto writes = fp_iter->collect_field_writes();
+  EXPECT_EQ(writes.get(f), SignedConstantDomain(7));
+  fp_iter->grow_field_values(writes, 2);
+  EXPECT_EQ(fp_iter->rerun_incrementally(kMaxGrowingSweeps).get(f),
+            SignedConstantDomain(8));
+}
+
+// `send(p, z)` writes `z` to `Loop.w` and, unless `z` is 0, calls `send(p, 0)`;
+// `start` calls it only on a path that cannot run. The run first analyzes
+// `send` with no arguments, which the analysis treats as unknown ones, so its
+// recursive call passes 0. Analyzed with 0, `send` no longer calls itself, so
+// the run ends with no arguments for `send`, which its latest analysis did not
+// use. The collected writes are those under no arguments.
+TEST_F(InterproceduralConstantPropagationTest,
+       collectFieldWritesUsesTheFinalArgumentsOfARecursion) {
+  Scope scope{create_class("LLoop;", {"LLoop;.w:I"}, {R"(
+    (method (public static) "LLoop;.send:(LLoop;I)V"
+     (
+      (load-param-object v0)
+      (load-param v1)
+      (iput v1 v0 "LLoop;.w:I")
+      (if-eqz v1 :done)
+      (const v2 0)
+      (invoke-static (v0 v2) "LLoop;.send:(LLoop;I)V")
+      (:done)
+      (return-void)
+     )
+    )
+  )"},
+                           {R"(
+    (method (public static) "LLoop;.start:(LLoop;)V"
+     (
+      (load-param-object v0)
+      (const v1 0)
+      (if-eqz v1 :done)
+      (invoke-static (v0 v1) "LLoop;.send:(LLoop;I)V")
+      (:done)
+      (return-void)
+     )
+    )
+  )"})};
+  build_cfgs(scope);
+  auto fp_iter = bootstrap_recording_field_writes(this, scope);
+  const auto* send = DexMethod::get_method("LLoop;.send:(LLoop;I)V")->as_def();
+  EXPECT_TRUE(fp_iter->get_entry_state_at(fp_iter->get_call_graph().node(send))
+                  .get(CURRENT_PARTITION_LABEL)
+                  .is_bottom());
+  const auto* w = DexField::get_field("LLoop;.w:I")->as_def();
+  EXPECT_TRUE(fp_iter->collect_field_writes().get(w).is_top());
+}
+
+// `pass` passes `P.f`, which `setF` sets to 7, to `sink`, which writes it to
+// `P.h`. Collecting the writes after `f` grows analyzes `pass` again; the
+// incremental rerun must still pass the grown argument on to `sink`.
+TEST_F(InterproceduralConstantPropagationTest,
+       collectFieldWritesBeforeARerunKeepsTheGrowth) {
+  Scope scope{create_class("LP;", {"LP;.f:I", "LP;.h:I"}, {R"(
+    (method (public static) "LP;.sink:(LP;I)V"
+     (
+      (load-param-object v0)
+      (load-param v1)
+      (iput v1 v0 "LP;.h:I")
+      (return-void)
+     )
+    )
+  )"},
+                           {R"(
+    (method (public static) "LP;.setF:(LP;)V"
+     (
+      (load-param-object v0)
+      (const v1 7)
+      (iput v1 v0 "LP;.f:I")
+      (return-void)
+     )
+    )
+  )",
+                            R"(
+    (method (public static) "LP;.pass:(LP;)V"
+     (
+      (load-param-object v0)
+      (iget v0 "LP;.f:I")
+      (move-result-pseudo v1)
+      (invoke-static (v0 v1) "LP;.sink:(LP;I)V")
+      (return-void)
+     )
+    )
+  )"})};
+  build_cfgs(scope);
+  std::vector<std::string> fields{"LP;.h:I"};
+  auto search = search_field_values(this, scope, /* incremental */ true, fields,
+                                    kMaxGrowingSweeps,
+                                    /* collect_before_rerun */ true);
+  EXPECT_EQ(
+      search.values[0],
+      ConstantValue(SignedConstantDomain(0).join(SignedConstantDomain(7))));
+  auto full = search_field_values(this, scope, /* incremental */ false, fields);
+  EXPECT_EQ(search.values, full.values);
+  EXPECT_TRUE(states_match(search, full, scope));
+}
+
+namespace {
+
+const char* const kCopyPreservingField = R"(
+    (method (public static) "LFoo;.copy:(LFoo;)LFoo;"
+     (
+      (load-param-object v0)
+      (iget v0 "LFoo;.f:I")
+      (move-result-pseudo v1)
+      (new-instance "LFoo;")
+      (move-result-pseudo-object v2)
+      (invoke-direct (v2 v1) "LFoo;.<init>:(I)V")
+      (return-object v2)
+     )
+    )
+)";
+
+// IPCP's configuration with the field search allowed `rounds` rounds.
+InterproceduralConstantPropagationPass::Config config_with_field_search(
+    size_t rounds, size_t widening_delay = 2) {
+  auto config = config_with_heap_analysis();
+  config.field_search_max_rounds = rounds;
+  config.field_search_widening_delay = widening_delay;
+  return config;
+}
+
+// Runs IPCP with `config` over `scope`, and returns whether `LFoo;.read` then
+// returns the constant 7.
+bool read_folds(const Scope& scope,
+                ConfigFiles& conf,
+                const InterproceduralConstantPropagationPass::Config& config) {
+  run_ipcp(scope, conf, config);
+  return contains_const("LFoo;.read:(LFoo;)I", 7);
+}
+
+bool read_folds_with_copy(
+    ConfigFiles& conf,
+    const InterproceduralConstantPropagationPass::Config& config) {
+  return read_folds(
+      {create_class_with_int_field(
+          "LFoo;", "f", {kMakeWithConst, kRead, kCopyPreservingField})},
+      conf, config);
+}
+
+} // namespace
+
+// The field is 7 in every instance: `copy` passes the field of an existing
+// instance back to the constructor. Descending from Top cannot show this,
+// because the value written depends on the value read.
+TEST_F(InterproceduralConstantPropagationTest,
+       fieldPreservedByCopyStaysUnknownWithoutFieldSearch) {
+  EXPECT_FALSE(read_folds_with_copy(conf, config_with_field_search(0)));
+}
+
+TEST_F(InterproceduralConstantPropagationTest,
+       fieldSearchProvesFieldPreservedByCopy) {
+  EXPECT_TRUE(read_folds_with_copy(conf, config_with_field_search(4)));
+}
+
+// Two rounds are exactly enough: the first adds the 7 that the constructor
+// call writes, and the second finds that `copy` writes back only 7.
+TEST_F(InterproceduralConstantPropagationTest,
+       fieldSearchProvesFieldPreservedByCopyInTwoRounds) {
+  EXPECT_TRUE(read_folds_with_copy(conf, config_with_field_search(2)));
+}
+
+// Without the refinement after the search, the field values the search proves
+// are what the transformation uses.
+TEST_F(InterproceduralConstantPropagationTest,
+       fieldSearchProvesFieldPreservedByCopyWithoutRefinement) {
+  auto config = config_with_field_search(4);
+  config.max_heap_analysis_iterations = 0;
+  EXPECT_TRUE(read_folds_with_copy(conf, config));
+}
+
+// Apps run IPCP with the multiple-callee call graph, which the whole-program
+// state then also uses. The search proves the field there too, and a search
+// cut short by the limit is discarded there too.
+TEST_F(InterproceduralConstantPropagationTest,
+       fieldSearchWorksWithTheMultipleCalleeCallGraph) {
+  auto config = config_with_field_search(4);
+  config.use_multiple_callee_callgraph = true;
+  EXPECT_TRUE(read_folds_with_copy(conf, config));
+}
+
+TEST_F(InterproceduralConstantPropagationTest,
+       fieldSearchCutShortIsDiscardedWithTheMultipleCalleeCallGraph) {
+  auto config = config_with_field_search(1);
+  config.use_multiple_callee_callgraph = true;
+  EXPECT_FALSE(read_folds_with_copy(conf, config));
+}
+
+// The value comes from a static field set by its class initializer, like a
+// Kotlin companion object's `val` used as a constructor default.
+TEST_F(InterproceduralConstantPropagationTest,
+       fieldSearchProvesFieldFromAStaticPreservedByCopy) {
+  ClassCreator bar(DexType::make_type("LBar;"));
+  bar.set_super(type::java_lang_Object());
+  bar.add_field(DexField::make_field("LBar;.s:I")
+                    ->make_concrete(ACC_PUBLIC | ACC_STATIC | ACC_FINAL));
+  bar.add_method(assembler::method_from_string(R"(
+    (method (public static constructor) "LBar;.<clinit>:()V"
+     (
+      (const v0 7)
+      (sput v0 "LBar;.s:I")
+      (return-void)
+     )
+    )
+  )"));
+  const char* make_from_static = R"(
+    (method (public static) "LFoo;.make:()LFoo;"
+     (
+      (sget "LBar;.s:I")
+      (move-result-pseudo v1)
+      (new-instance "LFoo;")
+      (move-result-pseudo-object v0)
+      (invoke-direct (v0 v1) "LFoo;.<init>:(I)V")
+      (return-object v0)
+     )
+    )
+  )";
+  EXPECT_TRUE(read_folds(
+      {bar.create(),
+       create_class_with_int_field(
+           "LFoo;", "f", {make_from_static, kRead, kCopyPreservingField})},
+      conf, config_with_field_search(4)));
+}
+
+// `f` goes from Bottom to 7 and stays there. Getting a first value is not
+// growth, so even with no widening delay `f` is not widened.
+TEST_F(InterproceduralConstantPropagationTest,
+       fieldSearchDoesNotCountFirstValueAsGrowth) {
+  EXPECT_TRUE(read_folds_with_copy(conf, config_with_field_search(4, 0)));
+}
+
+// The Kotlin `copy$default` shape: each parameter is either the caller's
+// argument or, when its mask bit is set, the field of the source instance.
+// Every caller sets the bit for `f`, so `f` keeps its value.
+TEST_F(InterproceduralConstantPropagationTest,
+       fieldSearchProvesFieldPreservedByMaskedCopy) {
+  const char* const masked_copy = R"(
+    (method (public static) "LFoo;.copy:(LFoo;II)LFoo;"
+     (
+      (load-param-object v0)
+      (load-param v1)
+      (load-param v2)
+      (and-int/lit v3 v2 1)
+      (if-eqz v3 :use_arg)
+      (iget v0 "LFoo;.f:I")
+      (move-result-pseudo v1)
+      (:use_arg)
+      (new-instance "LFoo;")
+      (move-result-pseudo-object v4)
+      (invoke-direct (v4 v1) "LFoo;.<init>:(I)V")
+      (return-object v4)
+     )
+    )
+  )";
+  const char* const update = R"(
+    (method (public static) "LFoo;.update:(LFoo;)LFoo;"
+     (
+      (load-param-object v0)
+      (const v1 0)
+      (const v2 3)
+      (invoke-static (v0 v1 v2) "LFoo;.copy:(LFoo;II)LFoo;")
+      (move-result-object v0)
+      (const v2 1)
+      (invoke-static (v0 v1 v2) "LFoo;.copy:(LFoo;II)LFoo;")
+      (move-result-object v0)
+      (return-object v0)
+     )
+    )
+  )";
+  EXPECT_TRUE(read_folds(
+      {create_class_with_int_field(
+          "LFoo;", "f", {kMakeWithConst, kRead, update}, {masked_copy})},
+      conf, config_with_field_search(4)));
+}
+
+namespace {
+
+// `f` is 7 or 8, but it reaches 8 only in the second round: `make8` reads it
+// from `Bar.g`, which has no value until the first round records `Bar`'s
+// constructor. One growth is within the widening delay, so `f` keeps the range
+// [7, 8] and `positive` folds its branch; with no delay, `f` is widened to Top
+// instead.
+Scope make_field_growing_once() {
+  const char* const make8 = R"(
+    (method (public static) "LFoo;.make8:()LFoo;"
+     (
+      (new-instance "LBar;")
+      (move-result-pseudo-object v2)
+      (const v1 8)
+      (invoke-direct (v2 v1) "LBar;.<init>:(I)V")
+      (iget v2 "LBar;.g:I")
+      (move-result-pseudo v1)
+      (new-instance "LFoo;")
+      (move-result-pseudo-object v0)
+      (invoke-direct (v0 v1) "LFoo;.<init>:(I)V")
+      (return-object v0)
+     )
+    )
+  )";
+  const char* const positive = R"(
+    (method (public static) "LFoo;.positive:(LFoo;)I"
+     (
+      (load-param-object v0)
+      (iget v0 "LFoo;.f:I")
+      (move-result-pseudo v1)
+      (if-lez v1 :not_positive)
+      (const v2 1)
+      (return v2)
+      (:not_positive)
+      (const v2 0)
+      (return v2)
+     )
+    )
+  )";
+  return {create_class_with_int_field("LBar;", "g", {}),
+          create_class_with_int_field(
+              "LFoo;", "f",
+              {kMakeWithConst, make8, positive, kCopyPreservingField})};
+}
+
+} // namespace
+
+TEST_F(InterproceduralConstantPropagationTest,
+       fieldSearchKeepsFieldThatGrowsWithinTheDelay) {
+  run_ipcp(make_field_growing_once(), conf, config_with_field_search(8, 1));
+  EXPECT_FALSE(contains_const("LFoo;.positive:(LFoo;)I", 0));
+}
+
+TEST_F(InterproceduralConstantPropagationTest,
+       fieldSearchWidensFieldThatGrowsBeyondTheDelay) {
+  run_ipcp(make_field_growing_once(), conf, config_with_field_search(8, 0));
+  EXPECT_TRUE(contains_const("LFoo;.positive:(LFoo;)I", 0));
+}
+
+namespace {
+
+// `Baz.h` doubles in every round: `make` writes 1 and `inc` writes the field
+// shifted left by one, and the analysis keeps the known bits of each value,
+// so `h` keeps growing for many rounds. `Foo.f` is preserved by a copy, so it
+// is proven once the search converges.
+Scope make_field_growing_every_round() {
+  const char* const make_baz = R"(
+    (method (public static) "LBaz;.make:()LBaz;"
+     (
+      (new-instance "LBaz;")
+      (move-result-pseudo-object v0)
+      (const v1 1)
+      (invoke-direct (v0 v1) "LBaz;.<init>:(I)V")
+      (return-object v0)
+     )
+    )
+  )";
+  const char* const inc = R"(
+    (method (public static) "LBaz;.inc:(LBaz;)LBaz;"
+     (
+      (load-param-object v0)
+      (iget v0 "LBaz;.h:I")
+      (move-result-pseudo v1)
+      (shl-int/lit v1 v1 1)
+      (new-instance "LBaz;")
+      (move-result-pseudo-object v2)
+      (invoke-direct (v2 v1) "LBaz;.<init>:(I)V")
+      (return-object v2)
+     )
+    )
+  )";
+  return {create_class_with_int_field("LBaz;", "h", {make_baz, inc}),
+          create_class_with_int_field(
+              "LFoo;", "f", {kMakeWithConst, kRead, kCopyPreservingField})};
+}
+
+} // namespace
+
+// Widening `Baz.h` lets the search converge within the limit.
+TEST_F(InterproceduralConstantPropagationTest,
+       fieldSearchWidensFieldThatKeepsGrowing) {
+  EXPECT_TRUE(read_folds(make_field_growing_every_round(), conf,
+                         config_with_field_search(10)));
+}
+
+// Without widening within the limit, `Baz.h` keeps the search from
+// converging, so it is discarded and `Foo.f` stays unknown as well.
+TEST_F(InterproceduralConstantPropagationTest,
+       fieldSearchDiscardsSearchThatKeepsGrowing) {
+  EXPECT_FALSE(read_folds(make_field_growing_every_round(), conf,
+                          config_with_field_search(10, 10)));
+}
+
+// `Bar` is only ever constructed from another `Bar`, so the search proves
+// that `Bar.g` never holds a value: no Bar can exist. Reading `g` therefore
+// always throws, here into a handler that writes 99 to `Foo.f`, so `f` is not
+// always 7.
+TEST_F(InterproceduralConstantPropagationTest,
+       fieldSearchKeepsHandlerOfReadOfFieldWithoutValue) {
+  const char* const copy_ctor = R"(
+    (method (public constructor) "LBar;.<init>:(LBar;)V"
+     (
+      (load-param-object v0)
+      (load-param-object v1)
+      (invoke-direct (v0) "Ljava/lang/Object;.<init>:()V")
+      (iget v1 "LBar;.g:I")
+      (move-result-pseudo v2)
+      (iput v2 v0 "LBar;.g:I")
+      (return-void)
+     )
+    )
+  )";
+  const char* const copy = R"(
+    (method (public static) "LBar;.copy:(LBar;)LBar;"
+     (
+      (load-param-object v0)
+      (new-instance "LBar;")
+      (move-result-pseudo-object v1)
+      (invoke-direct (v1 v0) "LBar;.<init>:(LBar;)V")
+      (return-object v1)
+     )
+    )
+  )";
+  const char* const read_g_or_set_f = R"(
+    (method (public static) "LBar;.readGOrSetF:(LBar;LFoo;)V"
+     (
+      (load-param-object v0)
+      (load-param-object v1)
+      (.try_start a)
+      (iget v0 "LBar;.g:I")
+      (move-result-pseudo v2)
+      (.try_end a)
+      (return-void)
+      (.catch (a) "Ljava/lang/NullPointerException;")
+      (const v3 99)
+      (iput v3 v1 "LFoo;.f:I")
+      (return-void)
+     )
+    )
+  )";
+  ClassCreator bar(DexType::make_type("LBar;"));
+  bar.set_super(type::java_lang_Object());
+  bar.add_field(DexField::make_field("LBar;.g:I")->make_concrete(ACC_PUBLIC));
+  bar.add_method(assembler::method_from_string(copy_ctor));
+  for (const auto* root : {copy, read_g_or_set_f}) {
+    auto* m = assembler::method_from_string(root);
+    m->rstate.set_root();
+    bar.add_method(m);
+  }
+  run_ipcp({bar.create(),
+            create_class_with_int_field("LFoo;", "f", {kMakeWithConst, kRead})},
+           conf, config_with_field_search(4));
+  EXPECT_FALSE(contains_const("LFoo;.read:(LFoo;)I", 7));
+}
+
+// One round only reaches the field's first written value; the round that
+// would show the copy preserves it does not run, so the search is discarded
+// and the field stays unknown.
+TEST_F(InterproceduralConstantPropagationTest,
+       fieldSearchDiscardsSearchCutShortByTheLimit) {
+  EXPECT_FALSE(read_folds_with_copy(conf, config_with_field_search(1)));
+}
+
+namespace {
+
+// Runs IPCP with the search, but without the refinement after it, over the
+// recursion of create_flagged_recursion(), and returns whether `isNegative`
+// still returns 1 somewhere, that is, whether its branch on `Cyc.r` stayed.
+bool is_negative_keeps_branch(ConfigFiles& conf, size_t max_growing_sweeps) {
+  auto scope = create_flagged_recursion();
+  auto* is_negative = assembler::method_from_string(R"(
+    (method (public static) "LCyc;.isNegative:(LCyc;)I"
+     (
+      (load-param-object v0)
+      (iget v0 "LCyc;.r:I")
+      (move-result-pseudo v1)
+      (if-gez v1 :not_negative)
+      (const v2 1)
+      (return v2)
+      (:not_negative)
+      (const v2 0)
+      (return v2)
+     )
+    )
+  )");
+  is_negative->rstate.set_root();
+  type_class(DexType::get_type("LCyc;"))->add_method(is_negative);
+  auto config = config_with_field_search(10);
+  config.max_heap_analysis_iterations = 0;
+  config.field_search_max_growing_sweeps = max_growing_sweeps;
+  run_ipcp(scope, conf, config);
+  return contains_const("LCyc;.isNegative:(LCyc;)I", 1);
+}
+
+} // namespace
+
+// `Cyc.r` is 0 or 5, so `isNegative` always returns 0.
+TEST_F(InterproceduralConstantPropagationTest,
+       fieldSearchProvesFieldWrittenAlongARecursion) {
+  EXPECT_FALSE(is_negative_keeps_branch(conf, /* max_growing_sweeps */ 20));
+}
+
+// Allowed no growing sweep, the search's incremental reruns set the argument
+// of `a` to Top as soon as the recursive call grows it, so `Cyc.r` is unknown
+// and the branch stays.
+TEST_F(InterproceduralConstantPropagationTest,
+       fieldSearchPassesTheGrowingSweepsLimitToTheReruns) {
+  EXPECT_TRUE(is_negative_keeps_branch(conf, /* max_growing_sweeps */ 0));
+}
+
+// `Bar.g` is 9 once `callSet` ran, so its read must not fold to 0. Without the
+// refinement after the search, the search's result is what the read sees.
+TEST_F(InterproceduralConstantPropagationTest,
+       fieldSearchSeesWriteBehindACutOffRead) {
+  auto config = config_with_heap_analysis();
+  config.max_heap_analysis_iterations = 0;
+  config.field_search_max_rounds = 4;
+  auto scope = create_write_behind_immutable_read();
+  auto* read_g = assembler::method_from_string(R"(
+    (method (public static) "LBar;.readG:(LBar;)I"
+     (
+      (load-param-object v0)
+      (iget v0 "LBar;.g:I")
+      (move-result-pseudo v1)
+      (return v1)
+     )
+    )
+  )");
+  read_g->rstate.set_root();
+  type_class(DexType::get_type("LBar;"))->add_method(read_g);
+  run_ipcp(scope, conf, config);
+  EXPECT_FALSE(contains_const("LBar;.readG:(LBar;)I", 0));
 }

@@ -82,7 +82,8 @@ void analyze_clinits(const Scope& scope,
   });
 }
 
-// Returns the whole-program value of the field that `insn` reads, or Top.
+// Returns the whole-program value of the field that `insn` reads (Bottom if it
+// never holds a value), or Top.
 ConstantValue get_read_field_value(
     const WholeProgramStateAccessor* whole_program_state,
     const IRInstruction* insn) {
@@ -96,8 +97,8 @@ ConstantValue get_read_field_value(
   return whole_program_state->get_field_value(field);
 }
 
-// Returns the whole-program value that the method `insn` calls returns, or
-// Top.
+// Returns the whole-program value that the method `insn` calls returns (Bottom
+// if it never returns), or Top.
 ConstantValue get_invoke_return_value(
     const WholeProgramStateAccessor* whole_program_state,
     const IRInstruction* insn) {
@@ -124,9 +125,13 @@ ConstantValue get_invoke_return_value(
 }
 
 // Binds the result register to `value`, the whole-program value of the
-// instruction just analyzed. Binds nothing for Top.
+// instruction just analyzed. Binds nothing for Top, nor for Bottom: binding
+// Bottom makes the whole state Bottom, and with it the state on the
+// instruction's exception edges, which the instruction can still take.
+// WpsAwareNoThrowAnalyzer instead cuts off only the normal edge, for the
+// instructions whose Bottom means that they cannot complete normally.
 bool bind_result(const ConstantValue& value, ConstantEnvironment* env) {
-  if (value.is_top()) {
+  if (value.is_top() || value.is_bottom()) {
     return false;
   }
   env->set(RESULT_REGISTER, value);
@@ -184,7 +189,39 @@ WholeProgramState::WholeProgramState(
     const UnorderedSet<const DexField*>& definitely_assigned_ifields,
     std::shared_ptr<const call_graph::Graph> call_graph)
     : m_call_graph(std::move(call_graph)), m_field_blocklist(field_blocklist) {
+  add_known_fields_and_methods(scope, non_true_virtuals, field_blocklist);
+  analyze_clinits(scope, fp_iter, &m_field_partition);
+  collect(scope, fp_iter, definitely_assigned_ifields);
+}
 
+std::unique_ptr<WholeProgramState> WholeProgramState::make_field_search_start(
+    const Scope& scope,
+    const interprocedural::FixpointIterator& fp_iter,
+    const InsertOnlyConcurrentSet<DexMethod*>& non_true_virtuals,
+    const UnorderedSet<const DexType*>& field_blocklist,
+    const UnorderedSet<const DexField*>& definitely_assigned_ifields,
+    std::shared_ptr<const call_graph::Graph> call_graph) {
+  auto wps = std::make_unique<WholeProgramState>(std::move(call_graph));
+  wps->m_field_blocklist = field_blocklist;
+  wps->add_known_fields_and_methods(scope, non_true_virtuals, field_blocklist);
+  analyze_clinits(scope, fp_iter, &wps->m_field_partition);
+  // `collect` would join in the values that other methods write to a static
+  // field; without analyzing those methods, the field is unknown.
+  const auto written_outside_clinit =
+      get_static_fields_written_outside_clinit(scope);
+  for (const auto* field : UnorderedIterable(written_outside_clinit)) {
+    wps->m_field_partition.set(field, ConstantValue::top());
+  }
+  initialize_ifields(scope, &wps->m_field_partition,
+                     definitely_assigned_ifields);
+  wps->set_methods_to_top();
+  return wps;
+}
+
+void WholeProgramState::add_known_fields_and_methods(
+    const Scope& scope,
+    const InsertOnlyConcurrentSet<DexMethod*>& non_true_virtuals,
+    const UnorderedSet<const DexType*>& field_blocklist) {
   walk::fields(scope, [&](DexField* field) {
     // We exclude those marked by keep rules: keep-marked fields may be
     // written to by non-Dex bytecode.
@@ -209,8 +246,6 @@ WholeProgramState::WholeProgramState(
       m_known_methods.emplace(method);
     }
   });
-  analyze_clinits(scope, fp_iter, &m_field_partition);
-  collect(scope, fp_iter, definitely_assigned_ifields);
 }
 
 /*
@@ -323,27 +358,23 @@ void WholeProgramState::collect_field_values(
     const ConstantEnvironment& env,
     const DexType* clinit_cls,
     ConcurrentMap<const DexField*, ConstantValue>* fields_value_tmp) {
-  if (!opcode::is_an_sput(insn->opcode()) &&
-      !opcode::is_an_iput(insn->opcode())) {
+  auto write = get_field_write(insn, env);
+  if (!write || m_known_fields.count(write->first) == 0u) {
     return;
   }
-  auto* field = resolve_field(insn->get_field());
-  if (field != nullptr && (m_known_fields.count(field) != 0u)) {
-    if (opcode::is_an_sput(insn->opcode()) &&
-        field->get_class() == clinit_cls) {
-      return;
-    }
-    auto value = env.get(insn->src(0));
-    fields_value_tmp->update(
-        field,
-        [&value](const DexField*, ConstantValue& current_value, bool exists) {
-          if (exists) {
-            current_value.join_with(value);
-          } else {
-            current_value = std::move(value);
-          }
-        });
+  auto& [field, value] = *write;
+  if (opcode::is_an_sput(insn->opcode()) && field->get_class() == clinit_cls) {
+    return;
   }
+  fields_value_tmp->update(
+      field,
+      [&value](const DexField*, ConstantValue& current_value, bool exists) {
+        if (exists) {
+          current_value.join_with(value);
+        } else {
+          current_value = std::move(value);
+        }
+      });
 }
 
 /*
@@ -427,6 +458,47 @@ void WholeProgramState::collect_param_exit_values(
       });
 }
 
+WholeProgramState::FieldGrowth WholeProgramState::grow_field_values(
+    const ConstantFieldPartition& writes, size_t widening_delay) {
+  // Never Top: the writes are built from per-field updates of empty
+  // partitions and joins of those, so only their values can be Top.
+  always_assert_log(!writes.is_top(), "field writes must be per-field");
+  FieldGrowth growth;
+  for (const auto& [field, value] : writes.bindings()) {
+    if (m_known_fields.count(field) == 0u || is_static(field)) {
+      continue;
+    }
+    const auto& before = m_field_partition.get(field);
+    auto after = before.join(value);
+    if (after.equals(before)) {
+      continue;
+    }
+    ++growth.grown;
+    if (!before.is_bottom() && ++m_field_growths[field] > widening_delay) {
+      m_field_partition.set(field, ConstantValue::top());
+      ++growth.widened;
+      continue;
+    }
+    m_field_partition.set(field, std::move(after));
+  }
+  return growth;
+}
+
+std::optional<std::pair<const DexField*, ConstantValue>>
+WholeProgramState::get_field_write(const IRInstruction* insn,
+                                   const ConstantEnvironment& env) {
+  if (!opcode::is_an_sput(insn->opcode()) &&
+      !opcode::is_an_iput(insn->opcode())) {
+    return std::nullopt;
+  }
+  auto* field = resolve_field(insn->get_field());
+  if (field == nullptr) {
+    return std::nullopt;
+  }
+  // Every iput and sput has its value in src(0).
+  return std::make_pair(field, env.get(insn->src(0)));
+}
+
 void WholeProgramState::collect_static_finals(const DexClass* cls,
                                               FieldEnvironment field_env) {
   for (auto* field : cls->get_sfields()) {
@@ -490,18 +562,30 @@ bool WholeProgramAwareAnalyzer::analyze_invoke(
 
 namespace {
 
-// Refines an invoke's source registers from the IPCP per-(method, param)
-// exit-value summary on the no-throw edge. Composed before
-// DefaultNoThrowAnalyzer so the hardcoded null-check facts still apply
-// afterward.
+// Refines the no-throw edge from the whole-program state. A read of an
+// instance field that never holds a value, or a call of a method that never
+// returns, cannot complete normally, so the edge is cut off. Static field
+// reads are not cut off (see get_field_value). Otherwise, an invoke's source
+// registers are refined from the IPCP per-(method, param) exit-value summary.
+// Composed before DefaultNoThrowAnalyzer so the hardcoded null-check facts
+// still apply afterward.
 class WpsAwareNoThrowAnalyzer final
     : public InstructionAnalyzerBase<WpsAwareNoThrowAnalyzer,
                                      ConstantEnvironment,
                                      const WholeProgramStateAccessor*> {
  public:
+  static bool analyze_iget(const WholeProgramStateAccessor* wps_accessor,
+                           const IRInstruction* insn,
+                           ConstantEnvironment* env) {
+    return cut_off_if_bottom(get_read_field_value(wps_accessor, insn), env);
+  }
+
   static bool analyze_invoke(const WholeProgramStateAccessor* wps_accessor,
                              const IRInstruction* insn,
                              ConstantEnvironment* env) {
+    if (cut_off_if_bottom(get_invoke_return_value(wps_accessor, insn), env)) {
+      return true;
+    }
     // TODO(T275196808): Remove the `enable_param_exit_value_summary` guard once
     // the feature is fully rolled out.
     if (!enable_param_exit_value_summary || wps_accessor == nullptr) {
@@ -538,6 +622,16 @@ class WpsAwareNoThrowAnalyzer final
       }
     }
     return false;
+  }
+
+ private:
+  static bool cut_off_if_bottom(const ConstantValue& value,
+                                ConstantEnvironment* env) {
+    if (!value.is_bottom()) {
+      return false;
+    }
+    env->set_to_bottom();
+    return true;
   }
 };
 
