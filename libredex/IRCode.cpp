@@ -440,6 +440,11 @@ void translate_dex_to_ir(
     } else if (dex_insn->has_field()) {
       insn->set_field(
           dynamic_cast<const DexOpcodeField*>(dex_insn)->get_field());
+    } else if (const auto* sp_insn =
+                   dynamic_cast<const DexOpcodeSignaturePolymorphic*>(
+                       dex_insn)) {
+      insn->set_signature_polymorphic(sp_insn->get_method(),
+                                      sp_insn->get_callsite_proto());
     } else if (dex_insn->has_method()) {
       insn->set_method(
           dynamic_cast<const DexOpcodeMethod*>(dex_insn)->get_method());
@@ -780,11 +785,13 @@ uint16_t calc_outs_size(const IRCode* code) {
       continue;
     }
     auto* insn = mie.dex_insn;
-    if (dex_opcode::is_invoke_range(insn->opcode())) {
-      size = std::max(size, boost::numeric_cast<uint16_t>(insn->range_size()));
-    } else if (dex_opcode::is_invoke(insn->opcode())) {
-      size = std::max(size, boost::numeric_cast<uint16_t>(insn->srcs_size()));
+    auto op = insn->opcode();
+    if (!dex_opcode::is_an_invoke(op)) {
+      continue;
     }
+    auto words =
+        dex_opcode::has_range(op) ? insn->range_size() : insn->srcs_size();
+    size = std::max(size, boost::numeric_cast<uint16_t>(words));
   }
   return size;
 }

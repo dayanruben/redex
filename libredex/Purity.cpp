@@ -875,6 +875,8 @@ static size_t analyze_read_locations(
               case OPCODE_THROW:
               case IOPCODE_INIT_CLASS:
               case IOPCODE_WRITE_BARRIER:
+              case OPCODE_INVOKE_POLYMORPHIC:
+              case OPCODE_INVOKE_CUSTOM:
                 unknown = true;
                 break;
               case OPCODE_NEW_INSTANCE:
@@ -914,7 +916,7 @@ static size_t analyze_read_locations(
                       lads.locations.insert(location);
                     }
                   }
-                } else if (opcode::is_an_invoke(opcode)) {
+                } else if (opcode::is_a_method_invoke(opcode)) {
                   auto* invoke_method = resolve_method_deprecated(
                       insn->get_method(), opcode_to_search(opcode), method);
                   if (((invoke_method != nullptr) &&

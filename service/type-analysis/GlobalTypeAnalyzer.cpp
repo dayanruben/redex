@@ -73,7 +73,7 @@ void scan_any_init_reachables(
   TRACE(TYPE, 5, "[any init reachables] insert %s", SHOW(method));
   for (auto& mie : cfg::InstructionIterable(cfg)) {
     auto* insn = mie.insn;
-    if (!opcode::is_an_invoke(insn->opcode())) {
+    if (!opcode::is_a_method_invoke(insn->opcode())) {
       continue;
     }
     auto* callee_method_def = resolve_method_deprecated(
@@ -248,9 +248,12 @@ bool GlobalTypeAnalyzer::is_reachable(const DexMethod* method) const {
   return !args_domain.is_bottom();
 }
 
+// CtorFieldAnalyzer comes first: with a call graph, WholeProgramAwareAnalyzer
+// handles every call it can type through it, and CtorFieldAnalyzer must still
+// see the calls of the class's constructors that may overwrite its fields.
 using CombinedAnalyzer =
-    InstructionAnalyzerCombiner<WholeProgramAwareAnalyzer,
-                                local::CtorFieldAnalyzer,
+    InstructionAnalyzerCombiner<local::CtorFieldAnalyzer,
+                                WholeProgramAwareAnalyzer,
                                 local::RegisterTypeAnalyzer>;
 
 using CombinedReplayAnalyzer =
@@ -275,20 +278,24 @@ std::unique_ptr<local::LocalTypeAnalyzer> GlobalTypeAnalyzer::analyze_method(
   }
 
   auto env = env_with_params(&code, args);
-  DexType* ctor_type{nullptr};
-  if (method::is_init(method)) {
-    ctor_type = method->get_class();
-  }
   TRACE(TYPE, 5, "%s", SHOW(code.cfg()));
   auto local_ta =
       is_replayable
           ? std::make_unique<local::LocalTypeAnalyzer>(
                 code.cfg(), CombinedReplayAnalyzer(&wps, nullptr))
           : std::make_unique<local::LocalTypeAnalyzer>(
-                code.cfg(), CombinedAnalyzer(&wps, ctor_type, nullptr));
+                code.cfg(),
+                CombinedAnalyzer(get_ctor_fields(method), &wps, nullptr));
   local_ta->run(env);
 
   return local_ta;
+}
+
+local::CtorFields GlobalTypeAnalyzer::get_ctor_fields(
+    const DexMethod* method) const {
+  auto it = m_constructor_accesses.find(method);
+  return {it == m_constructor_accesses.end() ? nullptr : it->second.get(),
+          m_constructor_only_fields};
 }
 
 bool args_have_type(const DexProto* proto, const DexType* type) {
@@ -392,7 +399,7 @@ void GlobalTypeAnalysis::find_any_init_reachables(
     auto& cfg = code->cfg();
     for (auto& mie : InstructionIterable(cfg)) {
       auto* insn = mie.insn;
-      if (!opcode::is_an_invoke(insn->opcode())) {
+      if (!opcode::is_a_method_invoke(insn->opcode())) {
         continue;
       }
       auto* callee_method_def = resolve_method_deprecated(
@@ -468,10 +475,22 @@ std::unique_ptr<GlobalTypeAnalyzer> GlobalTypeAnalysis::analyze(
   });
   find_any_init_reachables(*method_override_graph, scope, cg);
 
+  // How each constructor uses `this` does not change between iterations.
+  auto constructor_accesses = local_pointers::analyze_constructors(
+      scope, local_pointers::get_constructors_keeping_this(scope));
+
   // Run the bootstrap. All field value and method return values are
   // represented by Top.
   TRACE(TYPE, 2, "[global] Bootstrap run");
-  auto gta = std::make_unique<GlobalTypeAnalyzer>(cg);
+  // Without safe aggregation no field counts as constructor-only, so reads
+  // after `this` escapes fall back to the whole-program type.
+  auto constructor_only_fields =
+      m_only_aggregate_safely_inferrable_fields
+          ? constant_propagation::gather_constructor_only_ifields(
+                scope, constructor_accesses)
+          : UnorderedSet<const DexField*>();
+  auto gta = std::make_unique<GlobalTypeAnalyzer>(
+      cg, std::move(constructor_accesses), std::move(constructor_only_fields));
   gta->run(ArgumentTypePartition{
       {CURRENT_PARTITION_LABEL, ArgumentTypeEnvironment()}});
   auto non_true_virtuals =
@@ -479,8 +498,11 @@ std::unique_ptr<GlobalTypeAnalyzer> GlobalTypeAnalysis::analyze(
   EligibleIfields eligible_ifields;
   if (m_only_aggregate_safely_inferrable_fields) {
     eligible_ifields =
-        constant_propagation::gather_safely_inferable_ifield_candidates(scope,
-                                                                        {});
+        constant_propagation::gather_safely_inferable_ifield_candidates(
+            scope,
+            constant_propagation::gather_ifields_written_only_by_constructors(
+                scope),
+            {});
   }
   size_t iteration_cnt = 0;
 
@@ -516,6 +538,7 @@ std::unique_ptr<GlobalTypeAnalyzer> GlobalTypeAnalysis::analyze(
     ++iteration_cnt;
   }
 
+  gta->release_constructor_accesses();
   global_analysis_iterations = iteration_cnt;
 
   TRACE(TYPE,

@@ -64,6 +64,42 @@ bool may_be_invoke_target(const DexMethod* method);
  */
 bool can_change_signature(const DexMethod* method);
 
+/**
+ * Whether calling `method` runs the target of a method handle that the call
+ * receives, which can be any code: `MethodHandle.invokeWithArguments`. (Calls
+ * of the signature-polymorphic `MethodHandle.invoke` and `invokeExact` are
+ * invoke-polymorphic instructions.) An analysis that assumes a call of a
+ * library method runs no app code cannot assume that for these calls.
+ */
+bool runs_method_handle_target(const DexMethodRef* method);
+
+/**
+ * The methods whose prototypes the method handles in `scope` fix: for every
+ * method handle that code (const-method-handle, or the bootstrap method or a
+ * bootstrap argument of a call site), a static field value or an annotation in
+ * `scope` holds, the method that it names, the method that it resolves to
+ * (`resolve_call`) and every method that calling it can run on some ART
+ * version (`resolve_method_handle_callees`; a handle outside code resolves
+ * without a caller). Changing the prototype of the member changes the handle's
+ * type, and the caller of an invoke-polymorphic fixes the prototype of the
+ * call, so a pass cannot rewrite these calls when it changes such a prototype:
+ * it must leave these methods, and the virtual scopes that they belong to, as
+ * they are.
+ */
+InsertOnlyConcurrentSet<const DexMethod*>
+gather_methods_named_by_method_handles(const Scope& scope);
+
+/**
+ * The fields that the method handles in `scope` get or put: for every method
+ * handle that code, a static field value or an annotation in `scope` holds, the
+ * field that it names and the field that it resolves to
+ * (`resolve_field_handle`). Such a handle reads or writes its field without a
+ * field instruction, so a pass that learns how a field is used from field
+ * instructions alone cannot delete, move or rewrite these fields.
+ */
+InsertOnlyConcurrentSet<const DexField*> gather_fields_named_by_method_handles(
+    const Scope& scope);
+
 using ClInitHasNoSideEffectsPredicate = std::function<bool(const DexType*)>;
 
 /**
@@ -159,10 +195,6 @@ DexMethod* kotlin_jvm_internal_Intrinsics_checkNotNullExpressionValue();
 DexMethod* kotlin_jvm_internal_Intrinsics_areEqual();
 
 DexMethod* redex_internal_checkObjectNotNull();
-
-DexMethod* java_lang_invoke_MethodHandle_invoke();
-
-DexMethod* java_lang_invoke_MethodHandle_invokeExact();
 
 inline unsigned count_opcode_of_types(const cfg::ControlFlowGraph& cfg,
                                       const UnorderedSet<IROpcode>& opcodes) {

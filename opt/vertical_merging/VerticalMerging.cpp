@@ -14,7 +14,9 @@
 #include "ControlFlow.h"
 #include "Debug.h"
 #include "DexAnnotation.h"
+#include "DexCallSite.h"
 #include "DexClass.h"
+#include "DexMethodHandle.h"
 #include "DexUtil.h"
 #include "EditableCfgAdapter.h"
 #include "IROpcode.h"
@@ -379,6 +381,66 @@ ClassMap collect_can_merge(const Scope& scope,
   return mergeable_to_merger;
 }
 
+/**
+ * Vertical merging does not rewrite method handles, so the classes that a
+ * method handle `method_handle`, held by code of `holder` (nullptr outside
+ * code), names or can resolve to are not merged: the class of its member and
+ * the class of each definition it can resolve to. ART versions disagree on
+ * what an invoke-direct handle of a method that is not private runs, which
+ * depends on the class of the code that holds it and, from Android 10, on the
+ * superclass of the named class (see `resolve_method_handle`), so neither of
+ * these classes is merged either. Nor is a type that merging must not replace
+ * in the prototype of the handle's method (see
+ * `gather_types_pinned_by_method_handle`) the mergeable.
+ */
+void record_method_handle_value(const DexMethodHandle* method_handle,
+                                const DexMethod* holder,
+                                DontMergeStatus* dont_merge_status) {
+  std::vector<const DexType*> pinned_types;
+  type_reference::gather_types_pinned_by_method_handle(method_handle,
+                                                       pinned_types);
+  for (const auto* type : pinned_types) {
+    record_dont_merge_state(type, kConditional, dont_merge_status);
+  }
+  if (!DexMethodHandle::isInvokeType(method_handle->type())) {
+    record_dont_merge_state(method_handle->fieldref()->get_class(), kStrict,
+                            dont_merge_status);
+    if (const auto* field = resolve_field_handle(method_handle)) {
+      record_dont_merge_state(field->get_class(), kStrict, dont_merge_status);
+    }
+    return;
+  }
+  const auto* method_ref = method_handle->methodref();
+  record_dont_merge_state(method_ref->get_class(), kStrict, dont_merge_status);
+  for (const auto* callee :
+       resolve_method_handle_callees(method_handle, holder)) {
+    record_dont_merge_state(callee->get_class(), kStrict, dont_merge_status);
+  }
+  if (method_handle_opcode(method_handle) != OPCODE_INVOKE_SUPER) {
+    return;
+  }
+  if (holder != nullptr) {
+    record_dont_merge_state(holder->get_class(), kStrict, dont_merge_status);
+  }
+  const auto* named_cls = type_class(method_ref->get_class());
+  if (named_cls != nullptr && named_cls->get_super_class() != nullptr) {
+    record_dont_merge_state(named_cls->get_super_class(), kStrict,
+                            dont_merge_status);
+  }
+}
+
+// Like a type that the values of static fields and annotations name, a method
+// handle among them keeps the classes it names from being merged.
+void record_method_handle_values(const Gatherable& value,
+                                 DontMergeStatus* dont_merge_status) {
+  std::vector<DexMethodHandle*> method_handles;
+  value.gather_methodhandles(method_handles);
+  for (const auto* method_handle : method_handles) {
+    record_method_handle_value(method_handle, /* holder */ nullptr,
+                               dont_merge_status);
+  }
+}
+
 size_t record_annotation(const Scope& scope,
                          bool record_type_like_string_refs,
                          DontMergeStatus* dont_merge_status) {
@@ -387,6 +449,7 @@ size_t record_annotation(const Scope& scope,
     for (const auto& elem : anno->anno_elems()) {
       record_class_literals(*elem.encoded_value, dont_merge_status);
     }
+    record_method_handle_values(*anno, dont_merge_status);
     if (anno->type() == type::dalvik_annotation_Signature() ||
         anno->type()->str() == "Lkotlin/Metadata;") {
       return;
@@ -435,7 +498,7 @@ size_t record_code_reference(const Scope& scope,
                              bool record_type_like_string_refs,
                              DontMergeStatus* dont_merge_status) {
   AtomicStatCounter<size_t> type_like_string_refs{0};
-  walk::parallel::code(scope, [&](DexMethod* /*method*/, IRCode& code) {
+  walk::parallel::code(scope, [&](DexMethod* method, IRCode& code) {
     auto& cfg = code.cfg();
     // Built only for methods with a class literal, which most methods lack.
     Lazy<live_range::DefUseChains> def_use_chains([&cfg] {
@@ -471,6 +534,15 @@ size_t record_code_reference(const Scope& scope,
             record_dont_merge_state(type, kConditional, dont_merge_status);
             TRACE(VMERGE, 9, "dont_merge %s as mergeable for type usage: %s",
                   SHOW(type), SHOW(insn));
+          }
+        }
+      } else if (insn->has_callsite()) {
+        // A Class among the bootstrap arguments of a call site is loaded like
+        // a const-class when the call site is linked.
+        for (const auto& arg : insn->get_callsite()->args()) {
+          if (const auto* type_arg =
+                  dynamic_cast<const DexEncodedValueType*>(arg.get())) {
+            record_class_literal(type_arg->type(), dont_merge_status);
           }
         }
       } else if (opcode::is_const_string(insn->opcode())) {
@@ -526,6 +598,15 @@ size_t record_code_reference(const Scope& scope,
                   SHOW(callee->get_class()), SHOW(callee_ref));
           }
         }
+      }
+      for_each_method_handle(insn, [&](const DexMethodHandle* method_handle) {
+        record_method_handle_value(method_handle, method, dont_merge_status);
+      });
+      // The bootstrap method of an invoke-custom receives a lookup in the
+      // class of the code that holds it, which merging must not move.
+      if (opcode::is_invoke_custom(insn->opcode())) {
+        record_dont_merge_state(method->get_class(), kStrict,
+                                dont_merge_status);
       }
     }
   });
@@ -726,6 +807,7 @@ size_t record_field_reference(const Scope& scope,
       value->gather_strings(strings);
       type_like_string_refs += record_type_like_strings(
           strings, record_type_like_string_refs, dont_merge_status);
+      record_method_handle_values(*value, dont_merge_status);
     }
     if (!can_rename(field)) {
       record_dont_merge_state(field->get_type(), kConditional,
@@ -819,6 +901,18 @@ void update_references(const Scope& scope,
                 SHOW(insn), SHOW(method));
           }
         }
+        // `record_method_handle_value` keeps the classes that method handles
+        // name from merging.
+        for_each_method_handle(insn, [&](const DexMethodHandle* method_handle) {
+          auto* named_class =
+              DexMethodHandle::isInvokeType(method_handle->type())
+                  ? method_handle->methodref()->get_class()
+                  : method_handle->fieldref()->get_class();
+          assert_log(!update_map.count(named_class),
+                     "Vertical Merging: a method handle names a merged class "
+                     "in %s",
+                     SHOW(method));
+        });
       });
   // Update type refs in all field or method specs.
   type_reference::TypeRefUpdater updater(update_map);

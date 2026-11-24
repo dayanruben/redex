@@ -38,6 +38,7 @@ endef
 ####
 
 check_PROGRAMS = \
+    access_marking_method_handle_test \
     aliased_registers_test \
     analysis_usage_test \
     anno_kill_test \
@@ -56,6 +57,7 @@ check_PROGRAMS = \
     boxed_boolean_propagation_test \
     branch_prefix_hoisting_test \
     bridge_synth_inline_pass_test \
+    builder_analysis_test \
     call_site_summary_reductions_test \
     callsite_never_inline_cloning_end_to_end_test \
     callsite_never_inline_cloning_test \
@@ -66,6 +68,7 @@ check_PROGRAMS = \
     class_checker_test \
     class_merging_fields_test \
     class_merging_hot_cold_grouping_test \
+    class_merging_method_handle_test \
     class_merging_models_test \
     class_order_sample_test \
     check_breadcrumbs_test \
@@ -75,6 +78,8 @@ check_PROGRAMS = \
     concurrent_hashtable_test \
     configurable_test \
     config_files_test \
+    constant_uses_test \
+    constructor_accesses_test \
     constructor_analysis_test \
     control_flow_test \
     copy_propagation_test \
@@ -84,6 +89,7 @@ check_PROGRAMS = \
     debug_info_test \
     debug_test \
     dedup_blocks_test \
+    del_super_test \
     deobfuscated_alias_test \
     deterministic_containers_test \
     dex_annotation_test \
@@ -106,6 +112,7 @@ check_PROGRAMS = \
     extract_native_test \
     fast_reg_alloc_test \
     fbjni_marker_test \
+    field_op_tracker_method_handle_test \
     final_inline_v2_test \
     fp_ev_test \
     global_type_analysis_test \
@@ -127,6 +134,8 @@ check_PROGRAMS = \
     ir_typechecker_test \
     jar_loader_test \
     java_parser_util_test \
+    kotlin_companion_method_handle_test \
+    kotlin_instance_rewriter_method_handle_test \
     kotlin_lambda_analyzer_test \
     kotlin_lambda_dedup_pass_test \
     literals_test \
@@ -138,13 +147,17 @@ check_PROGRAMS = \
     match_flow_test \
     match_test \
     materialize_null_checks_test \
+    method_devirtualizer_method_handle_test \
+    method_handle_rewriter_test \
     method_inline_test \
     method_profiles_test \
+    method_reference_test \
     method_splitting_test \
     method_splitter_test_fixture_test \
     method_splitter_region_no_live_out_test \
     method_splitter_region_builder_test \
     method_splitter_suffix_net_gate_test \
+    method_dedup_method_handle_test \
     method_util_test \
     metrics_sink_test \
     monitor_count_test \
@@ -155,10 +168,12 @@ check_PROGRAMS = \
     never_compile_selection_test \
     never_inline_eligibility_test \
     null_propagation_test \
+    obfuscate_method_handle_test \
     object_inliner_test \
     object_propagation_test \
     optimize_enums_test \
     outliner_type_analysis_test \
+    package_private_preprocessor_method_handle_test \
     partial_pass_test \
     pass_manager_feature_test \
     peephole_test \
@@ -175,6 +190,7 @@ check_PROGRAMS = \
     proguard_regex_test \
     pure_analysis_test \
     random_forest_test \
+    reachability_method_handle_test \
     reachable_natives_test \
     reaching_definitions_test \
     rearrange_enum_clinit_test \
@@ -205,6 +221,7 @@ check_PROGRAMS = \
     side_effects_summary_test \
     signed_constant_propagation_test \
     single_impl_escape_test \
+    single_impl_method_handle_test \
     compact_pointer_vector_test \
     source_blocks_test \
     source_debug_extension_test \
@@ -239,6 +256,7 @@ check_PROGRAMS = \
     unique_method_tracker_test \
     up_code_motion_test \
     used_vars_test \
+    vertical_merging_method_handle_test \
     vertical_merging_r_class_test \
     vertical_merging_test \
     vertical_merging_type_lookup_test \
@@ -248,6 +266,8 @@ check_PROGRAMS = \
     work_queue_test \
     xstorerefs_test \
     string_tree_test
+
+access_marking_method_handle_test_SOURCES = AccessMarkingMethodHandleTest.cpp
 
 aliased_registers_test_SOURCES = AliasedRegistersTest.cpp
 
@@ -292,6 +312,8 @@ branch_prefix_hoisting_test_SOURCES = BranchPrefixHoistingTest.cpp ScopeHelper.c
 
 bridge_synth_inline_pass_test_SOURCES = BridgeSynthInlinePassTest.cpp
 
+builder_analysis_test_SOURCES = BuilderAnalysisTest.cpp $(top_srcdir)/test/common/RedexTestUtils.cpp
+
 call_site_summary_reductions_test_SOURCES = CallSiteSummaryReductionsTest.cpp
 
 callsite_never_inline_cloning_end_to_end_test_SOURCES = \
@@ -311,9 +333,9 @@ cfg_positions_test_LDADD = $(COMMON_MOCK_TEST_LIBS)
 
 chrome_trace_writer_test_SOURCES = ChromeTraceWriterTest.cpp
 
-check_breadcrumbs_test_SOURCES = CheckBreadCrumbsTest.cpp
+check_breadcrumbs_test_SOURCES = CheckBreadCrumbsTest.cpp $(top_srcdir)/test/common/RedexTestUtils.cpp
 
-check_cast_analysis_test_SOURCES = CheckCastAnalysisTest.cpp
+check_cast_analysis_test_SOURCES = CheckCastAnalysisTest.cpp $(top_srcdir)/test/common/RedexTestUtils.cpp
 
 class_order_sample_test_SOURCES = ClassOrderSampleTest.cpp
 
@@ -328,6 +350,10 @@ class_merging_fields_test_SOURCES = \
 
 class_merging_hot_cold_grouping_test_SOURCES = \
     ClassMergingHotColdGroupingTest.cpp ScopeHelper.cpp
+
+class_merging_method_handle_test_SOURCES = \
+    ClassMergingMethodHandleTest.cpp ScopeHelper.cpp \
+    $(top_srcdir)/test/common/RedexTestUtils.cpp
 
 class_merging_models_test_SOURCES = \
     ClassMergingModelsTest.cpp ScopeHelper.cpp
@@ -347,12 +373,17 @@ config_files_test_SOURCES = ConfigFilesTest.cpp
 EXTRA_config_files_test_DEPENDENCIES = config_files_test.env
 $(eval $(call make_env,config_files_test,class_frequencies_path=$(srcdir)/class_frequencies.txt))
 
+constant_uses_test_SOURCES = ConstantUsesTest.cpp $(top_srcdir)/test/common/RedexTestUtils.cpp
+constant_uses_test_LDADD = $(COMMON_MOCK_TEST_LIBS)
+
+constructor_accesses_test_SOURCES = ConstructorAccessesTest.cpp
+
 constructor_analysis_test_SOURCES = ConstructorAnalysisTest.cpp
 
 control_flow_test_SOURCES = ControlFlowTest.cpp
 control_flow_test_LDADD = $(COMMON_MOCK_TEST_LIBS)
 
-copy_propagation_test_SOURCES = CopyPropagationTest.cpp
+copy_propagation_test_SOURCES = CopyPropagationTest.cpp $(top_srcdir)/test/common/RedexTestUtils.cpp
 
 cpp_util_test_SOURCES = CppUtilTest.cpp
 cpp_util_test_LDADD = $(COMMON_MOCK_TEST_LIBS) -lpthread
@@ -368,6 +399,8 @@ debug_test_SOURCES = DebugTest.cpp
 
 dedup_blocks_test_SOURCES = DedupBlocksTest.cpp VirtScopeHelper.cpp ScopeHelper.cpp
 
+del_super_test_SOURCES = DelSuperTest.cpp
+
 deobfuscated_alias_test_SOURCES = DeobfuscatedAliasTest.cpp
 
 deterministic_containers_test_SOURCES = DeterministicContainersTest.cpp
@@ -379,7 +412,7 @@ dex_class_test_SOURCES = DexClassTest.cpp
 
 dex_hasher_test_SOURCES = DexHasherTest.cpp $(top_srcdir)/test/common/RedexTestUtils.cpp
 
-dex_instruction_test_SOURCES = DexInstructionTest.cpp
+dex_instruction_test_SOURCES = DexInstructionTest.cpp $(top_srcdir)/test/common/RedexTestUtils.cpp
 
 dex_loader_test_SOURCES = DexLoaderTest.cpp
 
@@ -395,7 +428,7 @@ dexvt_test_SOURCES = DexVtTest.cpp
 
 dex_type_environment_test_SOURCES = type-analysis/DexTypeEnvironmentTest.cpp
 
-dex_util_test_SOURCES = DexUtilTest.cpp
+dex_util_test_SOURCES = DexUtilTest.cpp $(top_srcdir)/test/common/RedexTestUtils.cpp
 
 dominators_test_SOURCES = DominatorsTest.cpp
 
@@ -415,7 +448,9 @@ fbjni_marker_test_SOURCES = FbjniMarkerTest.cpp
 EXTRA_fbjni_marker_test_DEPENDENCIES = fbjni_marker_test.env
 $(eval $(call make_env,fbjni_marker_test,test_fbjni_json=$(srcdir)/example_fbjni.json))
 
-final_inline_v2_test_SOURCES = FinalInlineV2Test.cpp
+field_op_tracker_method_handle_test_SOURCES = FieldOpTrackerMethodHandleTest.cpp
+
+final_inline_v2_test_SOURCES = FinalInlineV2Test.cpp $(top_srcdir)/test/common/RedexTestUtils.cpp
 
 fp_ev_test_SOURCES = FpEvTest.cpp
 
@@ -432,7 +467,7 @@ hot_cold_method_specializing_test_SOURCES = HotColdMethodSpecializingTest.cpp
 
 init_class_test_SOURCES = InitClassTest.cpp
 
-init_class_pruner_test_SOURCES = InitClassPrunerTest.cpp
+init_class_pruner_test_SOURCES = InitClassPrunerTest.cpp $(top_srcdir)/test/common/RedexTestUtils.cpp
 
 init_class_lowering_pass_test_SOURCES = InitClassLoweringPassTest.cpp
 
@@ -440,31 +475,35 @@ unreachable_lowering_pass_test_SOURCES = UnreachableLoweringPassTest.cpp
 
 int_type_patcher_test_SOURCES = IntTypePatcherTest.cpp
 
-instruction_sequence_outliner_test_SOURCES = InstructionSequenceOutlinerTest.cpp ScopeHelper.cpp
+instruction_sequence_outliner_test_SOURCES = InstructionSequenceOutlinerTest.cpp ScopeHelper.cpp $(top_srcdir)/test/common/RedexTestUtils.cpp
 
-interprocedural_constant_propagation_test_SOURCES = constant-propagation/IPConstantPropagationTest.cpp
+interprocedural_constant_propagation_test_SOURCES = constant-propagation/IPConstantPropagationTest.cpp $(top_srcdir)/test/common/RedexTestUtils.cpp
 
 ipcp_stringbuilder_append_chain_test_SOURCES = constant-propagation/IPCPStringBuilderAppendChainTest.cpp
 
-intraprocedural_constant_propagation_test_SOURCES = constant-propagation/ConstantPropagationTest.cpp
+intraprocedural_constant_propagation_test_SOURCES = constant-propagation/ConstantPropagationTest.cpp $(top_srcdir)/test/common/RedexTestUtils.cpp
 intraprocedural_constant_propagation_test_LDADD = $(COMMON_MOCK_TEST_LIBS)
 
 ir_assembler_test_SOURCES = IRAssemblerTest.cpp
 
 ir_code_test_SOURCES = IRCodeTest.cpp
 
-ir_instruction_test_SOURCES = IRInstructionTest.cpp OpcodeList.cpp
+ir_instruction_test_SOURCES = IRInstructionTest.cpp OpcodeList.cpp $(top_srcdir)/test/common/RedexTestUtils.cpp
 
 ir_list_test_SOURCES = IRListTest.cpp
 ir_list_test_LDADD = $(COMMON_MOCK_TEST_LIBS)
 
-ir_typechecker_test_SOURCES = IRTypeCheckerTest.cpp
+ir_typechecker_test_SOURCES = IRTypeCheckerTest.cpp $(top_srcdir)/test/common/RedexTestUtils.cpp
 ir_typechecker_test_LDADD = $(COMMON_MOCK_TEST_LIBS)
 
 jar_loader_test_SOURCES = JarLoaderTest.cpp
 
 java_parser_util_test_SOURCES = JavaParserUtilTest.cpp
 java_parser_util_test_LDADD = $(COMMON_MOCK_TEST_LIBS)
+
+kotlin_companion_method_handle_test_SOURCES = KotlinCompanionMethodHandleTest.cpp $(top_srcdir)/test/common/RedexTestUtils.cpp
+
+kotlin_instance_rewriter_method_handle_test_SOURCES = KotlinInstanceRewriterMethodHandleTest.cpp $(top_srcdir)/test/common/RedexTestUtils.cpp
 
 kotlin_lambda_analyzer_test_SOURCES = KotlinLambdaAnalyzerTest.cpp
 kotlin_lambda_analyzer_test_LDADD = $(COMMON_MOCK_TEST_LIBS)
@@ -494,9 +533,15 @@ match_flow_test_LDADD = $(COMMON_MOCK_TEST_LIBS)
 
 materialize_null_checks_test_SOURCES = MaterializeNullChecksTest.cpp
 
-method_inline_test_SOURCES = MethodInlineTest.cpp
+method_devirtualizer_method_handle_test_SOURCES = MethodDevirtualizerMethodHandleTest.cpp
+
+method_handle_rewriter_test_SOURCES = MethodHandleRewriterTest.cpp $(top_srcdir)/test/common/RedexTestUtils.cpp
+
+method_inline_test_SOURCES = MethodInlineTest.cpp $(top_srcdir)/test/common/RedexTestUtils.cpp
 
 method_profiles_test_SOURCES = MethodProfilesTest.cpp
+
+method_reference_test_SOURCES = MethodReferenceTest.cpp $(top_srcdir)/test/common/RedexTestUtils.cpp
 
 tail_duplication_test_SOURCES = TailDuplicationTest.cpp
 
@@ -517,7 +562,9 @@ method_splitter_suffix_net_gate_test_SOURCES = \
 	MethodSplitterTestFixture.cpp \
 	MethodSplitterSuffixNetGateTest.cpp
 
-method_util_test_SOURCES = MethodUtilTest.cpp
+method_dedup_method_handle_test_SOURCES = MethodDedupMethodHandleTest.cpp
+
+method_util_test_SOURCES = MethodUtilTest.cpp $(top_srcdir)/test/common/RedexTestUtils.cpp
 
 metrics_sink_test_SOURCES = MetricsSinkTest.cpp
 
@@ -542,6 +589,8 @@ nopper_test_SOURCES = NopperTest.cpp
 
 null_propagation_test_SOURCES = constant-propagation/NullPropagationTest.cpp
 
+obfuscate_method_handle_test_SOURCES = ObfuscateMethodHandleTest.cpp $(top_srcdir)/test/common/RedexTestUtils.cpp
+
 object_inliner_test_SOURCES = ObjectInlinerTest.cpp
 object_inliner_test_LDADD = $(COMMON_MOCK_TEST_LIBS)
 
@@ -552,6 +601,8 @@ optimize_enums_test_SOURCES = OptimizeEnumsTest.cpp $(top_srcdir)/test/common/Re
 optimize_enums_test_LDADD = $(COMMON_MOCK_TEST_LIBS)
 
 outliner_type_analysis_test_SOURCES = OutlinerTypeAnalysisTest.cpp
+
+package_private_preprocessor_method_handle_test_SOURCES = PackagePrivatePreprocessorMethodHandleTest.cpp $(top_srcdir)/test/common/RedexTestUtils.cpp
 
 partial_pass_test_SOURCES = PartialPassTest.cpp
 
@@ -588,6 +639,8 @@ pure_analysis_test_LDADD = $(COMMON_MOCK_TEST_LIBS)
 
 random_forest_test_SOURCES = RandomForestTest.cpp
 
+reachability_method_handle_test_SOURCES = ReachabilityMethodHandleTest.cpp $(top_srcdir)/test/common/RedexTestUtils.cpp
+
 reachable_natives_test_SOURCES = ReachableNativesTest.cpp
 reachable_natives_test_LDADD = $(COMMON_MOCK_TEST_LIBS)
 
@@ -606,12 +659,13 @@ reduce_gotos_test_LDADD = $(COMMON_MOCK_TEST_LIBS)
 
 reduce_sparse_switches_test_SOURCES = ReduceSparseSwitchesTest.cpp
 
-ref_checker_test_SOURCES = RefCheckerTest.cpp
+ref_checker_test_SOURCES = RefCheckerTest.cpp $(top_srcdir)/test/common/RedexTestUtils.cpp
+ref_checker_test_LDADD = $(COMMON_MOCK_TEST_LIBS)
 
 reflection_analysis_test_SOURCES = ReflectionAnalysisTest.cpp
 reflection_analysis_test_LDADD = $(COMMON_MOCK_TEST_LIBS)
 
-reg_alloc_test_SOURCES = RegAllocTest.cpp OpcodeList.cpp
+reg_alloc_test_SOURCES = RegAllocTest.cpp OpcodeList.cpp $(top_srcdir)/test/common/RedexTestUtils.cpp
 reg_alloc_test_LDADD = $(COMMON_MOCK_TEST_LIBS)
 
 region_plan_test_SOURCES = RegionPlanTest.cpp
@@ -620,7 +674,7 @@ registers_test_SOURCES = RegistersTest.cpp OpcodeList.cpp
 
 remark_test_SOURCES = RemarkTest.cpp
 
-remove_builders_test_SOURCES = RemoveBuildersTest.cpp
+remove_builders_test_SOURCES = RemoveBuildersTest.cpp $(top_srcdir)/test/common/RedexTestUtils.cpp
 
 remove_null_check_string_arg_test_SOURCES = RemoveNullCheckStringArgTest.cpp ScopeHelper.cpp
 
@@ -628,7 +682,7 @@ remove_recursive_locks_test_SOURCES = RemoveRecursiveLocksTest.cpp
 
 remove_redundant_check_casts_test_SOURCES = RemoveRedundantCheckCastsTest.cpp VirtScopeHelper.cpp ScopeHelper.cpp
 
-remove_uninstantiables_test_SOURCES = RemoveUninstantiablesTest.cpp ScopeHelper.cpp
+remove_uninstantiables_test_SOURCES = RemoveUninstantiablesTest.cpp ScopeHelper.cpp $(top_srcdir)/test/common/RedexTestUtils.cpp
 remove_uninstantiables_test_LDADD = $(COMMON_MOCK_TEST_LIBS)
 
 remove_unused_args_test_SOURCES = RemoveUnusedArgsTest.cpp ScopeHelper.cpp
@@ -639,7 +693,7 @@ removed_reachability_graph_test_LDADD = $(COMMON_MOCK_TEST_LIBS)
 
 renamer_test_SOURCES = RenamerTest.cpp VirtScopeHelper.cpp ScopeHelper.cpp
 
-resolver_test_SOURCES = ResolverTest.cpp
+resolver_test_SOURCES = ResolverTest.cpp $(top_srcdir)/test/common/RedexTestUtils.cpp
 resolve_proguard_value_test_SOURCES = ResolveProguardAssumeValuesTest.cpp ScopeHelper.cpp
 
 resource_inlining_test_SOURCES = ResourceInliningTest.cpp ScopeHelper.cpp arsc/TestStructures.cpp
@@ -658,6 +712,8 @@ signed_constant_propagation_test_CPPFLAGS = $(AM_CPPFLAGS) -I$(top_srcdir)/spart
 
 single_impl_escape_test_SOURCES = SingleImplEscapeTest.cpp
 
+single_impl_method_handle_test_SOURCES = SingleImplMethodHandleTest.cpp $(top_srcdir)/test/common/RedexTestUtils.cpp
+
 compact_pointer_vector_test_SOURCES = CompactPointerVectorTest.cpp
 
 source_blocks_test_SOURCES = SourceBlocksTest.cpp
@@ -674,7 +730,7 @@ split_huge_switch_test_SOURCES = SplitHugeSwitchTest.cpp
 
 static_field_dependency_graph_test_SOURCES = StaticFieldDependencyGraphTest.cpp
 
-static_relo_v2_test_SOURCES = StaticReloV2Test.cpp
+static_relo_v2_test_SOURCES = StaticReloV2Test.cpp $(top_srcdir)/test/common/RedexTestUtils.cpp
 
 stringbuilder_append_chain_test_SOURCES = constant-propagation/StringBuilderAppendChainTest.cpp
 
@@ -712,12 +768,12 @@ true_virtuals_test_LDADD = $(COMMON_MOCK_TEST_LIBS)
 
 type_analysis_transform_test_SOURCES = type-analysis/TypeAnalysisTransformTest.cpp
 
-type_inference_test_SOURCES = TypeInferenceTest.cpp
+type_inference_test_SOURCES = TypeInferenceTest.cpp $(top_srcdir)/test/common/RedexTestUtils.cpp
 type_inference_test_LDADD = $(COMMON_MOCK_TEST_LIBS)
 
-type_ref_updater_test_SOURCES = TypeRefUpdaterTest.cpp
+type_ref_updater_test_SOURCES = TypeRefUpdaterTest.cpp $(top_srcdir)/test/common/RedexTestUtils.cpp
 
-type_reference_test_SOURCES = TypeReferenceTest.cpp
+type_reference_test_SOURCES = TypeReferenceTest.cpp $(top_srcdir)/test/common/RedexTestUtils.cpp
 
 type_string_rewriter_test_SOURCES = TypeStringRewriterTest.cpp
 
@@ -739,13 +795,15 @@ up_code_motion_test_LDADD = $(COMMON_MOCK_TEST_LIBS)
 used_vars_test_SOURCES = object-sensitive-dce/UsedVarsTest.cpp
 used_vars_test_LDADD = $(COMMON_MOCK_TEST_LIBS)
 
+vertical_merging_method_handle_test_SOURCES = VerticalMergingMethodHandleTest.cpp $(top_srcdir)/test/common/RedexTestUtils.cpp
+
 vertical_merging_r_class_test_SOURCES = VerticalMergingRClassTest.cpp
 
 vertical_merging_test_SOURCES = VerticalMergingTest.cpp
 
 vertical_merging_type_lookup_test_SOURCES = VerticalMergingTypeLookupTest.cpp
 
-virtual_merging_test_SOURCES = VirtualMergingTest.cpp
+virtual_merging_test_SOURCES = VirtualMergingTest.cpp $(top_srcdir)/test/common/RedexTestUtils.cpp
 
 virtual_scopes_test_SOURCES = VirtualScopesTest.cpp ScopeHelper.cpp
 virtual_scopes_test_LDADD = $(COMMON_MOCK_TEST_LIBS)

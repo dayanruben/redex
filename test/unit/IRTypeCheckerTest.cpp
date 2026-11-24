@@ -21,6 +21,7 @@
 #include "IROpcode.h"
 #include "IRTypeChecker.h"
 #include "RedexTest.h"
+#include "RedexTestUtils.h"
 #include "Show.h"
 
 using namespace testing;
@@ -441,6 +442,23 @@ TEST_F(IRTypeCheckerTest, move_result_after_void_invoke) {
       (invoke-static () "LFoo;.run:()V")
       (move-result v0)
       (return v0)
+     )
+    )
+  )");
+  IRTypeChecker checker(method);
+  checker.run();
+  EXPECT_TRUE(checker.fail());
+}
+
+TEST_F(IRTypeCheckerTest, move_result_after_void_method_handle_call) {
+  auto* method = assembler::method_from_string(R"(
+    (method (public static) "LFoo;.bar:(Ljava/lang/invoke/MethodHandle;)I"
+     (
+      (load-param-object v0)
+      (invoke-static () "LFoo;.getInt:()I")
+      (invoke-polymorphic (v0) "Ljava/lang/invoke/MethodHandle;.invokeExact:([Ljava/lang/Object;)Ljava/lang/Object;" "()V")
+      (move-result v1)
+      (return v1)
      )
     )
   )");
@@ -3106,7 +3124,7 @@ TEST_F(IRTypeCheckerTest, invokePolymorphic) {
       DexMethod::make_method(
           "Ljava/lang/invoke/MethodHandle;.invoke:([Ljava/"
           "lang/Object;)Ljava/lang/Object;")
-          ->make_concrete(ACC_PUBLIC | ACC_FINAL | ACC_VARARGS,
+          ->make_concrete(ACC_PUBLIC | ACC_FINAL | ACC_VARARGS | ACC_NATIVE,
                           /* is_virtual */ false);
   method_handle_creator.add_method(invoke_method);
   method_handle_creator.set_super(type::java_lang_Object());
@@ -3125,9 +3143,9 @@ TEST_F(IRTypeCheckerTest, invokePolymorphic) {
       (move-result-pseudo-object v1)
       (const-string "S2")
       (move-result-pseudo-object v2)
-      (invoke-polymorphic (v0) "Ljava/lang/invoke/MethodHandle;.invoke:([Ljava/lang/Object;)Ljava/lang/Object;")
-      (invoke-polymorphic (v0 v1) "Ljava/lang/invoke/MethodHandle;.invoke:([Ljava/lang/Object;)Ljava/lang/Object;")
-      (invoke-polymorphic (v0 v1 v2) "Ljava/lang/invoke/MethodHandle;.invoke:([Ljava/lang/Object;)Ljava/lang/Object;")
+      (invoke-polymorphic (v0) "Ljava/lang/invoke/MethodHandle;.invoke:([Ljava/lang/Object;)Ljava/lang/Object;" "()V")
+      (invoke-polymorphic (v0 v1) "Ljava/lang/invoke/MethodHandle;.invoke:([Ljava/lang/Object;)Ljava/lang/Object;" "(Ljava/lang/String;)V")
+      (invoke-polymorphic (v0 v1 v2) "Ljava/lang/invoke/MethodHandle;.invoke:([Ljava/lang/Object;)Ljava/lang/Object;" "(Ljava/lang/String;Ljava/lang/String;)V")
       (return-void)
   ))"));
   cls_foo_creator.add_method(method);
@@ -3142,14 +3160,14 @@ TEST_F(IRTypeCheckerTest, invokePolymorphic) {
 }
 
 TEST_F(IRTypeCheckerTest, invokePolymorphicOnUnexpectedExternalMethod) {
-  // Mimic java.lang.invoke.MethodHandle.invoke as closely as possible except
-  // name.
+  // MethodHandle.invokeWithArguments has the parameter of a signature
+  // polymorphic method but is not native, so it is an ordinary method.
   auto* const type_method_handle =
       DexType::make_type("Ljava/lang/invoke/MethodHandle;");
   ClassCreator method_handle_creator(type_method_handle);
   auto* not_invoke_method =
       DexMethod::make_method(
-          "Ljava/lang/invoke/MethodHandle;.notInvoke:([Ljava/"
+          "Ljava/lang/invoke/MethodHandle;.invokeWithArguments:([Ljava/"
           "lang/Object;)Ljava/lang/Object;")
           ->make_concrete(ACC_PUBLIC | ACC_FINAL | ACC_VARARGS,
                           /* is_virtual */ false);
@@ -3170,7 +3188,7 @@ TEST_F(IRTypeCheckerTest, invokePolymorphicOnUnexpectedExternalMethod) {
       (move-result-pseudo-object v1)
       (const-string "S2")
       (move-result-pseudo-object v2)
-      (invoke-polymorphic (v0 v1 v2) "Ljava/lang/invoke/MethodHandle;.notInvoke:([Ljava/lang/Object;)Ljava/lang/Object;")
+      (invoke-polymorphic (v0 v1 v2) "Ljava/lang/invoke/MethodHandle;.invokeWithArguments:([Ljava/lang/Object;)Ljava/lang/Object;" "(Ljava/lang/String;Ljava/lang/String;)V")
       (return-void)
   ))"));
   cls_foo_creator.add_method(method);
@@ -3181,12 +3199,12 @@ TEST_F(IRTypeCheckerTest, invokePolymorphicOnUnexpectedExternalMethod) {
 
   IRTypeChecker checker(method);
   checker.run();
-  EXPECT_THAT(checker.what(),
-              HasSubstr("invoke-polymorphic: Callee must be either "
-                        "MethodHandle.invoke or MethodHandle.invokeExact"));
+  EXPECT_THAT(checker.what(), HasSubstr("is not signature polymorphic"));
   EXPECT_TRUE(checker.fail());
 }
 
+// A method of MethodHandle is signature polymorphic only if its one parameter
+// is an Object[].
 TEST_F(IRTypeCheckerTest, invokePolymorphicOnWrongArgMethod) {
   auto* const type_foo = DexType::make_type("LFoo;");
   ClassCreator cls_foo_creator(type_foo);
@@ -3200,14 +3218,15 @@ TEST_F(IRTypeCheckerTest, invokePolymorphicOnWrongArgMethod) {
   method->set_code(assembler::ircode_from_string(R"(
     (
       (load-param-object v0)
-      (invoke-polymorphic (v0) "LFoo;.bar:()V")
+      (invoke-polymorphic (v0) "Ljava/lang/invoke/MethodHandle;.invoke:()Ljava/lang/Object;" "()V")
       (return-void)
   ))"));
   IRTypeChecker checker(method);
   checker.run();
-  EXPECT_THAT(
-      checker.what(),
-      ContainsRegex("invoke-polymorphic.*Arg count.*is expected to be 1"));
+  EXPECT_THAT(checker.what(),
+              HasSubstr("invoke-polymorphic: "
+                        "Ljava/lang/invoke/MethodHandle;.invoke:()Ljava/lang/"
+                        "Object; is not signature polymorphic"));
   EXPECT_TRUE(checker.fail());
 }
 
@@ -3225,14 +3244,210 @@ TEST_F(IRTypeCheckerTest, invokePolymorphicOnFixedArgMethod) {
     (
       (load-param-object v0)
       (load-param-object v1)
-      (invoke-polymorphic (v0 v1) "LFoo;.bar:(Ljava/lang/Object;)V")
+      (invoke-polymorphic (v0 v1) "Ljava/lang/invoke/MethodHandle;.invoke:(Ljava/lang/Object;)Ljava/lang/Object;" "(Ljava/lang/Object;)V")
       (return-void)
   ))"));
   IRTypeChecker checker(method);
   checker.run();
   EXPECT_THAT(checker.what(),
-              ContainsRegex("invoke-polymorphic.*is expected to be an array"));
+              HasSubstr("invoke-polymorphic: "
+                        "Ljava/lang/invoke/MethodHandle;.invoke:(Ljava/lang/"
+                        "Object;)Ljava/lang/Object; is not signature "
+                        "polymorphic"));
   EXPECT_TRUE(checker.fail());
+}
+
+// A move-result reads the result of a method handle call.
+TEST_F(IRTypeCheckerTest, moveResultAfterInvokePolymorphic) {
+  auto* method = assembler::method_from_string(R"(
+    (method (public static) "LFoo;.bar:(Ljava/lang/invoke/MethodHandle;)V"
+     (
+      (load-param-object v0)
+      (invoke-polymorphic (v0) "Ljava/lang/invoke/MethodHandle;.invoke:([Ljava/lang/Object;)Ljava/lang/Object;" "()Ljava/lang/Object;")
+      (move-result-object v1)
+      (return-void)
+     )
+    )
+  )");
+  IRTypeChecker checker(method);
+  checker.run();
+  EXPECT_TRUE(checker.good()) << checker.what();
+}
+
+// A static initializer that calls a method handle:
+//
+//   static final long START = (long) NOW.invokeExact();
+TEST_F(IRTypeCheckerTest, invokePolymorphicWideResult) {
+  auto* method = assembler::method_from_string(R"(
+    (method (public static constructor) "LFoo;.<clinit>:()V"
+     (
+      (sget-object "LFoo;.NOW:Ljava/lang/invoke/MethodHandle;")
+      (move-result-pseudo-object v0)
+      (invoke-polymorphic (v0) "Ljava/lang/invoke/MethodHandle;.invokeExact:([Ljava/lang/Object;)Ljava/lang/Object;" "()J")
+      (move-result-wide v1)
+      (sput-wide v1 "LFoo;.START:J")
+      (return-void)
+     )
+    )
+  )");
+  IRTypeChecker checker(method);
+  checker.run();
+  EXPECT_TRUE(checker.good()) << checker.what();
+}
+
+TEST_F(IRTypeCheckerTest, invokePolymorphicResultMismatchIsAnError) {
+  auto* method = assembler::method_from_string(R"(
+    (method (public static) "LFoo;.bar:(Ljava/lang/invoke/MethodHandle;)V"
+     (
+      (load-param-object v0)
+      (invoke-polymorphic (v0) "Ljava/lang/invoke/MethodHandle;.invokeExact:([Ljava/lang/Object;)Ljava/lang/Object;" "()J")
+      (move-result-object v1)
+      (return-void)
+     )
+    )
+  )");
+  IRTypeChecker checker(method);
+  checker.run();
+  EXPECT_TRUE(checker.fail());
+}
+
+// VarHandle accessors are signature polymorphic too:
+//
+//   boolean swapped = NEXT.compareAndSet(this, expected, next);
+TEST_F(IRTypeCheckerTest, invokePolymorphicOnVarHandle) {
+  ClassCreator var_handle_creator(
+      DexType::make_type("Ljava/lang/invoke/VarHandle;"));
+  var_handle_creator.add_method(
+      DexMethod::make_method(
+          "Ljava/lang/invoke/VarHandle;.compareAndSet:([Ljava/lang/Object;)Z")
+          ->make_concrete(ACC_PUBLIC | ACC_FINAL | ACC_VARARGS | ACC_NATIVE,
+                          /* is_virtual */ true));
+  var_handle_creator.set_super(type::java_lang_Object());
+  var_handle_creator.set_access(ACC_PUBLIC | ACC_ABSTRACT);
+  var_handle_creator.create();
+
+  auto* method = assembler::method_from_string(R"(
+    (method (public static) "LFoo;.bar:(Ljava/lang/invoke/VarHandle;LFoo;LFoo;LFoo;)Z"
+     (
+      (load-param-object v0)
+      (load-param-object v1)
+      (load-param-object v2)
+      (load-param-object v3)
+      (invoke-polymorphic (v0 v1 v2 v3) "Ljava/lang/invoke/VarHandle;.compareAndSet:([Ljava/lang/Object;)Z" "(LFoo;LFoo;LFoo;)Z")
+      (move-result v4)
+      (return v4)
+     )
+    )
+  )");
+  IRTypeChecker checker(method);
+  checker.run();
+  EXPECT_TRUE(checker.good()) << checker.what();
+}
+
+// Only MethodHandle and VarHandle declare signature-polymorphic methods.
+TEST_F(IRTypeCheckerTest, invokePolymorphicOutsideMethodHandleIsAnError) {
+  auto* method = assembler::method_from_string(R"(
+    (method (public static) "LFoo;.bar:(LFoo;)V"
+     (
+      (load-param-object v0)
+      (invoke-polymorphic (v0) "LFoo;.call:([Ljava/lang/Object;)Ljava/lang/Object;" "()V")
+      (return-void)
+     )
+    )
+  )");
+  IRTypeChecker checker(method);
+  checker.run();
+  EXPECT_TRUE(checker.fail());
+  EXPECT_THAT(checker.what(), HasSubstr("is not signature polymorphic"));
+}
+
+// The call-site prototype types the arguments and the result of a method
+// handle call: here an int and a long argument and a long result.
+//
+//   long next = (long) handle.invokeExact(7, 8L);
+TEST_F(IRTypeCheckerTest, invokePolymorphicUsesCallSiteProto) {
+  auto* method = assembler::method_from_string(R"(
+    (method (public static) "LFoo;.bar:(Ljava/lang/invoke/MethodHandle;)J"
+     (
+      (load-param-object v0)
+      (const v1 7)
+      (const-wide v2 8)
+      (invoke-polymorphic (v0 v1 v2) "Ljava/lang/invoke/MethodHandle;.invokeExact:([Ljava/lang/Object;)Ljava/lang/Object;" "(IJ)J")
+      (move-result-wide v4)
+      (return-wide v4)
+     )
+    )
+  )");
+  IRTypeChecker checker(method);
+  checker.run();
+  EXPECT_TRUE(checker.good()) << checker.what();
+}
+
+TEST_F(IRTypeCheckerTest, invokePolymorphicArgumentMismatchIsAnError) {
+  auto* method = assembler::method_from_string(R"(
+    (method (public static) "LFoo;.bar:(Ljava/lang/invoke/MethodHandle;)V"
+     (
+      (load-param-object v0)
+      (invoke-polymorphic (v0 v0) "Ljava/lang/invoke/MethodHandle;.invokeExact:([Ljava/lang/Object;)Ljava/lang/Object;" "(I)V")
+      (return-void)
+     )
+    )
+  )");
+  IRTypeChecker checker(method);
+  checker.run();
+  EXPECT_TRUE(checker.fail());
+  EXPECT_THAT(checker.what(), HasSubstr("expected type INT, but found REF"));
+}
+
+// The call site's method type types the arguments and the result of
+// `invoke-custom`, which has no receiver. Here tool-generated call sites with
+// an app-defined bootstrap method take a long and return a `LongSupplier`, or
+// a `Runnable` that goes unused.
+TEST_F(IRTypeCheckerTest, invokeCustomUsesCallSiteMethodType) {
+  auto check = [](std::string_view method_type, const char* move_result) {
+    // The placeholder takes the arguments of the call site.
+    auto placeholder =
+        "LFoo;.placeholder:" +
+        std::string(method_type.substr(0, method_type.find(')') + 1)) + "V";
+    auto* method = assembler::method_from_string(std::string(R"IR(
+      (method (public static) "LFoo;.bar:(J)V"
+       (
+        (load-param-wide v0)
+        (invoke-static (v0) ")IR") + placeholder +
+                                                 R"IR(")
+        )IR" + move_result + R"IR(
+        (return-void)
+       )
+      )
+    )IR");
+    redex::make_invoke_custom(method->get_code(), "get", method_type);
+    auto checker = std::make_unique<IRTypeChecker>(method);
+    checker->run();
+    return checker;
+  };
+  {
+    auto checker = check("(J)Ljava/util/function/LongSupplier;",
+                         "(move-result-object v2)");
+    EXPECT_TRUE(checker->good()) << checker->what();
+  }
+  {
+    auto checker = check("(J)Ljava/lang/Runnable;", "");
+    EXPECT_TRUE(checker->good()) << checker->what();
+  }
+  {
+    // The argument is a long, not a reference.
+    auto checker = check("(Ljava/lang/Object;)Ljava/lang/Object;",
+                         "(move-result-object v2)");
+    EXPECT_TRUE(checker->fail());
+    EXPECT_THAT(checker->what(), HasSubstr("expected type REF"));
+  }
+  {
+    // The result is a long, not a reference.
+    auto checker = check("(J)J", "(move-result-object v2)");
+    EXPECT_TRUE(checker->fail());
+    EXPECT_THAT(checker->what(),
+                HasSubstr("expected type REF, but found LONG1"));
+  }
 }
 
 TEST_F(IRTypeCheckerTest, invokeOnClassInitializer) {
@@ -4312,4 +4527,65 @@ TEST_F(IRTypeCheckerFinalFieldTest, iput_unresolvable_final_field) {
   checker.validate_access();
   checker.run();
   EXPECT_TRUE(checker.good()) << checker.what();
+}
+
+class IRTypeCheckerMethodHandleAccessTest : public RedexTest {
+ protected:
+  // `LOwner;` with the private static method `secret()` and the private static
+  // field `hidden`.
+  void SetUp() override {
+    ClassCreator owner(DexType::make_type("LOwner;"));
+    owner.set_super(type::java_lang_Object());
+    owner.add_method(DexMethod::make_method("LOwner;.secret:()V")
+                         ->make_concrete(ACC_PRIVATE | ACC_STATIC, false));
+    owner.add_field(DexField::make_field("LOwner;.hidden:I")
+                        ->make_concrete(ACC_PRIVATE | ACC_STATIC));
+    owner.create();
+  }
+
+  // Type checks `code` as the body of a static method of `cls`, with access
+  // validation.
+  static std::unique_ptr<IRTypeChecker> check(const std::string& cls,
+                                              const std::string& code) {
+    auto* method = DexMethod::make_method(cls + ".use:()V")
+                       ->make_concrete(ACC_PUBLIC | ACC_STATIC, false);
+    method->set_code(assembler::ircode_from_string(code));
+    auto checker = std::make_unique<IRTypeChecker>(method);
+    checker->validate_access();
+    checker->run();
+    return checker;
+  }
+};
+
+// Tool-generated code: a method handle needs access to the method or field
+// it names, as the instruction it acts like does.
+TEST_F(IRTypeCheckerMethodHandleAccessTest, privateMethodOfOtherClass) {
+  auto checker = check("LUser;", R"((
+    (const-method-handle invoke-static "LOwner;.secret:()V")
+    (move-result-pseudo-object v0)
+    (return-void)
+  ))");
+  EXPECT_TRUE(checker->fail());
+  EXPECT_THAT(checker->what(), HasSubstr("illegal access to private"));
+}
+
+TEST_F(IRTypeCheckerMethodHandleAccessTest, privateFieldOfOtherClass) {
+  auto checker = check("LUser;", R"((
+    (const-method-handle static-get "LOwner;.hidden:I")
+    (move-result-pseudo-object v0)
+    (return-void)
+  ))");
+  EXPECT_TRUE(checker->fail());
+  EXPECT_THAT(checker->what(), HasSubstr("illegal access to private"));
+}
+
+TEST_F(IRTypeCheckerMethodHandleAccessTest, privateMembersOfOwnClass) {
+  auto checker = check("LOwner;", R"((
+    (const-method-handle invoke-static "LOwner;.secret:()V")
+    (move-result-pseudo-object v0)
+    (const-method-handle static-get "LOwner;.hidden:I")
+    (move-result-pseudo-object v0)
+    (return-void)
+  ))");
+  EXPECT_TRUE(checker->good()) << checker->what();
 }

@@ -15,6 +15,7 @@
 #include "RedexContext.h"
 #include "Resolver.h"
 #include "TypeUtil.h"
+#include "Walkers.h"
 
 namespace {
 
@@ -144,7 +145,13 @@ class ClInitSideEffectsAnalysis {
     cfg_adapter::iterate_with_iterator(
         method->get_code(), [&](const IRList::iterator& it) {
           auto* insn = it->insn;
-          if (opcode::is_an_invoke(insn->opcode())) {
+          if (opcode::is_invoke_polymorphic(insn->opcode()) ||
+              opcode::is_invoke_custom(insn->opcode())) {
+            // The method handle or call site decides at run time what runs.
+            non_trivial = true;
+            return cfg_adapter::LOOP_BREAK;
+          }
+          if (opcode::is_a_method_invoke(insn->opcode())) {
             if (invoke_may_have_side_effects(effective_caller, insn)) {
               non_trivial = true;
               return cfg_adapter::LOOP_BREAK;
@@ -539,6 +546,88 @@ bool can_change_signature(const DexMethod* method) {
          !method->rstate.no_optimizations();
 }
 
+bool runs_method_handle_target(const DexMethodRef* method) {
+  return method->get_class() ==
+             DexType::get_type("Ljava/lang/invoke/MethodHandle;") &&
+         method->get_name()->str() == "invokeWithArguments";
+}
+
+namespace {
+
+// Calls `f(method_handle, caller)`, in parallel, for every method handle that
+// `scope` holds: in code, with the method that holds it as `caller`, and in a
+// static field value or an annotation, which no code holds, with a null
+// `caller`.
+template <typename Fn>
+void walk_method_handles(const Scope& scope, const Fn& f) {
+  auto walk_value = [&](const Gatherable& value) {
+    std::vector<DexMethodHandle*> method_handles;
+    value.gather_methodhandles(method_handles);
+    for (const auto* method_handle : method_handles) {
+      f(method_handle, /* caller */ nullptr);
+    }
+  };
+  walk::parallel::fields(scope, [&](DexField* field) {
+    if (auto* value = field->get_static_value()) {
+      walk_value(*value);
+    }
+  });
+  walk::parallel::annotations(
+      scope, [&](DexAnnotation* annotation) { walk_value(*annotation); });
+  walk::parallel::opcodes(scope, [&](DexMethod* method, IRInstruction* insn) {
+    for_each_method_handle(insn, [&](const DexMethodHandle* method_handle) {
+      f(method_handle, method);
+    });
+  });
+}
+
+} // namespace
+
+InsertOnlyConcurrentSet<const DexMethod*>
+gather_methods_named_by_method_handles(const Scope& scope) {
+  InsertOnlyConcurrentSet<const DexMethod*> methods;
+  // What a method handle in code calls depends on the method that holds it.
+  walk_method_handles(
+      scope,
+      [&](const DexMethodHandle* method_handle, const DexMethod* caller) {
+        if (!DexMethodHandle::isInvokeType(method_handle->type())) {
+          return;
+        }
+        if (auto* method = method_handle->methodref()->as_def()) {
+          methods.insert(method);
+        }
+        if (auto* method = resolve_call(method_handle_opcode(method_handle),
+                                        method_handle->methodref(),
+                                        method_handle, caller)) {
+          methods.insert(method);
+        }
+        for (auto* callee :
+             resolve_method_handle_callees(method_handle, caller)) {
+          methods.insert(callee);
+        }
+      });
+  return methods;
+}
+
+InsertOnlyConcurrentSet<const DexField*> gather_fields_named_by_method_handles(
+    const Scope& scope) {
+  InsertOnlyConcurrentSet<const DexField*> fields;
+  walk_method_handles(
+      scope,
+      [&](const DexMethodHandle* method_handle, const DexMethod* /* caller */) {
+        if (DexMethodHandle::isInvokeType(method_handle->type())) {
+          return;
+        }
+        if (auto* field = method_handle->fieldref()->as_def()) {
+          fields.insert(field);
+        }
+        if (auto* field = resolve_field_handle(method_handle)) {
+          fields.insert(field);
+        }
+      });
+  return fields;
+}
+
 #define DEFINE_CACHED_METHOD(func_name, _)                 \
   DexMethod* func_name() {                                 \
     return g_redex->pointers_cache().method_##func_name(); \
@@ -581,18 +670,6 @@ DexMethod* kotlin_jvm_internal_Intrinsics_areEqual() {
 DexMethod* redex_internal_checkObjectNotNull() {
   return dynamic_cast<DexMethod*>(DexMethod::get_method(
       "Lredex/$NullCheck;.null_check:(Ljava/lang/Object;)V"));
-}
-
-DexMethod* java_lang_invoke_MethodHandle_invoke() {
-  return dynamic_cast<DexMethod*>(
-      DexMethod::get_method("Ljava/lang/invoke/MethodHandle;.invoke:([Ljava/"
-                            "lang/Object;)Ljava/lang/Object;"));
-}
-
-DexMethod* java_lang_invoke_MethodHandle_invokeExact() {
-  return dynamic_cast<DexMethod*>(DexMethod::get_method(
-      "Ljava/lang/invoke/MethodHandle;.invokeExact:([Ljava/"
-      "lang/Object;)Ljava/lang/Object;"));
 }
 
 std::optional<std::string_view> get_param_name(const DexMethod* m, size_t idx) {

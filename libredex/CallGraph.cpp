@@ -24,6 +24,23 @@ namespace {
 
 AccumulatingTimer s_timer("CallGraph");
 
+// The methods that the method handles held by code in `scope` call. Code calls
+// a method handle through invoke-polymorphic or invoke-custom, which do not
+// name the method, so the graph cannot see these calls; such methods are
+// roots, like methods called from outside the app.
+ConcurrentSet<const DexMethod*> get_method_handle_callees(const Scope& scope) {
+  ConcurrentSet<const DexMethod*> callees;
+  walk::parallel::opcodes(scope, [&](DexMethod* method, IRInstruction* insn) {
+    for_each_method_handle(insn, [&](const DexMethodHandle* method_handle) {
+      for (auto* callee :
+           resolve_method_handle_callees(method_handle, method)) {
+        callees.insert(callee);
+      }
+    });
+  });
+  return callees;
+}
+
 } // namespace
 
 namespace call_graph {
@@ -59,7 +76,7 @@ CallSites SingleCalleeStrategy::get_callsites(const DexMethod* method) const {
   cfg_adapter::iterate_with_iterator(
       code, [&](const IRList::const_iterator& it) {
         auto* insn = it->insn;
-        if (opcode::is_an_invoke(insn->opcode())) {
+        if (opcode::is_a_method_invoke(insn->opcode())) {
           auto* callee = resolve_invoke_method_deprecated(insn, method);
           if (callee == nullptr || is_definitely_virtual(callee)) {
             return cfg_adapter::LOOP_CONTINUE;
@@ -76,8 +93,10 @@ CallSites SingleCalleeStrategy::get_callsites(const DexMethod* method) const {
 RootAndDynamic SingleCalleeStrategy::get_roots() const {
   RootAndDynamic root_and_dynamic;
   auto& roots = root_and_dynamic.roots;
+  auto method_handle_callees = get_method_handle_callees(m_scope);
   walk::code(m_scope, [&](DexMethod* method, IRCode& /* code */) {
     if (is_definitely_virtual(method) || root(method) ||
+        method_handle_callees.count_unsafe(method) != 0u ||
         method::is_clinit(method) || method::is_argless_init(method)) {
       roots.insert(method);
     }
@@ -137,6 +156,7 @@ RootAndDynamic MultipleCalleeBaseStrategy::get_roots() const {
     }
     roots.insert(method);
   };
+  auto method_handle_callees = get_method_handle_callees(m_scope);
   walk::methods(m_scope, [&](DexMethod* method) {
     if (method::is_clinit(method)) {
       roots.insert(method);
@@ -145,8 +165,8 @@ RootAndDynamic MultipleCalleeBaseStrategy::get_roots() const {
     const bool is_method_dynamic =
         method->is_virtual() && is_interface(type_class(method->get_class())) &&
         !can_rename(method);
-    if (!root(method) && !method::is_argless_init(method) &&
-        !is_method_dynamic) {
+    if (!root(method) && method_handle_callees.count_unsafe(method) == 0u &&
+        !method::is_argless_init(method) && !is_method_dynamic) {
       // For root methods and dynamically added classes, created via
       // Proxy.newProxyInstance, we need to add them and their overrides and
       // overridden to roots.
@@ -209,7 +229,7 @@ CompleteCallGraphStrategy::get_invoke_targets(const DexMethod* method) const {
   cfg_adapter::iterate_with_iterator(
       code, [&](const IRList::const_iterator& it) {
         auto* insn = it->insn;
-        if (opcode::is_an_invoke(insn->opcode())) {
+        if (opcode::is_a_method_invoke(insn->opcode())) {
           auto* callee = resolve_invoke_method_deprecated(insn, method);
           if (callee == nullptr) {
             return cfg_adapter::LOOP_CONTINUE;
@@ -254,14 +274,18 @@ RootAndDynamic CompleteCallGraphStrategy::get_roots() const {
       roots.insert(method);
     }
   };
+  auto method_handle_callees = get_method_handle_callees(m_scope);
   walk::methods(m_scope, [&](DexMethod* method) {
-    if (root(method) || method::is_clinit(method) ||
+    const bool is_method_handle_callee =
+        method_handle_callees.count_unsafe(method) != 0u;
+    if (root(method) || is_method_handle_callee || method::is_clinit(method) ||
         method::is_argless_init(method)) {
       roots.insert(method);
     }
-    if (!root(method) && (!method->is_virtual() ||
-                          !is_interface(type_class(method->get_class())) ||
-                          can_rename(method))) {
+    if (!root(method) && !is_method_handle_callee &&
+        (!method->is_virtual() ||
+         !is_interface(type_class(method->get_class())) ||
+         can_rename(method))) {
       // For root methods and dynamically added classes, created via
       // Proxy.newProxyInstance, we need to add them and their overrides and
       // overridden to roots.
@@ -297,7 +321,7 @@ MultipleCalleeStrategy::MultipleCalleeStrategy(
   ConcurrentSet<const DexMethod*> concurrent_callees;
   walk::parallel::opcodes(scope, [&](const DexMethod* method,
                                      IRInstruction* insn) {
-    if (opcode::is_an_invoke(insn->opcode())) {
+    if (opcode::is_a_method_invoke(insn->opcode())) {
       auto* callee = resolve_invoke_method_deprecated(insn, method);
       if (callee == nullptr) {
         return;
@@ -337,7 +361,7 @@ CallSites MultipleCalleeStrategy::get_callsites(const DexMethod* method) const {
   cfg_adapter::iterate_with_iterator(
       code, [&](const IRList::const_iterator& it) {
         auto* insn = it->insn;
-        if (opcode::is_an_invoke(insn->opcode())) {
+        if (opcode::is_a_method_invoke(insn->opcode())) {
           auto* callee = resolve_invoke_method_deprecated(insn, method);
           if (callee == nullptr) {
             return cfg_adapter::LOOP_CONTINUE;

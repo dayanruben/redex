@@ -400,7 +400,7 @@ TEST_F(LiveRangeTest, TypeDemandOfInvokes) {
       (load-param-object v0)
       (load-param-object v1)
       (invoke-super (v0 v1) "LBase;.take:(LArg;)V")
-      (invoke-polymorphic (v1 v0) "Ljava/lang/invoke/MethodHandle;.invoke:([Ljava/lang/Object;)Ljava/lang/Object;")
+      (invoke-polymorphic (v1 v0) "Ljava/lang/invoke/MethodHandle;.invoke:([Ljava/lang/Object;)Ljava/lang/Object;" "(LArg;)V")
       (return-void)
     )
   )");
@@ -415,9 +415,12 @@ TEST_F(LiveRangeTest, TypeDemandOfInvokes) {
             DexType::get_type("LBase;"));
   EXPECT_EQ(get_type_demand(nullptr, {invoke_super, 1}),
             DexType::get_type("LArg;"));
-  // The call site's prototype, which Redex does not keep, decides what the
-  // arguments must be.
-  EXPECT_EQ(get_type_demand(nullptr, {invoke_polymorphic, 1}), nullptr);
+  // The handle must be a MethodHandle, and the call site's prototype decides
+  // what the arguments must be.
+  EXPECT_EQ(get_type_demand(nullptr, {invoke_polymorphic, 0}),
+            DexType::get_type("Ljava/lang/invoke/MethodHandle;"));
+  EXPECT_EQ(get_type_demand(nullptr, {invoke_polymorphic, 1}),
+            DexType::get_type("LArg;"));
 
   auto* call_site = redex::make_callsite("run", "(LArg;)V");
   IRInstruction invoke_custom(OPCODE_INVOKE_CUSTOM);

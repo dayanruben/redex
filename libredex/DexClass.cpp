@@ -21,6 +21,7 @@
 #include "DexMemberRefs.h"
 #include "DexOutput.h"
 #include "DexPosition.h"
+#include "DexSignaturePolymorphicRef.h"
 #include "DexUtil.h"
 #include "IRCode.h"
 #include "IRInstruction.h"
@@ -2041,6 +2042,11 @@ void DexProto::gather_strings(UnorderedSet<const DexString*>& lstring) const {
   }
 }
 
+DexSignaturePolymorphicRef* DexSignaturePolymorphicRef::make(
+    DexMethodRef* method, DexProto* callsite_proto) {
+  return g_redex->make_signature_polymorphic_ref(method, callsite_proto);
+}
+
 namespace {
 
 template <typename C>
@@ -2275,6 +2281,17 @@ void DexClass::gather_protos(C& lproto) const {
   for (auto const& m : m_vmethods) {
     m->gather_protos(lproto);
   }
+  for (auto const& f : m_sfields) {
+    f->gather_protos(lproto);
+  }
+  for (auto const& f : m_ifields) {
+    f->gather_protos(lproto);
+  }
+  if (m_anno) {
+    std::vector<DexProto*> proto_vec;
+    m_anno->gather_protos(proto_vec);
+    c_append_all(lproto, proto_vec.begin(), proto_vec.end());
+  }
 }
 INSTANTIATE(DexClass::gather_protos, DexProto*)
 
@@ -2285,6 +2302,17 @@ void DexClass::gather_methodhandles(C& lmethodhandle) const {
   }
   for (auto const& m : m_vmethods) {
     m->gather_methodhandles(lmethodhandle);
+  }
+  for (auto const& f : m_sfields) {
+    f->gather_methodhandles(lmethodhandle);
+  }
+  for (auto const& f : m_ifields) {
+    f->gather_methodhandles(lmethodhandle);
+  }
+  if (m_anno) {
+    std::vector<DexMethodHandle*> mhandles_vec;
+    m_anno->gather_methodhandles(mhandles_vec);
+    c_append_all(lmethodhandle, mhandles_vec.begin(), mhandles_vec.end());
   }
 }
 INSTANTIATE(DexClass::gather_methodhandles, DexMethodHandle*)
@@ -2362,6 +2390,32 @@ void DexField::gather_methods(C& lmethod) const {
 }
 INSTANTIATE(DexField::gather_methods, DexMethodRef*)
 
+template <typename C>
+void DexField::gather_protos(C& lproto) const {
+  std::vector<DexProto*> proto_vec;
+  if (m_value) {
+    m_value->gather_protos(proto_vec);
+  }
+  if (m_anno) {
+    m_anno->gather_protos(proto_vec);
+  }
+  c_append_all(lproto, proto_vec.begin(), proto_vec.end());
+}
+INSTANTIATE(DexField::gather_protos, DexProto*)
+
+template <typename C>
+void DexField::gather_methodhandles(C& lmethodhandle) const {
+  std::vector<DexMethodHandle*> mhandles_vec;
+  if (m_value) {
+    m_value->gather_methodhandles(mhandles_vec);
+  }
+  if (m_anno) {
+    m_anno->gather_methodhandles(mhandles_vec);
+  }
+  c_append_all(lmethodhandle, mhandles_vec.begin(), mhandles_vec.end());
+}
+INSTANTIATE(DexField::gather_methodhandles, DexMethodHandle*)
+
 std::string DexField::get_simple_deobfuscated_name() const {
   return get_simple_deobf_name(this);
 }
@@ -2414,11 +2468,20 @@ INSTANTIATE(DexMethod::gather_callsites, DexCallSite*)
 template <typename C>
 void DexMethod::gather_protos(C& lproto) const {
   // The method's own proto is handled with the method ref.
+  std::vector<DexProto*> proto_vec;
   if (m_code) {
-    std::vector<DexProto*> proto_vec;
     m_code->gather_protos(proto_vec);
-    c_append_all(lproto, proto_vec.begin(), proto_vec.end());
   }
+  if (m_anno) {
+    m_anno->gather_protos(proto_vec);
+  }
+  const auto* param_anno = get_param_anno();
+  if (param_anno) {
+    for (const auto& pair : *param_anno) {
+      pair.second->gather_protos(proto_vec);
+    }
+  }
+  c_append_all(lproto, proto_vec.begin(), proto_vec.end());
 }
 INSTANTIATE(DexMethod::gather_protos, DexProto*)
 
@@ -2428,6 +2491,15 @@ void DexMethod::gather_methodhandles(C& lmethodhandle) const {
   std::vector<DexMethodHandle*> mhandles_vec; // Simplify refactor.
   if (m_code) {
     m_code->gather_methodhandles(mhandles_vec);
+  }
+  if (m_anno) {
+    m_anno->gather_methodhandles(mhandles_vec);
+  }
+  const auto* param_anno = get_param_anno();
+  if (param_anno) {
+    for (const auto& pair : *param_anno) {
+      pair.second->gather_methodhandles(mhandles_vec);
+    }
   }
   c_append_all(lmethodhandle, mhandles_vec.begin(), mhandles_vec.end());
 }

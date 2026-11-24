@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "Debug.h"
+#include "DexSignaturePolymorphicRef.h"
 #include "IROpcode.h"
 
 class DexCallSite;
@@ -172,8 +173,15 @@ class IRInstruction final {
 
   bool has_field() const { return opcode::ref(m_opcode) == opcode::Ref::Field; }
 
+  // The five invokes that call the method they name. `invoke-polymorphic` also
+  // names a method, but calls whatever its method handle refers to; see
+  // has_signature_polymorphic().
   bool has_method() const {
     return opcode::ref(m_opcode) == opcode::Ref::Method;
+  }
+
+  bool has_signature_polymorphic() const {
+    return opcode::ref(m_opcode) == opcode::Ref::SignaturePolymorphic;
   }
 
   bool has_literal() const {
@@ -202,7 +210,7 @@ class IRInstruction final {
   }
 
   bool has_move_result() const {
-    return has_method() || m_opcode == OPCODE_FILLED_NEW_ARRAY;
+    return opcode::writes_result_register(m_opcode);
   }
 
   bool has_move_result_any() const {
@@ -354,6 +362,46 @@ class IRInstruction final {
     return this;
   }
 
+  // The prototype of an invoke's call site: the types of the arguments after
+  // the receiver, if any, and of the result. It is the callee's prototype for
+  // the invokes that name the method they call, the recorded call-site
+  // prototype for `invoke-polymorphic`, and the call site's method type for
+  // `invoke-custom`.
+  DexProto* get_callsite_proto() const;
+
+  // Whether an invoke's first source is a receiver that its call-site
+  // prototype does not list: the object for an instance method, and the method
+  // handle or var handle for `invoke-polymorphic`.
+  bool invoke_has_receiver() const {
+    always_assert(opcode::is_an_invoke(m_opcode));
+    return !opcode::is_invoke_static(m_opcode) &&
+           !opcode::is_invoke_custom(m_opcode);
+  }
+
+  // The type an invoke's source `i` must have: the class of the method for a
+  // receiver, otherwise the argument type from the call-site prototype.
+  const DexType* get_invoke_src_type(src_index_t i) const;
+
+  // The number of sources a normalized invoke has: the receiver, if any, and
+  // one for each argument of its call-site prototype.
+  size_t invoke_srcs_size() const;
+
+  // The method and call-site prototype of an `invoke-polymorphic`. It is
+  // interned, so equal pairs are the same object.
+  const DexSignaturePolymorphicRef* get_signature_polymorphic() const {
+    always_assert(has_signature_polymorphic());
+    always_assert(m_signature_polymorphic != nullptr);
+    return m_signature_polymorphic;
+  }
+
+  IRInstruction* set_signature_polymorphic(DexMethodRef* method,
+                                           DexProto* callsite_proto) {
+    always_assert(has_signature_polymorphic());
+    m_signature_polymorphic =
+        DexSignaturePolymorphicRef::make(method, callsite_proto);
+    return this;
+  }
+
   DexCallSite* get_callsite() const {
     always_assert(has_callsite());
     return m_callsite;
@@ -419,6 +467,8 @@ class IRInstruction final {
   void gather_protos(std::vector<DexProto*>& lproto) const {
     if (has_proto()) {
       lproto.push_back(m_proto);
+    } else if (has_signature_polymorphic()) {
+      lproto.push_back(get_callsite_proto());
     }
   }
 
@@ -457,6 +507,7 @@ class IRInstruction final {
     DexCallSite* m_callsite;
     DexMethodHandle* m_methodhandle;
     DexProto* m_proto;
+    DexSignaturePolymorphicRef* m_signature_polymorphic;
   };
   // 16 bytes so far
   union {

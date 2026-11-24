@@ -190,6 +190,7 @@ libredex_la_SOURCES = \
 	libredex/MatchFlowDetail.cpp \
 	libredex/MethodDevirtualizer.cpp \
 	libredex/MethodFixup.cpp \
+	libredex/MethodHandleRewriter.cpp \
 	libredex/MethodOverrideGraph.cpp \
 	libredex/MethodProfiles.cpp \
 	libredex/MethodSimilarityCompressionConsciousOrderer.cpp \
@@ -299,6 +300,7 @@ libredex_la_SOURCES = \
 	service/dedup-blocks/DedupBlockValueNumbering.cpp \
 	service/enum-utils/EnumUtilsHolders.cpp \
 	service/escape-analysis/BlamingAnalysis.cpp \
+	service/escape-analysis/ConstructorAccesses.cpp \
 	service/escape-analysis/LocalPointersAnalysis.cpp \
 	service/atomic-field-updaters/AtomicFieldUpdaters.cpp \
 	service/field-ops/FieldOpTracker.cpp \

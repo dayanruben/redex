@@ -7,9 +7,11 @@
 
 #include "IFieldAnalysisUtil.h"
 
+#include <algorithm>
 #include <optional>
 
 #include "Debug.h"
+#include "Resolver.h"
 #include "TypeSystem.h"
 #include "Walkers.h"
 
@@ -66,7 +68,10 @@ class ThisObjectAnalysis final
               break;
             }
           }
-          if (use_this) {
+          if (use_this && !insn->has_method()) {
+            // invoke-polymorphic and invoke-custom run unknown code.
+            return_set.emplace(nullptr);
+          } else if (use_this) {
             auto* insn_method = insn->get_method();
             auto* callee = resolve_method_deprecated(
                 insn_method, opcode_to_search(insn), m_method);
@@ -190,7 +195,23 @@ bool get_ifields_read(const UnorderedSet<std::string>& allowlist_method_names,
               field->get_class() == ifield_cls->get_type()) {
             blocklist_ifields->emplace(field);
           }
-        } else if (opcode::is_an_invoke(insn->opcode())) {
+        } else if (opcode::is_an_invoke(insn->opcode()) &&
+                   !insn->has_method()) {
+          // invoke-polymorphic and invoke-custom run unknown code, which can
+          // read the fields of an object passed to it.
+          const auto* args = insn->get_callsite_proto()->get_args();
+          if (std::any_of(args->begin(), args->end(), [&](const DexType* t) {
+                return parent_intf_set.count(t) != 0u;
+              })) {
+            bool keep_going = get_ifields_read(
+                allowlist_method_names, parent_intf_set, ifield_cls,
+                /* method */ nullptr, blocklist_ifields, visited);
+            if (!keep_going) {
+              res = false;
+              return cfg_adapter::LOOP_BREAK;
+            }
+          }
+        } else if (opcode::is_a_method_invoke(insn->opcode())) {
           auto* insn_method = insn->get_method();
           auto* callee = resolve_method_deprecated(
               insn_method, opcode_to_search(insn), method);
@@ -329,25 +350,14 @@ ConcurrentSet<DexField*> get_ifields_read_in_callees(
 
 namespace constant_propagation {
 
-EligibleIfields gather_safely_inferable_ifield_candidates(
-    const Scope& scope,
-    const UnorderedSet<std::string>& allowlist_method_names) {
-  EligibleIfields eligible_ifields;
+UnorderedSet<const DexField*> gather_ifields_written_only_by_constructors(
+    const Scope& scope) {
   UnorderedSet<DexField*> ifields_candidates;
   walk::fields(scope, [&](DexField* field) {
-    // Collect non-final instance field candidates that are non external,
+    // Collect instance field candidates that are non external,
     // and can be deleted.
     if (is_static(field) || field->is_external() || !can_delete(field) ||
         is_volatile(field)) {
-      return;
-    }
-    if (is_final(field)) {
-      eligible_ifields.emplace(field);
-      return;
-    }
-    DexClass* field_cls = type_class(field->get_class());
-    if (field_cls != nullptr && field_cls->get_ctors().size() > 1) {
-      // Class with multiple constructors, ignore it now.
       return;
     }
     ifields_candidates.emplace(field);
@@ -356,41 +366,126 @@ EligibleIfields gather_safely_inferable_ifield_candidates(
   ConcurrentSet<DexField*> invalid_candidates;
   walk::parallel::code(scope, [&](DexMethod* method, IRCode& code) {
     // Remove candidate field if it was written in code other than its class'
-    // init function.
+    // init function, or in an init function excluded from optimization.
     cfg_adapter::iterate_with_iterator(&code, [&](const IRList::iterator& it) {
-      auto* insn = it->insn;
-      auto op = insn->opcode();
-      if (opcode::is_an_iput(op)) {
-        auto* field = resolve_field(insn->get_field(), FieldSearch::Instance);
-        if (field == nullptr || (method::is_init(method) &&
-                                 method->get_class() == field->get_class())) {
-          // If couldn't resolve the field, or this method is this field's
-          // class's init function, move on.
-          return cfg_adapter::LOOP_CONTINUE;
-        }
-        // We assert that final fields are not modified outside of <init>
-        // methods. javac seems to enforce this, but it's unclear if the JVM
-        // spec actually forbids that. Doing the check here simplifies the
-        // constant propagation analysis later -- we can determine the
-        // values of these fields without analyzing any methods invoked from
-        // the <init> methods.
-        always_assert_log(!is_final(field),
-                          "FinalInlinePassV2: encountered one final instance "
-                          "field been changed outside of its class's <init> "
-                          "file, for temporary solution set "
-                          "\"inline_instance_field\" in \"FinalInlinePassV2\" "
-                          "to be false. Field: %s",
-                          SHOW(field));
-        invalid_candidates.insert(field);
-      }
+      for_each_field_access(
+          it->insn,
+          [&](IROpcode op, DexFieldRef* field_ref,
+              const DexMethodHandle* method_handle) {
+            if (!opcode::is_an_iput(op)) {
+              return;
+            }
+            // A method handle can be called anywhere, on any object.
+            if (method_handle != nullptr) {
+              if (auto* field = resolve_field_handle(method_handle)) {
+                invalid_candidates.insert(field);
+              }
+              return;
+            }
+            auto* field = resolve_field(field_ref, FieldSearch::Instance);
+            if (field == nullptr) {
+              return;
+            }
+            if (method::is_init(method) &&
+                method->get_class() == field->get_class()) {
+              // See `ConstructorAccesses` on constructors excluded from
+              // optimization.
+              if (method->rstate.no_optimizations()) {
+                invalid_candidates.insert(field);
+              }
+              return;
+            }
+            // We assert that final fields are not modified outside of <init>
+            // methods. javac seems to enforce this, but it's unclear if the
+            // JVM spec actually forbids that. Doing the check here simplifies
+            // the constant propagation analysis later -- we can determine the
+            // values of these fields without analyzing any methods invoked
+            // from the <init> methods.
+            always_assert_log(
+                !is_final(field),
+                "FinalInlinePassV2: encountered one final instance "
+                "field been changed outside of its class's <init> "
+                "file, for temporary solution set "
+                "\"inline_instance_field\" in \"FinalInlinePassV2\" "
+                "to be false. Field: %s",
+                SHOW(field));
+            invalid_candidates.insert(field);
+          });
       return cfg_adapter::LOOP_CONTINUE;
     });
   });
+  UnorderedSet<const DexField*> written_only_by_constructors;
   for (DexField* field : UnorderedIterable(ifields_candidates)) {
     if (invalid_candidates.count(field) == 0u) {
-      eligible_ifields.emplace(field);
+      written_only_by_constructors.emplace(field);
     }
   }
+  return written_only_by_constructors;
+}
+
+UnorderedSet<const DexField*> gather_constructor_only_ifields(
+    const Scope& scope,
+    const local_pointers::ConstructorAccessesMap& constructor_accesses) {
+  auto constructor_only_ifields =
+      gather_ifields_written_only_by_constructors(scope);
+  ConcurrentSet<const DexField*> stored_on_other_objects;
+  walk::parallel::code(scope, [&](DexMethod* method, IRCode& code) {
+    if (!method::is_init(method) || method->rstate.no_optimizations()) {
+      return;
+    }
+    // Remove candidate field if its class's init function writes it to an
+    // object other than the one it initializes.
+    const local_pointers::ConstructorAccesses* accesses = nullptr;
+    for (const auto& mie : cfg::InstructionIterable(code.cfg())) {
+      auto* insn = mie.insn;
+      if (!opcode::is_an_iput(insn->opcode())) {
+        continue;
+      }
+      auto* field = resolve_field(insn->get_field(), FieldSearch::Instance);
+      if (field == nullptr || field->get_class() != method->get_class() ||
+          constructor_only_ifields.count(field) == 0u) {
+        continue;
+      }
+      if (accesses == nullptr) {
+        auto it = constructor_accesses.find(method);
+        always_assert_log(it != constructor_accesses.end(),
+                          "Unanalyzed constructor %s", SHOW(method));
+        accesses = it->second.get();
+      }
+      // `ConstructorAccesses` records every access to a resolved field of
+      // the constructor's class, so it knows this store.
+      auto access = accesses->field_accesses().find(insn);
+      always_assert_log(access != accesses->field_accesses().end(),
+                        "Unclassified store to an own field in %s: %s",
+                        SHOW(method), SHOW(insn));
+      if (access->second.receiver != local_pointers::Receiver::This) {
+        stored_on_other_objects.insert(field);
+      }
+    }
+  });
+  for (const auto* field : UnorderedIterable(stored_on_other_objects)) {
+    constructor_only_ifields.erase(field);
+  }
+  return constructor_only_ifields;
+}
+
+EligibleIfields gather_safely_inferable_ifield_candidates(
+    const Scope& scope,
+    const UnorderedSet<const DexField*>& candidate_ifields,
+    const UnorderedSet<std::string>& allowlist_method_names) {
+  EligibleIfields eligible_ifields;
+  walk::fields(scope, [&](DexField* field) {
+    if (candidate_ifields.count(field) == 0u) {
+      return;
+    }
+    DexClass* field_cls = type_class(field->get_class());
+    if (!is_final(field) && field_cls != nullptr &&
+        field_cls->get_ctors().size() > 1) {
+      // Class with multiple constructors, ignore it now.
+      return;
+    }
+    eligible_ifields.emplace(field);
+  });
   auto blocklist_ifields =
       get_ifields_read_in_callees(scope, allowlist_method_names);
   for (DexField* field : UnorderedIterable(blocklist_ifields)) {

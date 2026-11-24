@@ -59,6 +59,30 @@ DexClass* create_simple_class(const std::string& name) {
   return cc.create();
 }
 
+TEST_F(UsedVarsTest, UnusedInvokePolymorphicRemains) {
+  ClassCreator handles(DexType::make_type("Ljava/lang/invoke/MethodHandle;"));
+  handles.set_super(type::java_lang_Object());
+  handles.add_method(
+      DexMethod::make_method(
+          "Ljava/lang/invoke/MethodHandle;.invoke:([Ljava/lang/Object;)"
+          "Ljava/lang/Object;")
+          ->make_concrete(ACC_PUBLIC | ACC_NATIVE, true));
+  handles.create();
+  auto code = assembler::ircode_from_string(R"(
+    ((load-param-object v0)
+     (invoke-polymorphic (v0) "Ljava/lang/invoke/MethodHandle;.invoke:([Ljava/lang/Object;)Ljava/lang/Object;" "()Ljava/lang/Object;")
+     (move-result-object v1)
+     (return-void))
+  )");
+  code->build_cfg();
+  auto& cfg = code->cfg();
+  auto fp_iter = analyze(cfg, {}, {});
+  optimize(*fp_iter, cfg);
+  code->clear_cfg();
+  const auto output = assembler::to_string(code.get());
+  EXPECT_NE(output.find("invoke-polymorphic"), std::string::npos) << output;
+}
+
 TEST_F(UsedVarsTest, simple) {
   create_simple_class("LFoo;");
 
@@ -79,7 +103,7 @@ TEST_F(UsedVarsTest, simple) {
   ptrs::InvokeToSummaryMap invoke_to_esc_summary_map;
   for (auto& mie : InstructionIterable(*code)) {
     auto* insn = mie.insn;
-    if (opcode::is_an_invoke(insn->opcode()) &&
+    if (opcode::is_a_method_invoke(insn->opcode()) &&
         insn->get_method() == DexMethod::get_method("LFoo;.<init>:()V")) {
       invoke_to_eff_summary_map.emplace(insn, side_effects::Summary({0}));
       invoke_to_esc_summary_map.emplace(insn, ptrs::EscapeSummary{});
@@ -132,7 +156,7 @@ TEST_F(UsedVarsTest, join) {
   auto& cfg = code->cfg();
   for (auto& mie : InstructionIterable(cfg)) {
     auto* insn = mie.insn;
-    if (opcode::is_an_invoke(insn->opcode()) &&
+    if (opcode::is_a_method_invoke(insn->opcode()) &&
         method::is_init(insn->get_method())) {
       invoke_to_eff_summary_map.emplace(insn, side_effects::Summary({0}));
       invoke_to_esc_summary_map.emplace(insn, ptrs::EscapeSummary{});
@@ -187,7 +211,7 @@ TEST_F(UsedVarsTest, noDeleteInit) {
   ptrs::InvokeToSummaryMap invoke_to_esc_summary_map;
   for (auto& mie : InstructionIterable(*code)) {
     auto* insn = mie.insn;
-    if (opcode::is_an_invoke(insn->opcode()) &&
+    if (opcode::is_a_method_invoke(insn->opcode()) &&
         method::is_init(insn->get_method())) {
       invoke_to_eff_summary_map.emplace(insn, side_effects::Summary({0}));
       invoke_to_esc_summary_map.emplace(insn, ptrs::EscapeSummary{});
@@ -223,7 +247,7 @@ TEST_F(UsedVarsTest, noDeleteAliasedInit) {
   ptrs::InvokeToSummaryMap invoke_to_esc_summary_map;
   for (auto& mie : InstructionIterable(*code)) {
     auto* insn = mie.insn;
-    if (opcode::is_an_invoke(insn->opcode()) &&
+    if (opcode::is_a_method_invoke(insn->opcode()) &&
         method::is_init(insn->get_method())) {
       invoke_to_eff_summary_map.emplace(insn, side_effects::Summary({0}));
       invoke_to_esc_summary_map.emplace(insn, ptrs::EscapeSummary{});
@@ -269,7 +293,7 @@ TEST_F(UsedVarsTest, noDeleteInitForUnreadObject) {
   ptrs::InvokeToSummaryMap invoke_to_esc_summary_map;
   for (auto& mie : InstructionIterable(*code)) {
     auto* insn = mie.insn;
-    if (opcode::is_an_invoke(insn->opcode())) {
+    if (opcode::is_a_method_invoke(insn->opcode())) {
       auto* method = insn->get_method();
       if (method::is_init(method) ||
           method->get_name()->str() == "nosideeffects") {
@@ -314,7 +338,7 @@ TEST_F(UsedVarsTest, noReturn) {
   ptrs::InvokeToSummaryMap invoke_to_esc_summary_map;
   for (auto& mie : InstructionIterable(*code)) {
     auto* insn = mie.insn;
-    if (opcode::is_an_invoke(insn->opcode())) {
+    if (opcode::is_a_method_invoke(insn->opcode())) {
       auto* callee = insn->get_method();
       if (callee == DexMethod::get_method("LFoo;.<init>:()V")) {
         invoke_to_eff_summary_map.emplace(insn, side_effects::Summary({0}));
@@ -334,4 +358,56 @@ TEST_F(UsedVarsTest, noReturn) {
   optimize(*fp_iter, cfg);
   code->clear_cfg();
   EXPECT_EQ(assembler::to_s_expr(code.get()), expected);
+}
+
+// A method handle call may do anything: it is kept even though its result is
+// unused, and an object passed to it escapes, so writes to it are kept.
+TEST_F(UsedVarsTest, invokePolymorphicIsRequired) {
+  create_simple_class("LFoo;");
+
+  const auto* code_str = R"(
+    (
+      (sget-object "LFoo;.h:Ljava/lang/invoke/MethodHandle;")
+      (move-result-pseudo-object v0)
+      (new-instance "LFoo;")
+      (move-result-pseudo-object v1)
+      (invoke-direct (v1) "LFoo;.<init>:()V")
+      (const v2 0)
+      (iput v2 v1 "LFoo;.bar:I")
+      (invoke-polymorphic (v0 v1) "Ljava/lang/invoke/MethodHandle;.invokeExact:([Ljava/lang/Object;)Ljava/lang/Object;" "(LFoo;)I")
+      (move-result v3)
+      (return-void)
+    )
+  )";
+  auto code = assembler::ircode_from_string(code_str);
+  side_effects::InvokeToSummaryMap invoke_to_eff_summary_map;
+  ptrs::InvokeToSummaryMap invoke_to_esc_summary_map;
+  for (auto& mie : InstructionIterable(*code)) {
+    auto* insn = mie.insn;
+    if (insn->opcode() == OPCODE_INVOKE_DIRECT) {
+      invoke_to_eff_summary_map.emplace(insn, side_effects::Summary({0}));
+      invoke_to_esc_summary_map.emplace(insn, ptrs::EscapeSummary{});
+    }
+  }
+  code->build_cfg();
+  auto& cfg = code->cfg();
+  auto fp_iter =
+      analyze(cfg, invoke_to_esc_summary_map, invoke_to_eff_summary_map);
+  optimize(*fp_iter, cfg);
+
+  code->clear_cfg();
+  auto expected_code = assembler::ircode_from_string(R"(
+    (
+      (sget-object "LFoo;.h:Ljava/lang/invoke/MethodHandle;")
+      (move-result-pseudo-object v0)
+      (new-instance "LFoo;")
+      (move-result-pseudo-object v1)
+      (invoke-direct (v1) "LFoo;.<init>:()V")
+      (const v2 0)
+      (iput v2 v1 "LFoo;.bar:I")
+      (invoke-polymorphic (v0 v1) "Ljava/lang/invoke/MethodHandle;.invokeExact:([Ljava/lang/Object;)Ljava/lang/Object;" "(LFoo;)I")
+      (return-void)
+    )
+  )");
+  EXPECT_CODE_EQ(code.get(), expected_code.get());
 }

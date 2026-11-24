@@ -10,16 +10,21 @@
 #include "ApiLevelChecker.h"
 #include "Creators.h"
 #include "Debug.h"
+#include "Deleter.h"
+#include "DexAnnotation.h"
 #include "DexAsm.h"
 #include "DexUtil.h"
+#include "FrameworkApi.h"
 #include "IRAssembler.h"
 #include "IRCode.h"
 #include "Inliner.h"
 #include "InlinerConfig.h"
 #include "LegacyInliner.h"
 #include "MethodInlinePass.h"
+#include "PartialInliner.h"
 #include "PassManager.h"
 #include "RedexTest.h"
+#include "RedexTestUtils.h"
 #include "Walkers.h"
 
 struct MethodInlineTest : public RedexTest {
@@ -52,7 +57,7 @@ void test_inliner(const std::string& caller_str,
   const auto& callsite = std::find_if(
       caller->begin(), caller->end(), [](const MethodItemEntry& mie) {
         return mie.type == MFLOW_OPCODE &&
-               opcode::is_an_invoke(mie.insn->opcode());
+               opcode::is_a_method_invoke(mie.insn->opcode());
       });
   legacy_inliner::inline_method_unsafe(
       /*caller_method=*/nullptr, caller.get(), callee.get(), callsite);
@@ -4786,4 +4791,481 @@ TEST_F(MethodInlineTest, identical_implementation_keeps_all_cluster_members) {
 TEST_F(MethodInlineTest, identical_implementation_still_inlines_shared_calls) {
   check_identical_implementation_callers(/* keep_shared_calls */ false,
                                          /* extra_implementation */ false);
+}
+
+// A block that calls a method handle may do anything, so it is not inlined
+// partially.
+TEST_F(MethodInlineTest, partial_inlining_rejects_invoke_polymorphic) {
+  auto* method = assembler::method_from_string(R"(
+    (method (public static) "LFoo;.p:(Ljava/lang/invoke/MethodHandle;I)V"
+     (
+      (load-param-object v0)
+      (load-param v1)
+      (.src_block "LFoo;.p:(Ljava/lang/invoke/MethodHandle;I)V" 1 (1.0 1.0))
+      (if-eqz v1 :cold)
+      (.src_block "LFoo;.p:(Ljava/lang/invoke/MethodHandle;I)V" 2 (1.0 1.0))
+      (invoke-polymorphic (v0) "Ljava/lang/invoke/MethodHandle;.invokeExact:([Ljava/lang/Object;)Ljava/lang/Object;" "()V")
+      (return-void)
+     (:cold)
+      (.src_block "LFoo;.p:(Ljava/lang/invoke/MethodHandle;I)V" 3 (0 0))
+      (return-void)
+     )
+    )
+  )");
+  method->get_code()->build_cfg();
+  EXPECT_FALSE(inliner::get_partially_inlined_code(
+                   method, method->get_code()->cfg(), 100)
+                   .is_valid());
+}
+
+namespace {
+
+struct CrossStoreCallee {
+  // The body of the static method `LCallee;.callee:()V`.
+  std::string code;
+  // Runs before the CFGs are built.
+  std::function<void(DexMethod*)> edit = nullptr;
+  // Whether `LBoot;`, the bootstrap class of the call sites that
+  // `redex::make_invoke_custom` makes, is in the callee's store rather than
+  // in the root store.
+  bool bootstrap_in_callee_store{false};
+  // Marks the callee force-inline and gives the inliner a minimum SDK, which
+  // enables its later reference check for other callees.
+  bool force_inline_with_min_sdk_api{false};
+};
+
+// Returns whether `callee` is inlined into a caller of the root store.
+// `LCallee;` and `LOther;` are in a second store, which the root store cannot
+// reference.
+bool inlines_across_stores(const ConfigFiles& conf,
+                           const CrossStoreCallee& callee_spec) {
+  auto* caller_cls = create_a_class("LCaller;");
+  auto* callee_cls = create_a_class("LCallee;");
+  auto* other_cls = create_a_class("LOther;");
+  auto* boot_cls = create_a_class("LBoot;");
+  other_cls->add_method(
+      DexMethod::make_method("LOther;.m:()V")
+          ->make_concrete(ACC_PUBLIC | ACC_STATIC,
+                          assembler::ircode_from_string("((return-void))"),
+                          /* is_virtual */ false));
+  auto* callee =
+      DexMethod::make_method("LCallee;.callee:()V")
+          ->make_concrete(ACC_PUBLIC | ACC_STATIC,
+                          assembler::ircode_from_string(callee_spec.code),
+                          /* is_virtual */ false);
+  callee_cls->add_method(callee);
+  caller_cls->add_method(DexMethod::make_method("LCaller;.caller:()V")
+                             ->make_concrete(ACC_PUBLIC | ACC_STATIC,
+                                             assembler::ircode_from_string(R"((
+                            (invoke-static () "LCallee;.callee:()V")
+                            (return-void)
+                          ))"),
+                                             /* is_virtual */ false));
+  if (callee_spec.edit) {
+    callee_spec.edit(callee);
+  }
+  if (callee_spec.force_inline_with_min_sdk_api) {
+    callee->rstate.set_force_inline();
+  }
+
+  DexStoresVector stores;
+  DexStore root_store("classes");
+  root_store.add_classes({caller_cls});
+  DexStore callee_store("callee");
+  callee_store.add_classes({callee_cls, other_cls});
+  (callee_spec.bootstrap_in_callee_store ? callee_store : root_store)
+      .add_classes({boot_cls});
+  stores.push_back(std::move(root_store));
+  stores.push_back(std::move(callee_store));
+  auto scope = build_class_scope(stores);
+  walk::code(scope, [](auto*, IRCode& code) { code.build_cfg(); });
+  api::LevelChecker::init(0, scope);
+
+  inliner::InlinerConfig inliner_config;
+  inliner_config.populate(scope);
+  init_classes::InitClassesWithSideEffects init_classes_with_side_effects(
+      scope, /* create_init_class_insns */ false);
+  UnorderedSet<DexMethod*> candidates{callee};
+  ConcurrentMethodResolverDeprecated concurrent_method_resolver;
+  api::AndroidSDK min_sdk_api(std::nullopt);
+  MultiMethodInliner inliner(
+      scope, init_classes_with_side_effects, stores, conf, candidates,
+      std::ref(concurrent_method_resolver), inliner_config, /* min_sdk */ 0,
+      InterDex, /* true_virtual_callers */ {}, /* inline_for_speed */ nullptr,
+      /* analyze_and_prune_inits */ false, /* configured_pure_methods */ {},
+      callee_spec.force_inline_with_min_sdk_api ? &min_sdk_api : nullptr);
+  inliner.inline_methods();
+  return inliner.get_inlined().count(callee) != 0;
+}
+
+} // namespace
+
+TEST_F(MethodInlineTest, cross_store_const_class_is_not_inlined) {
+  EXPECT_FALSE(inlines_across_stores(conf, {.code = R"((
+    (const-class "LOther;")
+    (move-result-pseudo-object v0)
+    (return-void)
+  ))"}));
+}
+
+TEST_F(MethodInlineTest, cross_store_const_method_type_is_not_inlined) {
+  EXPECT_FALSE(inlines_across_stores(conf, {.code = R"((
+    (const-method-type "(LOther;)V")
+    (move-result-pseudo-object v0)
+    (return-void)
+  ))"}));
+}
+
+TEST_F(MethodInlineTest, cross_store_const_method_handle_is_not_inlined) {
+  EXPECT_FALSE(inlines_across_stores(conf, {.code = R"((
+    (const-method-handle invoke-static "LOther;.m:()V")
+    (move-result-pseudo-object v0)
+    (return-void)
+  ))"}));
+}
+
+TEST_F(MethodInlineTest, cross_store_invoke_polymorphic_proto_is_not_inlined) {
+  EXPECT_FALSE(inlines_across_stores(conf, {.code = R"((
+    (const v0 0)
+    (invoke-polymorphic (v0 v0) "Ljava/lang/invoke/MethodHandle;.invokeExact:([Ljava/lang/Object;)Ljava/lang/Object;" "(LOther;)V")
+    (return-void)
+  ))"}));
+}
+
+TEST_F(MethodInlineTest, cross_store_invoke_custom_method_type_is_not_inlined) {
+  EXPECT_FALSE(inlines_across_stores(conf, {.code = R"((
+    (const v0 0)
+    (invoke-static (v0) "LCallee;.placeholder:(LOther;)V")
+    (return-void)
+  ))",
+                                            .edit = [](DexMethod* callee) {
+                                              redex::make_invoke_custom(
+                                                  callee->get_code(), "run",
+                                                  "(LOther;)V");
+                                            }}));
+}
+
+TEST_F(MethodInlineTest,
+       cross_store_invoke_custom_bootstrap_method_is_not_inlined) {
+  EXPECT_FALSE(inlines_across_stores(
+      conf, {.code = R"((
+    (invoke-static () "LCallee;.placeholder:()V")
+    (return-void)
+  ))",
+             .edit =
+                 [](DexMethod* callee) {
+                   redex::make_invoke_custom(callee->get_code(), "run", "()V");
+                 },
+             .bootstrap_in_callee_store = true}));
+}
+
+TEST_F(MethodInlineTest,
+       cross_store_invoke_custom_bootstrap_argument_is_not_inlined) {
+  EXPECT_FALSE(inlines_across_stores(
+      conf, {.code = R"((
+    (invoke-static () "LCallee;.placeholder:()V")
+    (return-void)
+  ))",
+             .edit = [](DexMethod* callee) {
+               std::vector<std::unique_ptr<DexEncodedValue>> args;
+               args.push_back(std::make_unique<DexEncodedValueMethodHandle>(
+                   redex::make_method_handle(METHOD_HANDLE_TYPE_INVOKE_STATIC,
+                                             "LOther;.m:()V")));
+               redex::make_invoke_custom(callee->get_code(), "run", "()V",
+                                         std::move(args));
+             }}));
+}
+
+// A force-inline callee skips the inliner's later reference check, so the
+// cross-store check alone must refuse it.
+TEST_F(MethodInlineTest, cross_store_force_inline_method_type_is_not_inlined) {
+  EXPECT_FALSE(
+      inlines_across_stores(conf, {.code = R"((
+    (const-method-type "(LOther;)V")
+    (move-result-pseudo-object v0)
+    (return-void)
+  ))",
+                                   .force_inline_with_min_sdk_api = true}));
+}
+
+namespace {
+
+// Returns whether the static method `LFoo;.callee:()V`, whose body is `code`,
+// is inlined into `LBar;.caller:()V`. `edit` runs on the callee before the
+// CFGs are built. `LFoo;` extends `LBase;`; `LBase;` has the public virtual
+// method `run`, and `LFoo;` has the public virtual method `own` and the private
+// instance method `helper`.
+bool inlines_into_other_class(
+    const ConfigFiles& conf,
+    const std::string& code,
+    const std::function<void(DexMethod*)>& edit = {}) {
+  auto make_method = [](const char* name, DexAccessFlags access,
+                        bool is_virtual) {
+    return DexMethod::make_method(name)->make_concrete(
+        access, assembler::ircode_from_string(R"((
+          (load-param-object v0)
+          (return-void)
+        ))"),
+        is_virtual);
+  };
+  auto* base_cls = create_a_class("LBase;");
+  base_cls->add_method(make_method("LBase;.run:()V", ACC_PUBLIC, true));
+  ClassCreator foo_creator(DexType::make_type("LFoo;"));
+  foo_creator.set_super(base_cls->get_type());
+  foo_creator.add_method(make_method("LFoo;.own:()V", ACC_PUBLIC, true));
+  foo_creator.add_method(make_method("LFoo;.helper:()V", ACC_PRIVATE, false));
+  auto* callee = DexMethod::make_method("LFoo;.callee:()V")
+                     ->make_concrete(ACC_PUBLIC | ACC_STATIC,
+                                     assembler::ircode_from_string(code),
+                                     /* is_virtual */ false);
+  foo_creator.add_method(callee);
+  auto* foo_cls = foo_creator.create();
+  auto* bar_cls = create_a_class("LBar;");
+  bar_cls->add_method(DexMethod::make_method("LBar;.caller:()V")
+                          ->make_concrete(ACC_PUBLIC | ACC_STATIC,
+                                          assembler::ircode_from_string(R"((
+                            (invoke-static () "LFoo;.callee:()V")
+                            (return-void)
+                          ))"),
+                                          /* is_virtual */ false));
+  auto* boot_cls = create_a_class("LBoot;");
+  if (edit) {
+    edit(callee);
+  }
+
+  DexStoresVector stores;
+  DexStore store("classes");
+  store.add_classes({base_cls, foo_cls, bar_cls, boot_cls});
+  stores.push_back(std::move(store));
+  auto scope = build_class_scope(stores);
+  walk::code(scope, [](auto*, IRCode& code) { code.build_cfg(); });
+  api::LevelChecker::init(0, scope);
+
+  inliner::InlinerConfig inliner_config;
+  inliner_config.populate(scope);
+  init_classes::InitClassesWithSideEffects init_classes_with_side_effects(
+      scope, /* create_init_class_insns */ false);
+  UnorderedSet<DexMethod*> candidates{callee};
+  ConcurrentMethodResolverDeprecated concurrent_method_resolver;
+  MultiMethodInliner inliner(
+      scope, init_classes_with_side_effects, stores, conf, candidates,
+      std::ref(concurrent_method_resolver), inliner_config, /* min_sdk */ 0,
+      InterDex, /* true_virtual_callers */ {}, /* inline_for_speed */ nullptr,
+      /* analyze_and_prune_inits */ false, /* configured_pure_methods */ {});
+  inliner.inline_methods();
+  return inliner.get_inlined().count(callee) != 0;
+}
+
+} // namespace
+
+// What an invoke-direct handle of a method that is not private runs depends on
+// the class that holds it (see `resolve_method_handle`).
+TEST_F(MethodInlineTest, nonvirtual_method_handle_is_not_inlined) {
+  EXPECT_FALSE(inlines_into_other_class(conf, R"((
+    (const-method-handle invoke-direct "LBase;.run:()V")
+    (move-result-pseudo-object v0)
+    (return-void)
+  ))"));
+}
+
+// An invoke-direct handle of a method that the holding class declares and
+// that is not private calls that method itself; held by another class it would
+// run that class's implementation.
+TEST_F(MethodInlineTest,
+       method_handle_of_own_non_private_method_is_not_inlined) {
+  EXPECT_FALSE(inlines_into_other_class(conf, R"((
+    (const-method-handle invoke-direct "LFoo;.own:()V")
+    (move-result-pseudo-object v0)
+    (return-void)
+  ))"));
+}
+
+// The same holds for a handle among the bootstrap arguments of a call site.
+TEST_F(MethodInlineTest, nonvirtual_method_handle_of_call_site_is_not_inlined) {
+  EXPECT_FALSE(inlines_into_other_class(
+      conf,
+      R"((
+    (invoke-static () "LFoo;.placeholder:()V")
+    (return-void)
+  ))",
+      [](DexMethod* callee) {
+        std::vector<std::unique_ptr<DexEncodedValue>> args;
+        args.push_back(std::make_unique<DexEncodedValueMethodHandle>(
+            redex::make_method_handle(METHOD_HANDLE_TYPE_INVOKE_DIRECT,
+                                      "LBase;.run:()V")));
+        redex::make_invoke_custom(callee->get_code(), "run", "()V",
+                                  std::move(args));
+      }));
+}
+
+// As for an invoke-virtual, the access of a method that does not resolve is
+// unknown.
+TEST_F(MethodInlineTest, method_handle_of_unknown_virtual_is_not_inlined) {
+  EXPECT_FALSE(inlines_into_other_class(conf, R"((
+    (const-method-handle invoke-instance "LUnknown;.m:()V")
+    (move-result-pseudo-object v0)
+    (return-void)
+  ))"));
+}
+
+// As for an sget, the access of a field that does not resolve is unknown.
+TEST_F(MethodInlineTest, method_handle_of_unknown_field_is_not_inlined) {
+  EXPECT_FALSE(inlines_into_other_class(conf, R"((
+    (const-method-handle static-get "LUnknown;.f:I")
+    (move-result-pseudo-object v0)
+    (return-void)
+  ))"));
+}
+
+// A handle that code may hold in any class does not keep its code in place.
+TEST_F(MethodInlineTest, method_handle_of_public_virtual_is_inlined) {
+  EXPECT_TRUE(inlines_into_other_class(conf, R"((
+    (const-method-handle invoke-instance "LBase;.run:()V")
+    (move-result-pseudo-object v0)
+    (return-void)
+  ))"));
+}
+
+// Inlining into `LBar;` would make the private instance method `helper`
+// public and static, which an invoke-direct handle cannot call, so the callee
+// stays in its class.
+TEST_F(MethodInlineTest, method_handle_of_private_method_is_not_inlined) {
+  EXPECT_FALSE(inlines_into_other_class(conf, R"((
+    (const-method-handle invoke-direct "LFoo;.helper:()V")
+    (move-result-pseudo-object v0)
+    (return-void)
+  ))"));
+  EXPECT_TRUE(is_private(DexMethod::get_method("LFoo;.helper:()V")->as_def()));
+}
+
+// Inlining `LFoo;.callee` into `LBar;` would make the private method
+// `helper`, which it calls, public and static, so a method handle of `helper`
+// elsewhere, here in a static field value, would no longer fit it. The callee
+// stays in its class.
+TEST_F(MethodInlineTest,
+       private_method_that_a_static_value_handle_names_is_not_made_static) {
+  EXPECT_FALSE(inlines_into_other_class(
+      conf,
+      R"((
+    (new-instance "LFoo;")
+    (move-result-pseudo-object v0)
+    (invoke-direct (v0) "LFoo;.helper:()V")
+    (return-void)
+  ))",
+      [&](DexMethod* callee) {
+        auto* field =
+            DexField::make_field("LFoo;.HANDLE:Ljava/lang/invoke/MethodHandle;")
+                ->make_concrete(ACC_PUBLIC | ACC_STATIC | ACC_FINAL,
+                                std::make_unique<DexEncodedValueMethodHandle>(
+                                    redex::make_method_handle(
+                                        METHOD_HANDLE_TYPE_INVOKE_DIRECT,
+                                        "LFoo;.helper:()V")));
+        type_class(callee->get_class())->add_field(field);
+      }));
+  EXPECT_TRUE(is_private(DexMethod::get_method("LFoo;.helper:()V")->as_def()));
+}
+
+// The same holds for a handle of any kind in other code.
+TEST_F(MethodInlineTest,
+       private_method_that_a_handle_in_other_code_names_is_not_made_static) {
+  EXPECT_FALSE(inlines_into_other_class(
+      conf,
+      R"((
+    (new-instance "LFoo;")
+    (move-result-pseudo-object v0)
+    (invoke-direct (v0) "LFoo;.helper:()V")
+    (return-void)
+  ))",
+      [&](DexMethod* callee) {
+        type_class(callee->get_class())
+            ->add_method(DexMethod::make_method("LFoo;.other:()V")
+                             ->make_concrete(ACC_PUBLIC | ACC_STATIC,
+                                             assembler::ircode_from_string(R"((
+                (const-method-handle invoke-instance "LFoo;.helper:()V")
+                (move-result-pseudo-object v0)
+                (return-void)
+              ))"),
+                                             /* is_virtual */ false));
+      }));
+  EXPECT_TRUE(is_private(DexMethod::get_method("LFoo;.helper:()V")->as_def()));
+}
+
+// Without method handles, inlining makes `helper` public and static.
+TEST_F(MethodInlineTest, private_method_without_handles_is_made_static) {
+  EXPECT_TRUE(inlines_into_other_class(conf, R"((
+    (new-instance "LFoo;")
+    (move-result-pseudo-object v0)
+    (invoke-direct (v0) "LFoo;.helper:()V")
+    (return-void)
+  ))"));
+  auto* helper = DexMethod::get_method("LFoo;.helper:(LFoo;)V");
+  ASSERT_NE(helper, nullptr);
+  EXPECT_TRUE(is_static(helper->as_def()));
+}
+
+TEST_F(MethodInlineTest,
+       call_site_method_handle_of_private_method_is_not_inlined) {
+  EXPECT_FALSE(inlines_into_other_class(
+      conf,
+      R"((
+    (invoke-static () "LFoo;.placeholder:()V")
+    (return-void)
+  ))",
+      [](DexMethod* callee) {
+        std::vector<std::unique_ptr<DexEncodedValue>> args;
+        args.push_back(std::make_unique<DexEncodedValueMethodHandle>(
+            redex::make_method_handle(METHOD_HANDLE_TYPE_INVOKE_DIRECT,
+                                      "LFoo;.helper:()V")));
+        redex::make_invoke_custom(callee->get_code(), "run", "()V",
+                                  std::move(args));
+      }));
+  EXPECT_TRUE(is_private(DexMethod::get_method("LFoo;.helper:()V")->as_def()));
+}
+
+// The bootstrap method of an invoke-custom receives a lookup in the class of
+// the code that holds it, so the callee stays in its class.
+TEST_F(MethodInlineTest, invoke_custom_is_not_inlined) {
+  EXPECT_FALSE(inlines_into_other_class(conf,
+                                        R"((
+    (invoke-static () "LFoo;.placeholder:()V")
+    (return-void)
+  ))",
+                                        [](DexMethod* callee) {
+                                          redex::make_invoke_custom(
+                                              callee->get_code(), "run", "()V");
+                                        }));
+}
+
+// An inlined method that a method handle (tool-generated here) still calls
+// must not be deleted: the handle would no longer link.
+TEST_F(MethodInlineTest, delete_methods_keeps_method_handle_target) {
+  auto* foo_cls = create_a_class("LFoo;");
+  auto* helper = DexMethod::make_method("LFoo;.helper:(I)V")
+                     ->make_concrete(ACC_PUBLIC | ACC_STATIC,
+                                     assembler::ircode_from_string(R"((
+                                       (load-param v0)
+                                       (return-void)
+                                     ))"),
+                                     /* is_virtual */ false);
+  foo_cls->add_method(helper);
+  auto* bar_cls = create_a_class("LBar;");
+  bar_cls->add_method(DexMethod::make_method("LBar;.run:()V")
+                          ->make_concrete(ACC_PUBLIC | ACC_STATIC,
+                                          assembler::ircode_from_string(R"((
+                            (const-method-handle invoke-static "LFoo;.helper:(I)V")
+                            (move-result-pseudo-object v0)
+                            (const v1 7)
+                            (invoke-polymorphic (v0 v1) "Ljava/lang/invoke/MethodHandle;.invokeExact:([Ljava/lang/Object;)Ljava/lang/Object;" "(I)V")
+                            (return-void)
+                          ))"),
+                                          /* is_virtual */ false));
+  Scope scope{foo_cls, bar_cls};
+  walk::code(scope, [](auto*, IRCode& code) { code.build_cfg(); });
+
+  UnorderedSet<DexMethod*> removable{helper};
+  ConcurrentMethodResolverDeprecated concurrent_method_resolver;
+  auto deleted =
+      delete_methods(scope, removable, std::ref(concurrent_method_resolver));
+  EXPECT_TRUE(deleted.empty());
+  EXPECT_EQ(foo_cls->get_dmethods().size(), 1);
 }

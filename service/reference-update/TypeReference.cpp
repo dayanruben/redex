@@ -9,6 +9,7 @@
 
 #include "ControlFlow.h"
 #include "Debug.h"
+#include "MethodHandleRewriter.h"
 #include "MethodReference.h"
 #include "Resolver.h"
 #include "Show.h"
@@ -202,6 +203,57 @@ namespace type_reference {
 
 namespace {
 
+// `type` with its type, or element type, replaced if `old_to_new` maps it.
+template <typename MapT>
+DexType* get_new_type_impl(const DexType* type, const MapT& old_to_new) {
+  auto it = old_to_new.find(
+      const_cast<DexType*>(type::make_element_type_if_array(type)));
+  if (it == old_to_new.end()) {
+    return const_cast<DexType*>(type);
+  }
+  return type::make_array_type(it->second, type::get_array_level(type));
+}
+
+// `proto` with every type that `old_to_new` maps, or an array of it, replaced.
+template <typename MapT>
+DexProto* get_new_proto_impl(const DexProto* proto, const MapT& old_to_new) {
+  auto convert = [&](const DexType* type) {
+    return get_new_type_impl(type, old_to_new);
+  };
+  DexTypeList::ContainerType args;
+  for (const auto* arg : *proto->get_args()) {
+    args.push_back(convert(arg));
+  }
+  return DexProto::make_proto(convert(proto->get_rtype()),
+                              DexTypeList::make_type_list(std::move(args)));
+}
+
+/**
+ * Replaces by `new_proto(proto)` each prototype that the classes in `scope`
+ * name other than through a method reference: that of const-method-type, the
+ * call-site prototype of invoke-polymorphic, the method type and method-type
+ * arguments of a call site, and the method types that static field values and
+ * annotations hold. They describe the methods being called or looked up, so
+ * they must change together with those methods' prototypes.
+ */
+template <typename NewProtoFn>
+void update_named_protos(const Scope& scope, const NewProtoFn& new_proto) {
+  MethodHandleRewriter method_type_rewriter(
+      {.method_type = [&](DexProto* proto) { return new_proto(proto); }});
+  walk::parallel::opcodes(scope, [&](DexMethod* method, IRInstruction* insn) {
+    if (insn->has_proto()) {
+      insn->set_proto(new_proto(insn->get_proto()));
+    } else if (insn->has_signature_polymorphic()) {
+      insn->set_signature_polymorphic(
+          insn->get_signature_polymorphic()->method(),
+          new_proto(insn->get_callsite_proto()));
+    } else {
+      method_type_rewriter.rewrite(insn, method);
+    }
+  });
+  method_type_rewriter.rewrite(scope);
+}
+
 template <typename MapT>
 class TypeRefUpdaterImpl {
  public:
@@ -227,30 +279,33 @@ class TypeRefUpdaterImpl {
     ConcurrentSet<DexMethodRef*> methods;
     ConcurrentSet<DexFieldRef*> fields;
     walk::parallel::code(scope, [&](DexMethod* /*method*/, IRCode& code) {
+      std::vector<DexFieldRef*> code_fields;
+      std::vector<DexMethodRef*> code_methods;
       if (code.cfg_built()) {
         for (auto& mie : InstructionIterable(code.cfg())) {
-          auto* insn = mie.insn;
-          if (insn->has_field()) {
-            fields.insert(insn->get_field());
-          } else if (insn->has_method()) {
-            methods.insert(insn->get_method());
-          }
+          mie.insn->gather_fields(code_fields);
+          mie.insn->gather_methods(code_methods);
         }
       } else {
         for (auto& mie : InstructionIterable(code)) {
-          auto* insn = mie.insn;
-          if (insn->has_field()) {
-            fields.insert(insn->get_field());
-          } else if (insn->has_method()) {
-            methods.insert(insn->get_method());
-          }
+          mie.insn->gather_fields(code_fields);
+          mie.insn->gather_methods(code_methods);
         }
+      }
+      for (auto* field : code_fields) {
+        fields.insert(field);
+      }
+      for (auto* method : code_methods) {
+        methods.insert(method);
       }
     });
     workqueue_run<DexFieldRef*>([this](DexFieldRef* field) { mangling(field); },
                                 fields);
     workqueue_run<DexMethodRef*>(
         [this](DexMethodRef* method) { mangling(method); }, methods);
+    update_named_protos(scope, [this](const DexProto* proto) {
+      return get_new_proto_impl(proto, m_old_to_new);
+    });
 
     std::map<DexMethod*, DexProto*, dexmethods_comparator> inits;
     insert_unordered_iterable(inits, m_inits);
@@ -447,57 +502,19 @@ bool proto_has_reference_to(const DexProto* proto,
 DexProto* get_new_proto(
     const DexProto* proto,
     const UnorderedMap<const DexType*, DexType*>& old_to_new) {
-  const auto* rtype = type::make_element_type_if_array(proto->get_rtype());
-  if (old_to_new.count(rtype) > 0) {
-    auto* merger_type = old_to_new.at(rtype);
-    auto level = type::get_array_level(proto->get_rtype());
-    rtype = type::make_array_type(merger_type, level);
-  } else {
-    rtype = proto->get_rtype();
-  }
-  DexTypeList::ContainerType lst;
-  for (const auto* const arg_type : *proto->get_args()) {
-    const auto* extracted_arg_type = type::make_element_type_if_array(arg_type);
-    if (old_to_new.count(extracted_arg_type) > 0) {
-      auto* merger_type = old_to_new.at(extracted_arg_type);
-      auto level = type::get_array_level(arg_type);
-      auto* new_arg_type = type::make_array_type(merger_type, level);
-      lst.push_back(new_arg_type);
-    } else {
-      lst.push_back(arg_type);
-    }
-  }
-
-  return DexProto::make_proto(const_cast<DexType*>(rtype),
-                              DexTypeList::make_type_list(std::move(lst)));
+  return get_new_proto_impl(proto, old_to_new);
 }
 
 DexProto* get_new_proto(
     const DexProto* proto,
     const UnorderedMap<const DexType*, const DexType*>& old_to_new) {
-  const auto* rtype = type::make_element_type_if_array(proto->get_rtype());
-  if (old_to_new.count(rtype) > 0) {
-    const auto* merger_type = old_to_new.at(rtype);
-    auto level = type::get_array_level(proto->get_rtype());
-    rtype = type::make_array_type(merger_type, level);
-  } else {
-    rtype = proto->get_rtype();
-  }
-  DexTypeList::ContainerType lst;
-  for (const auto* const arg_type : *proto->get_args()) {
-    const auto* extracted_arg_type = type::make_element_type_if_array(arg_type);
-    if (old_to_new.count(extracted_arg_type) > 0) {
-      const auto* merger_type = old_to_new.at(extracted_arg_type);
-      auto level = type::get_array_level(arg_type);
-      auto* new_arg_type = type::make_array_type(merger_type, level);
-      lst.push_back(new_arg_type);
-    } else {
-      lst.push_back(arg_type);
-    }
-  }
+  return get_new_proto_impl(proto, old_to_new);
+}
 
-  return DexProto::make_proto(const_cast<DexType*>(rtype),
-                              DexTypeList::make_type_list(std::move(lst)));
+DexType* get_new_type(
+    const DexType* type,
+    const UnorderedMap<const DexType*, DexType*>& old_to_new) {
+  return get_new_type_impl(type, old_to_new);
 }
 
 void update_method_signature_type_references(
@@ -567,32 +584,32 @@ void update_method_signature_type_references(
     update_vmethods_group_one_type_ref(group, subtype_maps);
   }
 
+  update_named_protos(scope, [&old_to_new](const DexProto* proto) {
+    return get_new_proto(proto, old_to_new);
+  });
+
   // Ensure that no method references left that still refer old types.
   walk::parallel::code(scope, [&old_types](DexMethod*, IRCode& code) {
+    std::vector<DexMethodRef*> methods;
+    auto check = [&](const IRInstruction* insn) {
+      methods.clear();
+      insn->gather_methods(methods);
+      for (const auto* method : methods) {
+        always_assert_log(
+            !proto_has_reference_to(method->get_proto(), old_types),
+            "Find old type in method reference %s, please make sure that "
+            "ReBindRefsPass is enabled before the crashed pass.\n",
+            SHOW(insn));
+      }
+    };
     if (code.cfg_built()) {
       auto& cfg = code.cfg();
       for (auto& mie : InstructionIterable(cfg)) {
-        auto* insn = mie.insn;
-        if (insn->has_method()) {
-          auto* proto = insn->get_method()->get_proto();
-          always_assert_log(
-              !proto_has_reference_to(proto, old_types),
-              "Find old type in method reference %s, please make sure that "
-              "ReBindRefsPass is enabled before the crashed pass.\n",
-              SHOW(insn));
-        }
+        check(mie.insn);
       }
     } else {
       for (auto& mie : InstructionIterable(code)) {
-        auto* insn = mie.insn;
-        if (insn->has_method()) {
-          auto* proto = insn->get_method()->get_proto();
-          always_assert_log(
-              !proto_has_reference_to(proto, old_types),
-              "Find old type in method reference %s, please make sure that "
-              "ReBindRefsPass is enabled before the crashed pass.\n",
-              SHOW(insn));
-        }
+        check(mie.insn);
       }
     }
   });
@@ -619,32 +636,28 @@ void update_field_type_references(
   walk::parallel::fields(scope, update_field);
 
   walk::parallel::code(scope, [&old_to_new](DexMethod*, IRCode& code) {
+    std::vector<DexFieldRef*> fields;
+    auto check = [&](const IRInstruction* insn) {
+      fields.clear();
+      insn->gather_fields(fields);
+      for (const auto* field : fields) {
+        const auto* const type =
+            type::make_element_type_if_array(field->get_type());
+        always_assert_log(
+            old_to_new.count(type) == 0,
+            "Find old type in field reference %s, please make sure that "
+            "ReBindRefsPass is enabled before ClassMergingPass\n",
+            SHOW(insn));
+      }
+    };
     if (code.cfg_built()) {
       auto& cfg = code.cfg();
       for (auto& mie : InstructionIterable(cfg)) {
-        auto* insn = mie.insn;
-        if (insn->has_field()) {
-          auto* const ref_type = insn->get_field()->get_type();
-          const auto* const type = type::make_element_type_if_array(ref_type);
-          always_assert_log(
-              old_to_new.count(type) == 0,
-              "Find old type in field reference %s, please make sure that "
-              "ReBindRefsPass is enabled before ClassMergingPass\n",
-              SHOW(insn));
-        }
+        check(mie.insn);
       }
     } else {
       for (auto& mie : InstructionIterable(code)) {
-        auto* insn = mie.insn;
-        if (insn->has_field()) {
-          auto* const ref_type = insn->get_field()->get_type();
-          const auto* const type = type::make_element_type_if_array(ref_type);
-          always_assert_log(
-              old_to_new.count(type) == 0,
-              "Find old type in field reference %s, please make sure that "
-              "ReBindRefsPass is enabled before ClassMergingPass\n",
-              SHOW(insn));
-        }
+        check(mie.insn);
       }
     }
   });
@@ -764,6 +777,25 @@ void fix_colliding_dmethods(
       method_reference::patch_callsite(callsite, new_callee);
     }
   });
+}
+
+void gather_types_pinned_by_method_handle(const DexMethodHandle* method_handle,
+                                          std::vector<const DexType*>& types) {
+  if (!DexMethodHandle::isInvokeType(method_handle->type())) {
+    return;
+  }
+  auto* method_ref = method_handle->methodref();
+  if (!method::is_init(method_ref)) {
+    auto* method = method_ref->as_def();
+    if (method == nullptr || method->is_virtual() || can_rename(method)) {
+      return;
+    }
+  }
+  const auto* proto = method_ref->get_proto();
+  types.push_back(type::make_element_type_if_array(proto->get_rtype()));
+  for (const auto* arg : *proto->get_args()) {
+    types.push_back(type::make_element_type_if_array(arg));
+  }
 }
 
 } // namespace type_reference

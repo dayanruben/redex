@@ -19,6 +19,9 @@
 #include <cstring>
 #include <iterator>
 
+static_assert(sizeof(void*) != 8 || sizeof(IRInstruction) == 32,
+              "IRInstruction is laid out to take 32 bytes");
+
 IRInstruction::IRInstruction(IROpcode op) : m_opcode(op) {
   auto count = opcode_impl::min_srcs_size(op);
   m_num_srcs = count;
@@ -287,31 +290,58 @@ uint16_t IRInstruction::size() const {
       5, /* FMT_f51l   */
       4, /* FMT_f41c_d */
       4, /* FMT_f41c_s */
+      4, /* FMT_f45cc  */
+      4, /* FMT_f4rcc  */
       5, /* FMT_f52c_d */
       5, /* FMT_f52c_s */
       5, /* FMT_f5rc */
       5, /* FMT_f57c */
       0, /* FMT_fopcode   */
   };
+  static_assert(std::size(args) == FMT_fopcode + 1,
+                "one size for each instruction format");
   return args[dex_opcode::format(opcode::to_dex_opcode(op))];
 }
 
-// The instruction format doesn't tell us the width of registers for invoke
-// so we inspect the signature of the method we're calling
-bool IRInstruction::invoke_src_is_wide(src_index_t i) const {
-  always_assert(has_method());
+DexProto* IRInstruction::get_callsite_proto() const {
+  always_assert(opcode::is_an_invoke(m_opcode));
+  if (has_callsite()) {
+    always_assert(m_callsite != nullptr);
+    return m_callsite->method_type();
+  }
+  if (has_signature_polymorphic()) {
+    always_assert(m_signature_polymorphic != nullptr);
+    return m_signature_polymorphic->callsite_proto();
+  }
+  always_assert(m_method != nullptr);
+  return m_method->get_proto();
+}
 
-  // virtual methods have `this` as the 0th register argument, but the
-  // arg list does NOT include `this`
-  if (!opcode::is_invoke_static(m_opcode)) {
+const DexType* IRInstruction::get_invoke_src_type(src_index_t i) const {
+  // The call-site prototype does not list the receiver.
+  if (invoke_has_receiver()) {
     if (i == 0) {
-      // reference to `this`. References are never wide
-      return false;
+      return has_signature_polymorphic()
+                 ? m_signature_polymorphic->method()->get_class()
+                 : get_method()->get_class();
     }
     --i;
   }
+  const auto* args = get_callsite_proto()->get_args();
+  always_assert_log(i < args->size(), "No argument %u in %s",
+                    static_cast<unsigned>(i), SHOW(this));
+  return args->at(i);
+}
 
-  return type::is_wide_type(m_method->get_proto()->get_args()->at(i));
+size_t IRInstruction::invoke_srcs_size() const {
+  return (invoke_has_receiver() ? 1 : 0) +
+         get_callsite_proto()->get_args()->size();
+}
+
+// The instruction format doesn't tell us the width of registers for invoke
+// so we inspect the prototype of the call site
+bool IRInstruction::invoke_src_is_wide(src_index_t i) const {
+  return type::is_wide_type(get_invoke_src_type(i));
 }
 
 bool IRInstruction::src_is_wide(src_index_t i) const {
@@ -374,10 +404,10 @@ bool IRInstruction::src_is_wide(src_index_t i) const {
 
 bool IRInstruction::normalize_registers(std::string* error_msg) {
   if (opcode::is_an_invoke(opcode())) {
-    auto* args = get_method()->get_proto()->get_args();
+    auto* args = get_callsite_proto()->get_args();
     size_t old_srcs_idx{0};
     size_t srcs_idx{0};
-    if (m_opcode != OPCODE_INVOKE_STATIC) {
+    if (invoke_has_receiver()) {
       ++srcs_idx;
       ++old_srcs_idx;
     }
@@ -404,7 +434,7 @@ bool IRInstruction::normalize_registers(std::string* error_msg) {
 
 void IRInstruction::denormalize_registers() {
   if (opcode::is_an_invoke(m_opcode)) {
-    auto* args = get_method()->get_proto()->get_args();
+    auto* args = get_callsite_proto()->get_args();
     bool has_wide = false;
     for (const auto& arg : *args) {
       if (type::is_wide_type(arg)) {
@@ -419,7 +449,7 @@ void IRInstruction::denormalize_registers() {
     std::vector<reg_t> srcs;
     size_t args_idx{0};
     size_t srcs_idx{0};
-    if (m_opcode != OPCODE_INVOKE_STATIC) {
+    if (invoke_has_receiver()) {
       srcs.push_back(src(srcs_idx++));
     }
     for (; args_idx < args->size(); ++args_idx, ++srcs_idx) {
@@ -495,6 +525,7 @@ uint64_t IRInstruction::hash() const {
   case opcode::Ref::MethodHandle:
   case opcode::Ref::Field:
   case opcode::Ref::Method:
+  case opcode::Ref::SignaturePolymorphic:
   case opcode::Ref::Literal:
   case opcode::Ref::String:
   case opcode::Ref::Type: {
@@ -522,9 +553,6 @@ void IRInstruction::gather_types(std::vector<const DexType*>& ltype) const {
   case opcode::Ref::String:
   case opcode::Ref::Literal:
   case opcode::Ref::Data:
-  case opcode::Ref::CallSite:
-  case opcode::Ref::MethodHandle:
-  case opcode::Ref::Proto:
     break;
 
   case opcode::Ref::Type:
@@ -537,6 +565,34 @@ void IRInstruction::gather_types(std::vector<const DexType*>& ltype) const {
 
   case opcode::Ref::Method:
     m_method->gather_types_shallow(ltype);
+    break;
+
+  case opcode::Ref::SignaturePolymorphic:
+    m_signature_polymorphic->method()->gather_types_shallow(ltype);
+    get_callsite_proto()->gather_types(ltype);
+    break;
+
+  case opcode::Ref::CallSite:
+    m_callsite->gather_types(ltype);
+    [[fallthrough]];
+  case opcode::Ref::MethodHandle: {
+    // The methods and fields that the call site or method handle refers to
+    // contribute their types as a method or field reference does.
+    std::vector<DexMethodRef*> methods;
+    gather_methods(methods);
+    for (const auto* method : methods) {
+      method->gather_types_shallow(ltype);
+    }
+    std::vector<DexFieldRef*> fields;
+    gather_fields(fields);
+    for (const auto* field : fields) {
+      field->gather_types_shallow(ltype);
+    }
+    break;
+  }
+
+  case opcode::Ref::Proto:
+    m_proto->gather_types(ltype);
     break;
   }
 }
@@ -556,6 +612,9 @@ void IRInstruction::gather_fields(std::vector<DexFieldRef*>& lfield) const {
 void IRInstruction::gather_methods(std::vector<DexMethodRef*>& lmethod) const {
   if (has_method()) {
     lmethod.push_back(m_method);
+  }
+  if (has_signature_polymorphic()) {
+    lmethod.push_back(m_signature_polymorphic->method());
   }
   if (has_callsite()) {
     m_callsite->gather_methods(lmethod);

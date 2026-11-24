@@ -146,14 +146,20 @@ OP(SPUT_BYTE         , sput_byte         , Ref::Field, "sput-byte")
 OP(SPUT_CHAR         , sput_char         , Ref::Field, "sput-char")
 OP(SPUT_SHORT        , sput_short        , Ref::Field, "sput-short")
 
-OPRANGE(an_invoke, OPCODE_INVOKE_VIRTUAL, OPCODE_INVOKE_INTERFACE)
+// All seven invokes. The five in a_method_invoke call the method that their
+// method reference names; invoke-polymorphic and invoke-custom call a target
+// that a method handle or a call site supplies.
+OPRANGE(an_invoke      , OPCODE_INVOKE_VIRTUAL, OPCODE_INVOKE_CUSTOM)
+OPRANGE(a_method_invoke, OPCODE_INVOKE_VIRTUAL, OPCODE_INVOKE_INTERFACE)
 OP(INVOKE_VIRTUAL    , invoke_virtual    , Ref::Method, "invoke-virtual")
 OP(INVOKE_SUPER      , invoke_super      , Ref::Method, "invoke-super")
 OP(INVOKE_DIRECT     , invoke_direct     , Ref::Method, "invoke-direct")
 OP(INVOKE_STATIC     , invoke_static     , Ref::Method, "invoke-static")
 OP(INVOKE_INTERFACE  , invoke_interface  , Ref::Method, "invoke-interface")
 
-OP(INVOKE_POLYMORPHIC, invoke_polymorphic, Ref::Method, "invoke-polymorphic")
+// Calls through a method handle or a call site, which name no callee method.
+OPRANGE(a_dynamic_invoke, OPCODE_INVOKE_POLYMORPHIC, OPCODE_INVOKE_CUSTOM)
+OP(INVOKE_POLYMORPHIC, invoke_polymorphic, Ref::SignaturePolymorphic, "invoke-polymorphic")
 OP(INVOKE_CUSTOM     , invoke_custom     , Ref::CallSite, "invoke-custom")
 OP(NEG_INT           , neg_int           , Ref::None, "neg-int")
 OP(NOT_INT           , not_int           , Ref::None, "not-int")

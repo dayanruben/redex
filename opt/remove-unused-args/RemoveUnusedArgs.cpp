@@ -94,7 +94,7 @@ void RemoveArgs::gather_results_used() {
         auto ii = InstructionIterable(cfg);
         for (auto it = ii.begin(); it != ii.end(); ++it) {
           auto* insn = it->insn;
-          if (!opcode::is_an_invoke(insn->opcode())) {
+          if (!opcode::is_a_method_invoke(insn->opcode())) {
             continue;
           }
           auto move_result = cfg.move_result_of(it);
@@ -170,11 +170,11 @@ void RemoveArgs::compute_reordered_protos(const mog::Graph& override_graph) {
   };
   walk::parallel::methods(
       m_scope,
-      [&override_graph, &record_fixed_proto,
+      [this, &override_graph, &record_fixed_proto,
        &defined_protos](DexMethod* caller) {
         auto* caller_proto = caller->get_proto();
         defined_protos.insert(caller_proto);
-        if (!method::can_change_signature(caller) ||
+        if (!can_change_signature(caller) ||
             has_any_parameter_annotation(caller)) {
           record_fixed_proto(caller_proto, 1);
         } else if (caller->is_virtual()) {
@@ -379,6 +379,15 @@ std::deque<uint16_t> live_args(const DexMethod* method,
   return live_args;
 }
 
+/**
+ * Whether the definition of `method` allows changing its signature, and no
+ * method handle fixes its prototype.
+ */
+bool RemoveArgs::can_change_signature(const DexMethod* method) const {
+  return method::can_change_signature(method) &&
+         m_methods_named_by_method_handles.count(method) == 0;
+}
+
 bool RemoveArgs::compute_remove_result(const DexMethod* method) {
   auto* proto = method->get_proto();
   return !proto->is_void() && (m_result_used.count_unsafe(method) == 0u);
@@ -578,7 +587,7 @@ void RemoveArgs::gather_updated_entries(
         // this method.
         for (const auto* m : UnorderedIterable(kvp->second)) {
           // If we can't edit, just skip
-          if (!method::can_change_signature(m) ||
+          if (!can_change_signature(m) ||
               has_any_annotation(m, no_devirtualize_annos) ||
               has_any_parameter_annotation(m)) {
             return;
@@ -864,7 +873,7 @@ std::pair<size_t, LocalDce::Stats> RemoveArgs::update_callsites() {
         size_t callsite_args_removed = 0;
         for (const auto& mie : InstructionIterable(cfg)) {
           auto* insn = mie.insn;
-          if (opcode::is_an_invoke(insn->opcode())) {
+          if (opcode::is_a_method_invoke(insn->opcode())) {
             size_t insn_args_removed = update_callsite(insn);
             if (insn_args_removed > 0) {
               log_opt(CALLSITE_ARGS_REMOVED, method, insn);

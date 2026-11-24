@@ -11,6 +11,8 @@
 #include <gtest/gtest.h>
 
 #include "Creators.h"
+#include "DexCallSite.h"
+#include "DexMethodHandle.h"
 #include "IRAssembler.h"
 #include "MethodOverrideGraph.h"
 #include "RedexTest.h"
@@ -55,7 +57,7 @@ TEST_F(LocalPointersTest, domainOperations) {
 ptrs::InvokeToSummaryMap mark_all_invokes_as_non_escaping(const IRCode& code) {
   ptrs::InvokeToSummaryMap invoke_to_summary_map;
   for (const auto& mie : InstructionIterable(code.cfg())) {
-    if (opcode::is_an_invoke(mie.insn->opcode())) {
+    if (opcode::is_a_method_invoke(mie.insn->opcode())) {
       ptrs::ParamSet returned_params;
       if (!type::is_primitive(
               mie.insn->get_method()->get_proto()->get_rtype())) {
@@ -172,6 +174,102 @@ TEST_F(LocalPointersTest, filledNewArrayEscape) {
             *(IRInstruction(OPCODE_NEW_INSTANCE)
                   .set_type(DexType::get_type("LFoo;"))));
   EXPECT_TRUE(exit_env.may_have_escaped(foo_ptr));
+}
+
+TEST_F(LocalPointersTest, invokePolymorphicArgumentsEscape) {
+  auto code = assembler::ircode_from_string(R"(
+    (
+     (load-param-object v1)
+     (new-instance "LFoo;")
+     (move-result-pseudo-object v0)
+     (invoke-polymorphic (v1 v0) "Ljava/lang/invoke/MethodHandle;.invoke:([Ljava/lang/Object;)Ljava/lang/Object;" "(LFoo;)Ljava/lang/Object;")
+     (move-result-object v2)
+     (return-object v0)
+    )
+  )");
+
+  code->build_cfg();
+  auto& cfg = code->cfg();
+  cfg.calculate_exit_block();
+
+  ptrs::FixpointIterator fp_iter(cfg);
+  fp_iter.run(ptrs::Environment());
+
+  const auto& exit_env = fp_iter.get_exit_state_at(cfg.exit_block());
+  const auto& foo_ptr_set = exit_env.get_pointers(0);
+  ASSERT_EQ(foo_ptr_set.size(), 1);
+  EXPECT_TRUE(exit_env.may_have_escaped(*foo_ptr_set.elements().begin()));
+}
+
+TEST_F(LocalPointersTest, invokeCustomArgumentsEscape) {
+  auto* bootstrap =
+      DexMethod::make_method(
+          "LFoo;.bootstrap:(Ljava/lang/invoke/MethodHandles$Lookup;"
+          "Ljava/lang/String;Ljava/lang/invoke/MethodType;)"
+          "Ljava/lang/invoke/CallSite;")
+          ->make_concrete(ACC_PUBLIC | ACC_STATIC | ACC_NATIVE, false);
+  auto* call_site = new DexCallSite(
+      new DexMethodHandle(METHOD_HANDLE_TYPE_INVOKE_STATIC, bootstrap),
+      DexString::make_string("consume"),
+      DexProto::make_proto(
+          type::_void(),
+          DexTypeList::make_type_list({DexType::make_type("LFoo;")})),
+      {});
+  auto code = assembler::ircode_from_string(R"(
+    (
+     (new-instance "LFoo;")
+     (move-result-pseudo-object v0)
+     (invoke-static (v0) "LFoo;.consume:(LFoo;)V")
+     (return-object v0)
+    )
+  )");
+  for (auto& mie : InstructionIterable(*code)) {
+    if (mie.insn->opcode() == OPCODE_INVOKE_STATIC) {
+      mie.insn->set_opcode(OPCODE_INVOKE_CUSTOM);
+      mie.insn->set_callsite(call_site);
+    }
+  }
+
+  code->build_cfg();
+  auto& cfg = code->cfg();
+  cfg.calculate_exit_block();
+
+  ptrs::FixpointIterator fp_iter(cfg);
+  fp_iter.run(ptrs::Environment());
+
+  const auto& exit_env = fp_iter.get_exit_state_at(cfg.exit_block());
+  const auto& foo_ptr_set = exit_env.get_pointers(0);
+  ASSERT_EQ(foo_ptr_set.size(), 1);
+  EXPECT_TRUE(exit_env.may_have_escaped(*foo_ptr_set.elements().begin()));
+}
+
+TEST_F(LocalPointersTest, methodTypeConstantIsAnObject) {
+  auto code = assembler::ircode_from_string(R"(
+    (
+     (const-class "Ljava/lang/Object;")
+     (move-result-pseudo-object v0)
+     (return-object v0)
+    )
+  )");
+  for (auto& mie : InstructionIterable(*code)) {
+    if (mie.insn->opcode() == OPCODE_CONST_CLASS) {
+      mie.insn->set_opcode(OPCODE_CONST_METHOD_TYPE);
+      mie.insn->set_proto(
+          DexProto::make_proto(type::_void(), DexTypeList::make_type_list({})));
+    }
+  }
+
+  code->build_cfg();
+  auto& cfg = code->cfg();
+  cfg.calculate_exit_block();
+
+  ptrs::FixpointIterator fp_iter(cfg);
+  fp_iter.run(ptrs::Environment());
+
+  const auto& exit_env = fp_iter.get_exit_state_at(cfg.exit_block());
+  const auto& ptr_set = exit_env.get_pointers(0);
+  ASSERT_EQ(ptr_set.size(), 1);
+  EXPECT_TRUE(exit_env.may_have_escaped(*ptr_set.elements().begin()));
 }
 
 TEST_F(LocalPointersTest, generateEscapeSummary) {
@@ -344,7 +442,7 @@ TEST_F(LocalPointersTest, returnFreshValue) {
     const IRInstruction* invoke_insn{nullptr};
     for (const auto& mie : InstructionIterable(cfg)) {
       auto* insn = mie.insn;
-      if (opcode::is_an_invoke(insn->opcode())) {
+      if (opcode::is_a_method_invoke(insn->opcode())) {
         invoke_insn = insn;
         invoke_to_summary_map.emplace(insn, fresh_return_summary);
       }
@@ -414,7 +512,7 @@ TEST_F(LocalPointersTest, returnEscapedValue) {
     const IRInstruction* invoke_insn{nullptr};
     for (const auto& mie : InstructionIterable(cfg)) {
       auto* insn = mie.insn;
-      if (opcode::is_an_invoke(insn->opcode())) {
+      if (opcode::is_a_method_invoke(insn->opcode())) {
         invoke_insn = insn;
         invoke_to_summary_map.emplace(insn, fresh_return_summary);
       }
@@ -585,4 +683,22 @@ TEST_F(LocalPointersTest,
   ptrs::analyze_scope(scope, call_graph, &summaries);
   EXPECT_THAT(unordered_unsafe_unwrap(summaries.at(c_make).escaping_parameters),
               Contains(1));
+}
+
+// A method handle constant is an object reference, as a class constant is.
+TEST_F(LocalPointersTest, constMethodHandleIsAPointer) {
+  auto code = assembler::ircode_from_string(R"(
+    (
+      (const-method-handle invoke-instance "Ljava/lang/Object;.hashCode:()I")
+      (move-result-pseudo-object v0)
+      (return-object v0)
+    )
+  )");
+  code->build_cfg();
+  auto& cfg = code->cfg();
+  cfg.calculate_exit_block();
+  ptrs::FixpointIterator fp_iter(cfg, ptrs::InvokeToSummaryMap());
+  fp_iter.run(ptrs::Environment());
+  const auto& exit_env = fp_iter.get_exit_state_at(cfg.exit_block());
+  EXPECT_FALSE(exit_env.get_pointers(0).is_top());
 }

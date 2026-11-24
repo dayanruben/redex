@@ -13,6 +13,7 @@
 
 #include "BaselineProfile.h"
 #include "CallSiteSummaries.h"
+#include "ConcurrentContainers.h"
 #include "DeterministicContainers.h"
 #include "DexUtil.h"
 #include "PriorityThreadPoolDAGScheduler.h"
@@ -499,15 +500,18 @@ class MultiMethodInliner {
   bool outlined_invoke_outlined(IRInstruction* insn, const DexMethod* caller);
 
   /**
-   * Return true if a callee contains an invoke super to a different method
-   * in the hierarchy.
+   * Return true if a callee contains an instruction whose behavior depends on
+   * the class that holds it (`depends_on_holder_class`): an invoke super to a
+   * different method in the hierarchy, which `CFGInliner` cannot rewrite, a
+   * method handle that calls like one, or an invoke-custom.
    * invoke-super can only exist within the class the call lives in.
    */
   bool nonrelocatable_invoke_super(IRInstruction* insn,
                                    const DexMethod* callee);
 
   /**
-   * Return true if the callee contains a call to an unknown virtual method.
+   * Return true if the callee contains a call to an unknown virtual method,
+   * by an instruction or a method handle.
    * We cannot determine the visibility of the method invoked and thus
    * we cannot inline as we could cause a verification error if the method
    * was package/protected and we move the call out of context.
@@ -515,7 +519,8 @@ class MultiMethodInliner {
   bool unknown_virtual(IRInstruction* insn, const DexMethod* caller);
 
   /**
-   * Return true if the callee contains an access to an unknown field.
+   * Return true if the callee contains an access to an unknown field, by an
+   * instruction or a method handle.
    * We cannot determine the visibility of the field accessed and thus
    * we cannot inline as we could cause a verification error if the field
    * was package/protected and we move the access out of context.
@@ -943,6 +948,10 @@ class MultiMethodInliner {
   InliningInfo info;
 
   const std::vector<DexClass*>& m_scope;
+
+  // The methods that method handles name or can run, which are never made
+  // static (see `create_vmethod`).
+  const InsertOnlyConcurrentSet<const DexMethod*> m_method_handle_methods;
 
   const inliner::InlinerConfig& m_config;
 

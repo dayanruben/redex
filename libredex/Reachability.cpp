@@ -15,6 +15,7 @@
 #include "Debug.h"
 #include "DeterministicContainers.h"
 #include "DexAnnotation.h"
+#include "DexMethodHandle.h"
 #include "DexUtil.h"
 #include "MethodUtil.h"
 #include "PassManager.h"
@@ -777,7 +778,7 @@ std::optional<MethodReferencesGatherer::ReturningDependency>
 MethodReferencesGatherer::get_returning_dependency(
     const IRInstruction* insn, const References* refs) const {
   auto op = insn->opcode();
-  always_assert(opcode::is_an_invoke(op));
+  always_assert(opcode::is_a_method_invoke(op));
   auto is_method_returning = [&](const auto* method) -> bool {
     always_assert(method);
     always_assert(!is_abstract(method));
@@ -906,49 +907,85 @@ void MethodReferencesGatherer::default_gather_mie(const MethodItemEntry& mie,
     auto op = insn->opcode();
     if (opcode::is_new_instance(op)) {
       refs->new_instances.push_back(insn->get_type());
-    } else if (gather_methods && opcode::is_invoke_super(op)) {
-      auto* callee = resolve_method_deprecated(insn->get_method(),
-                                               MethodSearch::Super, m_method);
-      if ((callee != nullptr) && !callee->is_external()) {
-        always_assert(callee->is_virtual());
-        if (is_abstract(callee)) {
-          TRACE(REACH, 1,
-                "invoke super target of {%s} is abstract method %s in %s",
-                SHOW(insn), SHOW(callee), SHOW(m_method));
-        } else {
-          refs->invoke_super_targets.insert(callee);
-        }
-      }
-    } else if (gather_methods && (opcode::is_invoke_virtual(op) ||
-                                  opcode::is_invoke_interface(op))) {
-      auto* resolved_callee = resolve_invoke_method_deprecated(insn, m_method);
-      if (resolved_callee == nullptr) {
-        // Typically clone() on an array, or other obscure external references
-        TRACE(REACH, 2, "Unresolved virtual callee at %s", SHOW(insn));
-        refs->unknown_invoke_virtual_targets = true;
-        return;
-      }
-      auto* method_ref = insn->get_method();
-      auto* base_type = method_ref->get_class();
-      refs->base_invoke_virtual_targets_if_class_instantiable[resolved_callee]
-          .insert(base_type);
-      auto* base_cls = type_class(base_type);
-      always_assert(base_cls);
-      if (base_cls == nullptr || base_cls->is_external() ||
-          (!is_abstract(resolved_callee) && resolved_callee->is_external())) {
-        refs->unknown_invoke_virtual_targets = true;
-      } else if (opcode::is_invoke_interface(op) && is_interface(base_cls)) {
-        // Why can_rename? To mirror what VirtualRenamer looks at.
-        if (root(resolved_callee) || !can_rename(resolved_callee) ||
-            is_annotation(base_cls)) {
-          // We cannot rule out that there are dynamically added classes,
-          // possibly even created at runtime via Proxy.newProxyInstance, that
-          // override this method. So we assume the worst.
-          refs->unknown_invoke_virtual_targets = true;
-        }
-      }
     } else if (opcode::is_a_return(op)) {
       refs->returns = true;
+    }
+    // Unlike an invoke-direct of a constructor, which initializes an existing
+    // instance, an invoke-constructor handle allocates one.
+    for_each_method_handle(insn, [&](const DexMethodHandle* method_handle) {
+      if (method_handle->type() == METHOD_HANDLE_TYPE_INVOKE_CONSTRUCTOR) {
+        refs->new_instances.push_back(method_handle->methodref()->get_class());
+      }
+    });
+    if (gather_methods) {
+      for_each_invoke(insn, [&](IROpcode opcode, DexMethodRef* method_ref,
+                                const DexMethodHandle* method_handle) {
+        gather_invoke_targets(opcode, method_ref, method_handle, refs);
+      });
+    }
+  }
+}
+
+void MethodReferencesGatherer::gather_invoke_targets(
+    IROpcode op,
+    DexMethodRef* method_ref,
+    const DexMethodHandle* method_handle,
+    References* refs) const {
+  if (opcode::is_invoke_super(op)) {
+    // A method handle can run a different method on different ART versions.
+    std::vector<DexMethod*> callees;
+    if (method_handle == nullptr) {
+      auto* callee =
+          resolve_method_deprecated(method_ref, MethodSearch::Super, m_method);
+      if (callee != nullptr) {
+        callees.push_back(callee);
+      }
+    } else {
+      // Unlike the method that an invoke-super names, the handle's method ref
+      // need not lead to these.
+      callees = resolve_method_handle_callees(method_handle, m_method);
+      refs->methods.insert(refs->methods.end(), callees.begin(), callees.end());
+    }
+    for (auto* callee : callees) {
+      if (callee->is_external()) {
+        continue;
+      }
+      always_assert(callee->is_virtual());
+      if (is_abstract(callee)) {
+        TRACE(REACH, 1,
+              "invoke super target of {%s} is abstract method %s in %s",
+              SHOW(method_ref), SHOW(callee), SHOW(m_method));
+      } else {
+        refs->invoke_super_targets.insert(callee);
+      }
+    }
+  } else if (opcode::is_invoke_virtual(op) || opcode::is_invoke_interface(op)) {
+    auto* resolved_callee =
+        resolve_invoke_method_deprecated(op, method_ref, m_method);
+    if (resolved_callee == nullptr) {
+      // Typically clone() on an array, or other obscure external references
+      TRACE(REACH, 2, "Unresolved virtual callee %s in %s", SHOW(method_ref),
+            SHOW(m_method));
+      refs->unknown_invoke_virtual_targets = true;
+      return;
+    }
+    auto* base_type = method_ref->get_class();
+    refs->base_invoke_virtual_targets_if_class_instantiable[resolved_callee]
+        .insert(base_type);
+    auto* base_cls = type_class(base_type);
+    always_assert(base_cls);
+    if (base_cls == nullptr || base_cls->is_external() ||
+        (!is_abstract(resolved_callee) && resolved_callee->is_external())) {
+      refs->unknown_invoke_virtual_targets = true;
+    } else if (opcode::is_invoke_interface(op) && is_interface(base_cls)) {
+      // Why can_rename? To mirror what VirtualRenamer looks at.
+      if (root(resolved_callee) || !can_rename(resolved_callee) ||
+          is_annotation(base_cls)) {
+        // We cannot rule out that there are dynamically added classes,
+        // possibly even created at runtime via Proxy.newProxyInstance, that
+        // override this method. So we assume the worst.
+        refs->unknown_invoke_virtual_targets = true;
+      }
     }
   }
 }
@@ -1044,7 +1081,7 @@ void MethodReferencesGatherer::advance(const Advance& advance,
           return std::make_optional<Dependency>(*instantiable_dep);
         }
         m_instructions_visited++;
-        if (opcode::is_an_invoke(it->insn->opcode()) &&
+        if (opcode::is_a_method_invoke(it->insn->opcode()) &&
             m_shared_state->cfg_gathering_check_returning &&
             !m_method->rstate.no_optimizations()) {
           auto methods = std::move(refs->methods);

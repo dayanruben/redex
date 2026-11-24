@@ -42,7 +42,7 @@ bool has_range(DexOpcode);
 // If an opcode has a variable number of register operands
 inline bool has_arg_word_count(DexOpcode op) {
   auto fmt = format(op);
-  return fmt == FMT_f35c || fmt == FMT_f57c;
+  return fmt == FMT_f35c || fmt == FMT_f45cc || fmt == FMT_f57c;
 }
 
 bool is_commutative(DexOpcode op);
@@ -68,6 +68,13 @@ inline bool is_invoke_range(DexOpcode op) {
 
 inline bool is_invoke(DexOpcode op) {
   return op >= DOPCODE_INVOKE_VIRTUAL && op <= DOPCODE_INVOKE_INTERFACE_RANGE;
+}
+
+// One of the fourteen invoke opcodes. `is_invoke` excludes `invoke-polymorphic`
+// and `invoke-custom` and their range forms.
+inline bool is_an_invoke(DexOpcode op) {
+  return is_invoke(op) || (op >= DOPCODE_INVOKE_POLYMORPHIC &&
+                           op <= DOPCODE_INVOKE_CUSTOM_RANGE);
 }
 
 inline bool is_fopcode(DexOpcode op) {

@@ -7,7 +7,12 @@
 
 #include "MergeabilityCheck.h"
 
+#include <array>
+
 #include "ClassUtil.h"
+#include "DexAnnotation.h"
+#include "DexCallSite.h"
+#include "DexMethodHandle.h"
 #include "DexUtil.h"
 #include "IRCode.h"
 #include "LiveRange.h"
@@ -17,9 +22,28 @@
 #include "Resolver.h"
 #include "Show.h"
 #include "Trace.h"
+#include "TypeReference.h"
 #include "Walkers.h"
 
 using namespace class_merging;
+
+namespace {
+
+// The class of the member that `method_handle`, held by code of `holder`
+// (nullptr outside code), names, and the class of the member it resolves to.
+std::array<const DexType*, 2> classes_of_method_handle(
+    const DexMethodHandle* method_handle, const DexMethod* holder) {
+  if (DexMethodHandle::isInvokeType(method_handle->type())) {
+    const auto* method = resolve_method_handle(method_handle, holder);
+    return {method_handle->methodref()->get_class(),
+            method == nullptr ? nullptr : method->get_class()};
+  }
+  const auto* field = resolve_field_handle(method_handle);
+  return {method_handle->fieldref()->get_class(),
+          field == nullptr ? nullptr : field->get_class()};
+}
+
+} // namespace
 
 MergeabilityChecker::MergeabilityChecker(const Scope& scope,
                                          const ModelSpec& spec,
@@ -68,6 +92,29 @@ void MergeabilityChecker::exclude_unsupported_cls_property(
     if (is_abstract(cls)) {
       non_mergeables.insert(type);
       TRACE(CLMG, 5, "Is abstract %s", SHOW(type));
+    }
+  }
+}
+
+void MergeabilityChecker::exclude_unsupported_method_handle_refs(
+    const DexMethodHandle* method_handle,
+    const DexMethod* holder,
+    TypeSet& non_mergeables) {
+  std::vector<const DexType*> pinned_types;
+  type_reference::gather_types_pinned_by_method_handle(method_handle,
+                                                       pinned_types);
+  for (const auto* type : pinned_types) {
+    if (m_spec.merging_targets.count(type) > 0) {
+      TRACE(CLMG, 5, "[non mergeable] pinned by a method handle in %s",
+            SHOW(holder));
+      non_mergeables.insert(type);
+    }
+  }
+  for (const auto* type : classes_of_method_handle(method_handle, holder)) {
+    if (type != nullptr && m_spec.merging_targets.count(type) > 0) {
+      TRACE(CLMG, 5, "[non mergeable] named by a method handle in %s",
+            SHOW(holder));
+      non_mergeables.insert(type);
     }
   }
 }
@@ -127,6 +174,35 @@ TypeSet MergeabilityChecker::exclude_unsupported_bytecode_refs_for(
         TRACE(CLMG, 5,
               "[non mergeable] type like const string unsafe: %s in %s",
               SHOW(insn), SHOW(method));
+      }
+      continue;
+    }
+
+    // With type tags, a Class among the bootstrap arguments of a call site is
+    // checked like a const-class whose only use passes it to the bootstrap
+    // method.
+    if (insn->has_callsite()) {
+      if (!has_type_tag) {
+        continue;
+      }
+      auto* callsite = insn->get_callsite();
+      auto* bootstrap = callsite->method_handle();
+      bool safe_bootstrap = DexMethodHandle::isInvokeType(bootstrap->type()) &&
+                            m_const_class_safe_types.count(
+                                bootstrap->methodref()->get_class()) != 0u;
+      for (const auto& arg : callsite->args()) {
+        const auto* type_arg =
+            dynamic_cast<const DexEncodedValueType*>(arg.get());
+        if (type_arg == nullptr) {
+          continue;
+        }
+        const auto* type = type::make_element_type_if_array(type_arg->type());
+        if (m_spec.merging_targets.count(type) > 0 && !safe_bootstrap) {
+          TRACE(CLMG, 5,
+                "[non mergeable] Class bootstrap argument unsafe @ %s in %s",
+                SHOW(insn), SHOW(method));
+          non_mergeables.insert(type);
+        }
       }
       continue;
     }
@@ -281,6 +357,59 @@ void MergeabilityChecker::exclude_unsupported_bytecode(
                         non_mergeables_opcode.end());
 }
 
+void MergeabilityChecker::exclude_method_handle_refs(TypeSet& non_mergeables) {
+  // Merging moves the code of a mergeable into its merger, which has the same
+  // superclass, and replaces or deletes its methods and fields. So a mergeable
+  // whose code does something that depends on the class that holds it beyond
+  // that class's superclass is not merged, and neither is the class of a
+  // member that a method handle names or resolves to, which the handle must go
+  // on naming. Unlike the other checks of bytecode, this one applies to the
+  // code of generated classes too.
+  TypeSet excluded = walk::parallel::methods<TypeSet, MergeContainers<TypeSet>>(
+      m_scope, [this](DexMethod* method) {
+        TypeSet result;
+        auto* code = method->get_code();
+        if (code == nullptr) {
+          return result;
+        }
+        for (const auto& mie : InstructionIterable(code->cfg())) {
+          auto* insn = mie.insn;
+          if (depends_on_holder_class_beyond_superclass(insn) &&
+              m_spec.merging_targets.count(method->get_class()) > 0) {
+            TRACE(CLMG, 5, "[non mergeable] %s depends on its class in %s",
+                  SHOW(insn), SHOW(method));
+            result.insert(method->get_class());
+          }
+          for_each_method_handle(insn, [&](const DexMethodHandle* handle) {
+            exclude_unsupported_method_handle_refs(handle, method, result);
+          });
+        }
+        return result;
+      });
+  non_mergeables.insert(excluded.begin(), excluded.end());
+}
+
+void MergeabilityChecker::exclude_unsupported_static_value_method_handles(
+    TypeSet& non_mergeables) {
+  TypeSet non_mergeables_static_value =
+      walk::parallel::fields<TypeSet, MergeContainers<TypeSet>>(
+          m_scope, [this](DexField* field) {
+            TypeSet field_non_mergeables;
+            if (auto* value = field->get_static_value()) {
+              std::vector<DexMethodHandle*> method_handles;
+              value->gather_methodhandles(method_handles);
+              for (const auto* method_handle : method_handles) {
+                exclude_unsupported_method_handle_refs(
+                    method_handle, /* holder */ nullptr, field_non_mergeables);
+              }
+            }
+            return field_non_mergeables;
+          });
+
+  non_mergeables.insert(non_mergeables_static_value.begin(),
+                        non_mergeables_static_value.end());
+}
+
 void MergeabilityChecker::exclude_static_fields(TypeSet& non_mergeables) {
   static const DexType* string_type = type::java_lang_String();
 
@@ -350,6 +479,33 @@ void MergeabilityChecker::collect_referenced_mergeable_types(
     }
   };
 
+  auto maybe_insert_proto = [&](const DexProto* proto) {
+    if (proto != nullptr) {
+      maybe_insert(type::make_element_type_if_array(proto->get_rtype()));
+      if (auto* args = proto->get_args()) {
+        for (const auto* arg_type : *args) {
+          maybe_insert(type::make_element_type_if_array(arg_type));
+        }
+      }
+    }
+  };
+  auto maybe_insert_method = [&](const DexMethodRef* method) {
+    if (method != nullptr) {
+      // Check containing class
+      maybe_insert(type::make_element_type_if_array(method->get_class()));
+      // Check return type and parameter types
+      maybe_insert_proto(method->get_proto());
+    }
+  };
+  auto maybe_insert_field = [&](const DexFieldRef* field) {
+    if (field != nullptr) {
+      // Check containing class
+      maybe_insert(type::make_element_type_if_array(field->get_class()));
+      // Check field type
+      maybe_insert(type::make_element_type_if_array(field->get_type()));
+    }
+  };
+
   switch (ev->evtype()) {
   case DEVT_TYPE: {
     const auto* type_ev = dynamic_cast<const DexEncodedValueType*>(ev);
@@ -359,32 +515,28 @@ void MergeabilityChecker::collect_referenced_mergeable_types(
   }
   case DEVT_METHOD: {
     const auto* method_ev = dynamic_cast<const DexEncodedValueMethod*>(ev);
-    auto* method = method_ev->method();
-    if (method != nullptr) {
-      // Check containing class
-      maybe_insert(type::make_element_type_if_array(method->get_class()));
-      // Check return type and parameter types
-      auto* proto = method->get_proto();
-      if (proto != nullptr) {
-        maybe_insert(type::make_element_type_if_array(proto->get_rtype()));
-        if (auto* args = proto->get_args()) {
-          for (const auto* arg_type : *args) {
-            maybe_insert(type::make_element_type_if_array(arg_type));
-          }
-        }
-      }
-    }
+    maybe_insert_method(method_ev->method());
     break;
   }
   case DEVT_FIELD: {
     const auto* field_ev = dynamic_cast<const DexEncodedValueField*>(ev);
-    auto* field = field_ev->field();
-    if (field != nullptr) {
-      // Check containing class
-      maybe_insert(type::make_element_type_if_array(field->get_class()));
-      // Check field type
-      maybe_insert(type::make_element_type_if_array(field->get_type()));
+    maybe_insert_field(field_ev->field());
+    break;
+  }
+  case DEVT_METHOD_HANDLE: {
+    const auto* method_handle =
+        dynamic_cast<const DexEncodedValueMethodHandle*>(ev)->methodhandle();
+    if (DexMethodHandle::isInvokeType(method_handle->type())) {
+      maybe_insert_method(method_handle->methodref());
+    } else {
+      maybe_insert_field(method_handle->fieldref());
     }
+    break;
+  }
+  case DEVT_METHOD_TYPE: {
+    const auto* method_type_ev =
+        dynamic_cast<const DexEncodedValueMethodType*>(ev);
+    maybe_insert_proto(method_type_ev->proto());
     break;
   }
   case DEVT_ARRAY: {
@@ -473,9 +625,17 @@ TypeSet MergeabilityChecker::get_non_mergeables() {
   prev_size = non_mergeables.size();
 
   exclude_unsupported_bytecode(non_mergeables);
+  exclude_unsupported_static_value_method_handles(non_mergeables);
   TRACE(CLMG,
         4,
         "Non mergeables (opcodes) %zu",
+        non_mergeables.size() - prev_size);
+  prev_size = non_mergeables.size();
+
+  exclude_method_handle_refs(non_mergeables);
+  TRACE(CLMG,
+        4,
+        "Non mergeables (method handles) %zu",
         non_mergeables.size() - prev_size);
   prev_size = non_mergeables.size();
 

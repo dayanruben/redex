@@ -18,7 +18,6 @@
 #include "Show.h"
 #include "Trace.h"
 #include "Transform.h"
-#include "TypeUtil.h"
 #include "VirtualRegistersFile.h"
 
 namespace regalloc {
@@ -76,12 +75,8 @@ static std::vector<cfg::Block*> find_first_uses(reg_t reg, cfg::Block* entry) {
  */
 static size_t sum_src_sizes(const IRInstruction* insn) {
   size_t size{0};
-  if (insn->opcode() != OPCODE_INVOKE_STATIC) {
-    // Account for the implicit `this` parameter
-    ++size;
-  }
-  for (auto* type : *insn->get_method()->get_proto()->get_args()) {
-    size += type::is_wide_type(type) ? 2 : 1;
+  for (src_index_t i = 0; i < insn->srcs_size(); ++i) {
+    size += insn->src_is_wide(i) ? 2 : 1;
   }
   return size;
 }

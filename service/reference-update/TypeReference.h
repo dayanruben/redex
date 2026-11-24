@@ -13,6 +13,7 @@
 #include "ClassHierarchy.h"
 #include "DeterministicContainers.h"
 #include "DexClass.h"
+#include "DexMethodHandle.h"
 
 using TypeSet = std::set<const DexType*, dextypes_comparator>;
 using UnorderedTypeSet = UnorderedSet<const DexType*>;
@@ -21,7 +22,8 @@ namespace type_reference {
 
 /**
  * Update old type reference to new type reference in all the fields and methods
- * in the scope, but is not responsible for updating opcodes. The users should
+ * in the scope, and in the method prototypes that instructions name, but is not
+ * responsible for updating the types that instructions name. The users should
  * take care of other part of analysis and transformations to make sure the
  * updating being valid. This supports updating virtual methods through name
  * mangling instead of walking through virtual scopes.
@@ -69,6 +71,13 @@ bool proto_has_reference_to(const DexProto* proto,
                             const UnorderedTypeSet& targets);
 
 /**
+ * `type` with its type, or element type, replaced by the new type if
+ * `old_to_new` maps it.
+ */
+DexType* get_new_type(const DexType* type,
+                      const UnorderedMap<const DexType*, DexType*>& old_to_new);
+
+/**
  * Get a new proto by updating the type references on the proto from an old type
  * to the provided new type.
  */
@@ -82,7 +91,9 @@ DexProto* get_new_proto(
 
 /**
  * Update all method signature type references in-place using the old_to_new
- * map. We update all references to an old type to the provided new type.
+ * map. We update all references to an old type to the provided new type. This
+ * includes the method prototypes that instructions name, such as that of
+ * const-method-type.
  *
  * The optional `method_debug_map` stores the map from the updated DexMethod to
  * the string representation of the original method signature.
@@ -101,4 +112,15 @@ void update_field_type_references(
 void fix_colliding_dmethods(
     const Scope& scope,
     const std::vector<std::pair<DexMethod*, DexProto*>>& colliding_methods);
+
+/**
+ * Adds to `types` the types that merging classes must not replace while
+ * `method_handle` names its method, because the method would gain parameters
+ * that a method handle cannot pass: the types, or element types, in the
+ * prototype of a constructor or of a direct method that cannot be renamed,
+ * since a collision after the type is replaced makes `fix_colliding_dmethods`
+ * add parameters to it.
+ */
+void gather_types_pinned_by_method_handle(const DexMethodHandle* method_handle,
+                                          std::vector<const DexType*>& types);
 } // namespace type_reference

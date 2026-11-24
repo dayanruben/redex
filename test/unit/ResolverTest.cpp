@@ -5,13 +5,23 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+#include <algorithm>
+#include <set>
+#include <string>
+#include <vector>
+
 #include <gtest/gtest.h>
 
 #include "ClassHierarchy.h"
 #include "Creators.h"
+#include "DexAnnotation.h"
 #include "DexClass.h"
+#include "DexMethodHandle.h"
+#include "IRInstruction.h"
 #include "RedexTest.h"
+#include "RedexTestUtils.h"
 #include "Resolver.h"
+#include "Show.h"
 
 DexFieldRef* make_field_ref(DexType* cls, const char* name, DexType* type) {
   return DexField::make_field(cls, DexString::make_string(name), type);
@@ -680,4 +690,317 @@ TEST_F(ResolverTest, HasSignatureCollisionWithUndefinedInterface) {
 
   EXPECT_FALSE(
       has_signature_collision(build_subtype_maps({cls}), method, string_proto));
+}
+
+namespace {
+
+DexClass* make_class(const char* name,
+                     DexAccessFlags access,
+                     const char* super = nullptr,
+                     const char* intf = nullptr) {
+  ClassCreator creator(DexType::make_type(name));
+  creator.set_access(access);
+  creator.set_super(super == nullptr ? type::java_lang_Object()
+                                     : DexType::make_type(super));
+  if (intf != nullptr) {
+    creator.add_interface(DexType::make_type(intf));
+  }
+  return creator.create();
+}
+
+DexMethod* add_method(DexClass* cls, const char* name) {
+  auto* method =
+      DexMethod::make_method(show(cls->get_type()) + "." + name + ":()V")
+          ->make_concrete(ACC_PUBLIC, /* is_virtual */ true);
+  cls->add_method(method);
+  return method;
+}
+
+} // namespace
+
+// class S { public void m() {} }
+// invoke-interface S.m()V, as in code compiled against a version of S that was
+// an interface: the verifier accepts it, and it throws when it runs.
+TEST_F(ResolverTest, ResolveInterfaceMethodOfClass) {
+  create_object_class();
+  auto* s = make_class("LS;", ACC_PUBLIC);
+  add_method(s, "m");
+
+  const auto* name = DexString::make_string("m");
+  auto* proto =
+      DexProto::make_proto(type::_void(), DexTypeList::make_type_list({}));
+  EXPECT_EQ(resolve_method(s, name, proto, MethodSearch::Interface), nullptr);
+  EXPECT_EQ(resolve_interface_method(s, name, proto), nullptr);
+}
+
+namespace {
+
+// `LBase;` declares `x` of `base_access`, and its subclass `LChild;` declares
+// a field of the same name and type, `x` of `child_access`.
+void make_shadowing_fields(DexAccessFlags base_access,
+                           DexAccessFlags child_access) {
+  ClassCreator base(DexType::make_type("LBase;"));
+  base.set_super(type::java_lang_Object());
+  base.add_field(
+      DexField::make_field("LBase;.x:I")->make_concrete(base_access));
+  auto* base_cls = base.create();
+  ClassCreator child(DexType::make_type("LChild;"));
+  child.set_super(base_cls->get_type());
+  child.add_field(
+      DexField::make_field("LChild;.x:I")->make_concrete(child_access));
+  child.create();
+}
+
+DexField* resolve_handle_of_child_x(MethodHandleType type) {
+  return resolve_field_handle(redex::make_method_handle(type, "LChild;.x:I"));
+}
+
+} // namespace
+
+// A static handle of `LChild;.x` reaches the static `LBase;.x`, past the
+// instance field that `LChild;` declares.
+TEST_F(ResolverTest, ResolveFieldHandleSkipsInstanceFieldForStaticHandle) {
+  make_shadowing_fields(ACC_PUBLIC | ACC_STATIC, ACC_PUBLIC);
+  auto* base_x = DexField::get_field("LBase;.x:I")->as_def();
+  auto* child_x = DexField::get_field("LChild;.x:I")->as_def();
+  EXPECT_EQ(resolve_handle_of_child_x(METHOD_HANDLE_TYPE_STATIC_GET), base_x);
+  EXPECT_EQ(resolve_handle_of_child_x(METHOD_HANDLE_TYPE_STATIC_PUT), base_x);
+  EXPECT_EQ(resolve_handle_of_child_x(METHOD_HANDLE_TYPE_INSTANCE_GET),
+            child_x);
+  EXPECT_EQ(resolve_handle_of_child_x(METHOD_HANDLE_TYPE_INSTANCE_PUT),
+            child_x);
+}
+
+// An instance handle of `LChild;.x` reaches the instance field `LBase;.x`,
+// past the static field that `LChild;` declares.
+TEST_F(ResolverTest, ResolveFieldHandleSkipsStaticFieldForInstanceHandle) {
+  make_shadowing_fields(ACC_PUBLIC, ACC_PUBLIC | ACC_STATIC);
+  auto* base_x = DexField::get_field("LBase;.x:I")->as_def();
+  auto* child_x = DexField::get_field("LChild;.x:I")->as_def();
+  EXPECT_EQ(resolve_handle_of_child_x(METHOD_HANDLE_TYPE_INSTANCE_GET), base_x);
+  EXPECT_EQ(resolve_handle_of_child_x(METHOD_HANDLE_TYPE_INSTANCE_PUT), base_x);
+  EXPECT_EQ(resolve_handle_of_child_x(METHOD_HANDLE_TYPE_STATIC_GET), child_x);
+  EXPECT_EQ(resolve_handle_of_child_x(METHOD_HANDLE_TYPE_STATIC_PUT), child_x);
+}
+
+TEST_F(ResolverTest, ResolveFieldHandleOfMethodHandle) {
+  EXPECT_EQ(resolve_field_handle(redex::make_method_handle(
+                METHOD_HANDLE_TYPE_INVOKE_STATIC, "LA;.m:()V")),
+            nullptr);
+}
+
+namespace {
+
+DexClass* make_handle_class(const char* name, const DexType* super) {
+  ClassCreator creator(DexType::make_type(name));
+  creator.set_super(const_cast<DexType*>(super));
+  return creator.create();
+}
+
+DexMethod* add_m(DexClass* cls) {
+  auto* method = DexMethod::make_method(show(cls->get_type()) + ".m:()V")
+                     ->make_concrete(ACC_PUBLIC, /* is_virtual */ true);
+  cls->add_method(method);
+  return method;
+}
+
+// A static method of `cls`, which holds the handles.
+DexMethod* add_holder(DexClass* cls) {
+  auto* method =
+      DexMethod::make_method(show(cls->get_type()) + ".hold:()V")
+          ->make_concrete(ACC_PUBLIC | ACC_STATIC, /* is_virtual */ false);
+  cls->add_method(method);
+  return method;
+}
+
+DexMethodHandle direct_handle(const char* method) {
+  return DexMethodHandle(METHOD_HANDLE_TYPE_INVOKE_DIRECT,
+                         DexMethod::make_method(method));
+}
+
+} // namespace
+
+// `LC;` extends `LB;`, which overrides `m` of `LA;`, which overrides `m` of
+// `LG;`. ART runs an invoke-direct handle of a method that is not private held
+// by `LC;` by taking `LC;`'s implementation, `LB;.m`, which Android 9 runs.
+// Android 10 and later run it only when the named class declares it, and
+// otherwise the named class's superclass's implementation.
+TEST_F(ResolverTest, ResolveNonvirtualMethodHandle) {
+  auto* g = make_handle_class("LG;", type::java_lang_Object());
+  auto* g_m = add_m(g);
+  auto* a = make_handle_class("LA;", g->get_type());
+  add_m(a);
+  auto* b = make_handle_class("LB;", a->get_type());
+  auto* b_m = add_m(b);
+  auto* c = make_handle_class("LC;", b->get_type());
+  auto* holder = add_holder(c);
+
+  // `LB;` declares `LB;.m`, so every version runs it.
+  auto names_b = direct_handle("LB;.m:()V");
+  EXPECT_EQ(resolve_method_handle(&names_b, holder), b_m);
+  EXPECT_EQ(resolve_method_handle_callees(&names_b, holder),
+            std::vector<DexMethod*>{b_m});
+  // `LC;` inherits `LB;.m` from its superclass, so every version runs it.
+  auto names_c = direct_handle("LC;.m:()V");
+  EXPECT_EQ(resolve_method_handle(&names_c, holder), b_m);
+  // `LA;` does not declare `LB;.m`: Android 10 and later run `LG;.m`.
+  auto names_a = direct_handle("LA;.m:()V");
+  EXPECT_EQ(resolve_method_handle(&names_a, holder), nullptr);
+  EXPECT_EQ(resolve_method_handle_callees(&names_a, holder),
+            (std::vector<DexMethod*>{b_m, g_m}));
+  // `LG;`'s superclass has no `m`, so Android 10 and later take a vtable entry
+  // of `Ljava/lang/Object;` that is not `m`.
+  auto names_g = direct_handle("LG;.m:()V");
+  EXPECT_EQ(resolve_method_handle(&names_g, holder), nullptr);
+  EXPECT_EQ(resolve_method_handle_callees(&names_g, holder),
+            std::vector<DexMethod*>{b_m});
+}
+
+// ART takes the vtable entry of the named method in the holder's class, which
+// is not known to be that method when the holder does not inherit it.
+TEST_F(ResolverTest, ResolveNonvirtualMethodHandleOfUnrelatedClass) {
+  auto* a = make_handle_class("LA;", type::java_lang_Object());
+  add_m(a);
+  auto* d = make_handle_class("LD;", type::java_lang_Object());
+  add_m(d);
+  auto* holder = add_holder(d);
+
+  auto names_a = direct_handle("LA;.m:()V");
+  EXPECT_EQ(resolve_method_handle(&names_a, holder), nullptr);
+  EXPECT_TRUE(resolve_method_handle_callees(&names_a, holder).empty());
+}
+
+// `Lp/B;.m` is package-private, so `Lq/C;.m` in another package cannot
+// override it and takes a slot of its own. An invoke-direct handle of
+// `Lp/B;.m` held by `Lp/D; extends Lq/C;` runs `Lp/B;.m`, the method in that
+// slot, though a search by name and prototype from `Lp/D;` finds `Lq/C;.m`.
+TEST_F(ResolverTest, ResolveNonvirtualMethodHandlePastPackagePrivateMethod) {
+  auto add_package_private_m = [](DexClass* cls) {
+    auto* method =
+        DexMethod::make_method(show(cls->get_type()) + ".m:()V")
+            ->make_concrete(DexAccessFlags(0), /* is_virtual */ true);
+    cls->add_method(method);
+    return method;
+  };
+  auto* b = make_handle_class("Lp/B;", type::java_lang_Object());
+  auto* b_m = add_package_private_m(b);
+  auto* c = make_handle_class("Lq/C;", b->get_type());
+  auto* c_m = add_package_private_m(c);
+  auto* d = make_handle_class("Lp/D;", c->get_type());
+  auto* holder = add_holder(d);
+
+  auto names_b = direct_handle("Lp/B;.m:()V");
+  auto callees = resolve_method_handle_callees(&names_b, holder);
+  EXPECT_NE(std::find(callees.begin(), callees.end(), b_m), callees.end());
+  EXPECT_NE(resolve_method_handle(&names_b, holder), c_m);
+}
+
+namespace {
+
+// Makes `name` with superclass `super` and a public virtual `m:()V`, unless
+// `declares_m` is false.
+DexClass* make_class_with_m(const char* name,
+                            const DexType* super,
+                            bool declares_m = true) {
+  ClassCreator creator(DexType::make_type(name));
+  creator.set_super(const_cast<DexType*>(super));
+  if (declares_m) {
+    creator.add_method(DexMethod::make_method(std::string(name) + ".m:()V")
+                           ->make_concrete(ACC_PUBLIC,
+                                           std::unique_ptr<IRCode>(nullptr),
+                                           /* is_virtual */ true));
+  }
+  return creator.create();
+}
+
+DexMethod* m_of(const char* cls) {
+  return DexMethod::get_method(std::string(cls) + ".m:()V")->as_def();
+}
+
+} // namespace
+
+// An invoke and a call through most method handles resolve to the method that
+// they name, found by the invoke's or the handle's kind.
+TEST_F(ResolverTest, ResolveCallOfInvokeAndHandle) {
+  auto* a = make_class_with_m("LA;", type::java_lang_Object());
+  make_class_with_m("LB;", a->get_type(), /* declares_m */ false);
+  auto* b_m = DexMethod::make_method("LB;.m:()V");
+
+  EXPECT_EQ(resolve_call(OPCODE_INVOKE_VIRTUAL, b_m, nullptr, nullptr),
+            m_of("LA;"));
+  auto* handle = redex::make_method_handle(METHOD_HANDLE_TYPE_INVOKE_INSTANCE,
+                                           "LB;.m:()V");
+  EXPECT_EQ(resolve_call(OPCODE_INVOKE_VIRTUAL, b_m, handle, nullptr),
+            m_of("LA;"));
+}
+
+// An invoke-direct handle of `A.m` held by `C extends B extends A`, where `B`
+// overrides `m`, resolves to `A.m`, which ART checks access to, though it runs
+// `B.m` on Android 9 and `A`'s superclass's method on Android 10 and later.
+TEST_F(ResolverTest, ResolveCallOfInvokeDirectHandleIsNamedMethod) {
+  auto* a = make_class_with_m("LA;", type::java_lang_Object());
+  auto* b = make_class_with_m("LB;", a->get_type());
+  auto* c = make_class_with_m("LC;", b->get_type(), /* declares_m */ false);
+  auto* user = DexMethod::make_method("LC;.use:()V")
+                   ->make_concrete(ACC_PUBLIC | ACC_STATIC,
+                                   std::unique_ptr<IRCode>(nullptr),
+                                   /* is_virtual */ false);
+  c->add_method(user);
+  auto* handle =
+      redex::make_method_handle(METHOD_HANDLE_TYPE_INVOKE_DIRECT, "LA;.m:()V");
+
+  EXPECT_EQ(
+      resolve_call(OPCODE_INVOKE_SUPER, handle->methodref(), handle, user),
+      m_of("LA;"));
+  EXPECT_EQ(resolve_method_handle(handle, user), nullptr);
+}
+
+namespace {
+
+std::set<std::string> indirectly_named_types(const IRInstruction* insn) {
+  std::set<std::string> types;
+  for_each_indirectly_named_type(
+      insn, [&](const DexType* type) { types.insert(show(type)); });
+  return types;
+}
+
+} // namespace
+
+TEST_F(ResolverTest, ForEachIndirectlyNamedType) {
+  using Types = std::set<std::string>;
+
+  IRInstruction handle(OPCODE_CONST_METHOD_HANDLE);
+  handle.set_methodhandle(redex::make_method_handle(
+      METHOD_HANDLE_TYPE_INVOKE_INSTANCE, "LA;.m:([[LB;)LC;"));
+  EXPECT_EQ(indirectly_named_types(&handle), (Types{"LA;", "[[LB;", "LC;"}));
+
+  IRInstruction field_handle(OPCODE_CONST_METHOD_HANDLE);
+  field_handle.set_methodhandle(
+      redex::make_method_handle(METHOD_HANDLE_TYPE_INSTANCE_GET, "LA;.f:LB;"));
+  EXPECT_EQ(indirectly_named_types(&field_handle), (Types{"LA;", "LB;"}));
+
+  IRInstruction method_type(OPCODE_CONST_METHOD_TYPE);
+  method_type.set_proto(DexProto::make_proto("(LD;)[LE;"));
+  EXPECT_EQ(indirectly_named_types(&method_type), (Types{"LD;", "[LE;"}));
+
+  std::vector<std::unique_ptr<DexEncodedValue>> args;
+  args.push_back(
+      std::make_unique<DexEncodedValueType>(DexType::make_type("LF;")));
+  IRInstruction invoke_custom(OPCODE_INVOKE_CUSTOM);
+  invoke_custom.set_callsite(
+      redex::make_callsite("run", "(LG;)V", std::move(args)));
+  auto custom_types = indirectly_named_types(&invoke_custom);
+  EXPECT_TRUE(custom_types.contains("LF;"));
+  EXPECT_TRUE(custom_types.contains("LG;"));
+
+  // Type, field and method operands are not named indirectly.
+  IRInstruction const_class(OPCODE_CONST_CLASS);
+  const_class.set_type(DexType::make_type("LA;"));
+  EXPECT_TRUE(indirectly_named_types(&const_class).empty());
+  IRInstruction iget(OPCODE_IGET_OBJECT);
+  iget.set_field(DexField::make_field("LA;.f:LB;"));
+  EXPECT_TRUE(indirectly_named_types(&iget).empty());
+  IRInstruction invoke(OPCODE_INVOKE_STATIC);
+  invoke.set_method(DexMethod::make_method("LA;.s:(LB;)V"));
+  EXPECT_TRUE(indirectly_named_types(&invoke).empty());
 }

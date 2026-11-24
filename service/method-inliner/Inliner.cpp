@@ -26,6 +26,7 @@
 #include "InlinerConfig.h"
 #include "LiveRange.h"
 #include "LoopInfo.h"
+#include "MethodUtil.h"
 #include "MonitorCount.h"
 #include "Mutators.h"
 #include "OptData.h"
@@ -192,6 +193,8 @@ MultiMethodInliner::MultiMethodInliner(
           },
           0),
       m_scope(scope),
+      m_method_handle_methods(
+          method::gather_methods_named_by_method_handles(scope)),
       m_config(config),
       m_mode(mode),
       m_inline_for_speed(inline_for_speed),
@@ -245,7 +248,7 @@ MultiMethodInliner::MultiMethodInliner(
   walk::parallel::opcodes(
       scope, [](DexMethod*) { return true; },
       [&](DexMethod* caller, IRInstruction* insn) {
-        if (!opcode::is_an_invoke(insn->opcode())) {
+        if (!opcode::is_a_method_invoke(insn->opcode())) {
           return;
         }
         auto* callee = m_concurrent_resolver(insn->get_method(),
@@ -433,7 +436,7 @@ void MultiMethodInliner::inline_methods() {
 
 std::optional<DexMethod*> MultiMethodInliner::get_callee(DexMethod* caller,
                                                          IRInstruction* insn) {
-  if (!opcode::is_an_invoke(insn->opcode())) {
+  if (!opcode::is_a_method_invoke(insn->opcode())) {
     return std::nullopt;
   }
   auto* callee =
@@ -579,7 +582,7 @@ size_t MultiMethodInliner::inline_callees(
     }
     auto* callee = it->second;
     always_assert(callee->is_concrete());
-    always_assert(opcode::is_an_invoke(insn->opcode()));
+    always_assert(opcode::is_a_method_invoke(insn->opcode()));
     const auto* needs_receiver_cast = get_needs_receiver_cast(insn, callee);
     inlinables.push_back((Inlinable){callee, insn, false, false, false, nullptr,
                                      get_callee_insn_size(callee),
@@ -2172,7 +2175,7 @@ bool MultiMethodInliner::should_partially_inline(cfg::Block* block,
                                                  IRInstruction* insn,
                                                  DexMethod* callee,
                                                  PartialCode* partial_code) {
-  always_assert(opcode::is_an_invoke(insn->opcode()));
+  always_assert(opcode::is_a_method_invoke(insn->opcode()));
   always_assert(insn->has_method());
   // Partial inlining peels off the callee's hot prefix and lets the peeled-off
   // code fall back to a plain invocation of the callee, which must be a valid
@@ -2307,33 +2310,42 @@ bool MultiMethodInliner::cannot_inline_opcodes(
 bool MultiMethodInliner::create_vmethod(IRInstruction* insn,
                                         const DexMethod* callee,
                                         const DexMethod* caller) {
-  auto opcode = insn->opcode();
-  if (opcode == OPCODE_INVOKE_DIRECT) {
+  bool needs_vmethod = false;
+  for_each_invoke(insn, [&](IROpcode opcode, DexMethodRef* method_ref,
+                            const DexMethodHandle* /* method_handle */) {
+    if (needs_vmethod || opcode != OPCODE_INVOKE_DIRECT) {
+      return;
+    }
     auto* method =
-        m_concurrent_resolver(insn->get_method(), MethodSearch::Direct, caller);
+        m_concurrent_resolver(method_ref, MethodSearch::Direct, caller);
     if (method == nullptr) {
       info.need_vmethod++;
-      return true;
+      needs_vmethod = true;
+      return;
     }
     always_assert(method->is_def());
     if (caller->get_class() == callee->get_class()) {
       // No need to give up here, or make it static. Visibility is just fine.
-      return false;
+      return;
     }
     if (method::is_init(method)) {
       if (!method->is_concrete() && !is_public(method)) {
         info.non_pub_ctor++;
-        return true;
+        needs_vmethod = true;
       }
       // concrete ctors we can handle because they stay invoke_direct
-      return false;
+      return;
     }
-    if (!can_rename(method) || method->rstate.no_optimizations()) {
+    // Making the method static would change what kind of method a method
+    // handle of it must be, so code that calls a private method that a method
+    // handle names stays in its class.
+    if ((m_method_handle_methods.count(method) != 0u) || !can_rename(method) ||
+        method->rstate.no_optimizations()) {
       info.need_vmethod++;
-      return true;
+      needs_vmethod = true;
     }
-  }
-  return false;
+  });
+  return needs_vmethod;
 }
 
 bool MultiMethodInliner::outlined_invoke_outlined(IRInstruction* insn,
@@ -2346,24 +2358,26 @@ bool MultiMethodInliner::outlined_invoke_outlined(IRInstruction* insn,
 }
 
 /**
- * Return true if a callee contains an invoke super to a different method
- * in the hierarchy.
+ * Return true if a callee contains an instruction whose behavior depends on
+ * the class that holds it (`depends_on_holder_class`), such as an invoke super
+ * to a different method in the hierarchy.
  * Inlining an invoke_super off its class hierarchy would break the verifier.
  */
 bool MultiMethodInliner::nonrelocatable_invoke_super(IRInstruction* insn,
                                                      const DexMethod* callee) {
-  if (insn->opcode() == OPCODE_INVOKE_SUPER) {
-    if (m_config.rewrite_invoke_super) {
-      auto* resolved_method = resolve_invoke_method_deprecated(insn, callee);
-      if ((resolved_method != nullptr) && resolved_method->is_def() &&
-          (resolved_method->as_def()->get_code() != nullptr)) {
-        return false;
-      }
-    }
-    info.invoke_super++;
-    return true;
+  if (!depends_on_holder_class(insn)) {
+    return false;
   }
-  return false;
+  // `CFGInliner::rewrite_invoke_supers` rewrites invoke-super instructions.
+  if (insn->opcode() == OPCODE_INVOKE_SUPER && m_config.rewrite_invoke_super) {
+    auto* resolved_method = resolve_invoke_method_deprecated(insn, callee);
+    if ((resolved_method != nullptr) && resolved_method->is_def() &&
+        (resolved_method->as_def()->get_code() != nullptr)) {
+      return false;
+    }
+  }
+  info.invoke_super++;
+  return true;
 }
 
 /**
@@ -2375,26 +2389,31 @@ bool MultiMethodInliner::nonrelocatable_invoke_super(IRInstruction* insn,
  */
 bool MultiMethodInliner::unknown_virtual(IRInstruction* insn,
                                          const DexMethod* caller) {
-  if (insn->opcode() == OPCODE_INVOKE_VIRTUAL) {
-    auto* method = insn->get_method();
+  bool unknown = false;
+  for_each_invoke(insn, [&](IROpcode opcode, DexMethodRef* method,
+                            const DexMethodHandle* /* method_handle */) {
+    if (unknown || opcode != OPCODE_INVOKE_VIRTUAL) {
+      return;
+    }
     auto* res_method =
         m_concurrent_resolver(method, MethodSearch::Virtual, caller);
     if (res_method == nullptr) {
       info.unresolved_methods++;
       if (unknown_virtuals::is_method_known_to_be_public(method)) {
         info.known_public_methods++;
-        return false;
+        return;
       }
 
       info.escaped_virtual++;
-      return true;
+      unknown = true;
+      return;
     }
     if (res_method->is_external() && !is_public(res_method)) {
       info.non_pub_virtual++;
-      return true;
+      unknown = true;
     }
-  }
-  return false;
+  });
+  return unknown;
 }
 
 /**
@@ -2405,22 +2424,28 @@ bool MultiMethodInliner::unknown_virtual(IRInstruction* insn,
  * we don't know we have no idea whether the field was public or not anyway.
  */
 bool MultiMethodInliner::unknown_field(IRInstruction* insn) {
-  if (opcode::is_an_ifield_op(insn->opcode()) ||
-      opcode::is_an_sfield_op(insn->opcode())) {
-    auto* ref = insn->get_field();
-    DexField* field = resolve_field(ref, opcode::is_an_sfield_op(insn->opcode())
-                                             ? FieldSearch::Static
-                                             : FieldSearch::Instance);
+  bool unknown = false;
+  for_each_field_access(insn, [&](IROpcode opcode, DexFieldRef* ref,
+                                  const DexMethodHandle* method_handle) {
+    if (unknown) {
+      return;
+    }
+    DexField* field = method_handle == nullptr
+                          ? resolve_field(ref, opcode::is_an_sfield_op(opcode)
+                                                   ? FieldSearch::Static
+                                                   : FieldSearch::Instance)
+                          : resolve_field_handle(method_handle);
     if (field == nullptr) {
       info.escaped_field++;
-      return true;
+      unknown = true;
+      return;
     }
     if (!field->is_concrete() && !is_public(field)) {
       info.non_pub_field++;
-      return true;
+      unknown = true;
     }
-  }
-  return false;
+  });
+  return unknown;
 }
 
 /**
@@ -2510,27 +2535,11 @@ MultiMethodInliner::get_callee_type_refs(
   always_assert(callee->get_code()->cfg_built());
   const auto& callee_cfg =
       reduced_cfg != nullptr ? *reduced_cfg : callee->get_code()->cfg();
+  std::vector<const DexType*> named_types;
   for (const auto& mie : InstructionIterable(callee_cfg)) {
-    auto* insn = mie.insn;
-    if (insn->has_type()) {
-      type_refs_set.insert(insn->get_type());
-    } else if (insn->has_method()) {
-      auto* meth = insn->get_method();
-      type_refs_set.insert(meth->get_class());
-      auto* proto = meth->get_proto();
-      type_refs_set.insert(proto->get_rtype());
-      auto* args = proto->get_args();
-      if (args != nullptr) {
-        for (const auto& arg : *args) {
-          type_refs_set.insert(arg);
-        }
-      }
-    } else if (insn->has_field()) {
-      auto* field = insn->get_field();
-      type_refs_set.insert(field->get_class());
-      type_refs_set.insert(field->get_type());
-    }
+    mie.insn->gather_types(named_types);
   }
+  insert_unordered_iterable(type_refs_set, named_types);
 
   auto type_refs = std::make_shared<UnorderedBag<const DexType*>>();
   for (const auto* type : UnorderedIterable(type_refs_set)) {
@@ -2742,7 +2751,7 @@ void MultiMethodInliner::build_hot_callsite_count_ramp() {
   std::vector<float> counts = source_blocks::gather_block_counts(
       m_scope, [](DexMethod*, cfg::Block* block) {
         for (const auto& mie : InstructionIterable(block)) {
-          if (opcode::is_an_invoke(mie.insn->opcode())) {
+          if (opcode::is_a_method_invoke(mie.insn->opcode())) {
             return true;
           }
         }

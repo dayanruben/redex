@@ -311,6 +311,39 @@ TEST_F(LocalDceEnhanceTest, NoImplementorIntfTest) {
   EXPECT_CODE_EQ(ircode, expected_code.get());
 }
 
+TEST_F(LocalDceEnhanceTest, MethodHandleCallHasSideEffects) {
+  Scope scope = create_empty_scope();
+  DexType* a_type = DexType::make_type("LA;");
+  DexClass* a_cls = create_internal_class(a_type, type::java_lang_Object(), {});
+  a_cls->add_method(assembler::method_from_string(R"(
+    (method (public static) "LA;.call:(Ljava/lang/invoke/MethodHandle;)V"
+     (
+      (load-param-object v0)
+      (invoke-polymorphic (v0) "Ljava/lang/invoke/MethodHandle;.invoke:([Ljava/lang/Object;)Ljava/lang/Object;" "()V")
+      (return-void)
+     )
+    )
+  )"));
+  scope.push_back(a_cls);
+
+  auto code = assembler::ircode_from_string(R"(
+    (
+      (load-param-object v0)
+      (invoke-static (v0) "LA;.call:(Ljava/lang/invoke/MethodHandle;)V")
+      (return-void)
+    )
+  )");
+  auto expected_code = assembler::ircode_from_string(R"(
+    (
+      (load-param-object v0)
+      (invoke-static (v0) "LA;.call:(Ljava/lang/invoke/MethodHandle;)V")
+      (return-void)
+    )
+  )");
+  dce(scope, code.get());
+  EXPECT_CODE_EQ(code.get(), expected_code.get());
+}
+
 TEST_F(LocalDceEnhanceTest, HaveImplementorWithoutSideEffectsTest) {
   Scope scope = create_empty_scope();
   auto* void_t = type::_void();
@@ -915,4 +948,63 @@ TEST_F(LocalDceEnhanceTest, ReplaceAllThreeWithInitClassAndPrune) {
   dce(scope, ircode, /* create_init_class_insns */ true,
       /* declaring_type */ type::java_lang_Object());
   EXPECT_CODE_EQ(ircode, expected_code.get());
+}
+
+// A method handle call may do anything, so it is kept even though its result
+// is unused.
+TEST_F(LocalDceTryTest, invokePolymorphicIsRequired) {
+  auto code = assembler::ircode_from_string(R"(
+    (
+      (load-param-object v0)
+      (invoke-polymorphic (v0) "Ljava/lang/invoke/MethodHandle;.invokeExact:([Ljava/lang/Object;)Ljava/lang/Object;" "()I")
+      (move-result v1)
+      (return-void)
+    )
+  )");
+  auto expected = assembler::ircode_from_string(R"(
+    (
+      (load-param-object v0)
+      (invoke-polymorphic (v0) "Ljava/lang/invoke/MethodHandle;.invokeExact:([Ljava/lang/Object;)Ljava/lang/Object;" "()I")
+      (return-void)
+    )
+  )");
+  dce(code.get());
+  EXPECT_CODE_EQ(code.get(), expected.get());
+}
+
+// A method handle call writes the result register, so the result of an earlier
+// call without side effects is dead once the method handle call replaces it.
+TEST_F(LocalDceTryTest, invokePolymorphicKillsEarlierResult) {
+  ClassCreator creator(DexType::make_type("LPure;"));
+  creator.set_super(type::java_lang_Object());
+  auto* pure_method =
+      DexMethod::make_method("LPure;.get:()I")
+          ->make_concrete(ACC_PUBLIC | ACC_STATIC | ACC_NATIVE, false);
+  creator.add_method(pure_method);
+
+  auto code = assembler::ircode_from_string(R"(
+    (
+      (load-param-object v0)
+      (invoke-static () "LPure;.get:()I")
+      (move-result v1)
+      (invoke-polymorphic (v0) "Ljava/lang/invoke/MethodHandle;.invokeExact:([Ljava/lang/Object;)Ljava/lang/Object;" "()I")
+      (move-result v2)
+      (return v2)
+    )
+  )");
+  auto expected = assembler::ircode_from_string(R"(
+    (
+      (load-param-object v0)
+      (invoke-polymorphic (v0) "Ljava/lang/invoke/MethodHandle;.invokeExact:([Ljava/lang/Object;)Ljava/lang/Object;" "()I")
+      (move-result v2)
+      (return v2)
+    )
+  )");
+
+  Scope scope{type_class(type::java_lang_Object()), creator.create()};
+  init_classes::InitClassesWithSideEffects init_classes_with_side_effects(
+      scope, /* create_init_class_insns */ false);
+  UnorderedSet<DexMethodRef*> pure_methods = {pure_method};
+  LocalDce(&init_classes_with_side_effects, pure_methods).dce(code.get());
+  EXPECT_CODE_EQ(code.get(), expected.get());
 }

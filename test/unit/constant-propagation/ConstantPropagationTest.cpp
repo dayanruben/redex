@@ -12,7 +12,10 @@
 #include <gtest/gtest.h>
 
 #include "ConstantPropagationTestUtil.h"
+#include "Creators.h"
+#include "DexStore.h"
 #include "IRAssembler.h"
+#include "RedexTestUtils.h"
 #include "SourceBlocks.h"
 
 using ::testing::AnyNumber;
@@ -61,6 +64,35 @@ TEST_F(ConstantPropagationTest, SourceBlockTargetMutating) {
       }
     }
   }
+}
+
+// A method handle call has no callee to resolve. The analyzers that model
+// particular callees must leave it alone, and its result is unknown.
+TEST_F(ConstantPropagationTest, MethodHandleCallWithBoxedAnalyzers) {
+  auto code = assembler::ircode_from_string(R"(
+    (
+      (load-param-object v0)
+      (const v1 1)
+      (invoke-polymorphic (v0 v1) "Ljava/lang/invoke/MethodHandle;.invokeExact:([Ljava/lang/Object;)Ljava/lang/Object;" "(I)I")
+      (move-result v2)
+      (return v2)
+    )
+  )");
+  auto expected = assembler::to_s_expr(code.get());
+
+  cp::ImmutableAttributeAnalyzerState immut_state;
+  auto string_state = cp::StringAnalyzerState::make_default();
+  auto package_name_state = cp::PackageNameState::make(std::nullopt);
+  cp::EnumFieldAnalyzerState enum_state;
+  cp::BoxedBooleanAnalyzerState boxed_boolean_state;
+  cp::ApiLevelAnalyzerState api_level_state(21);
+  do_const_prop(code.get(),
+                cp::ConstantPrimitiveAndBoxedAnalyzer(
+                    &immut_state, &immut_state, enum_state, boxed_boolean_state,
+                    &string_state, api_level_state, &package_name_state,
+                    nullptr, &immut_state, nullptr, nullptr));
+
+  EXPECT_EQ(assembler::to_s_expr(code.get()), expected);
 }
 
 TEST_F(ConstantPropagationTest, ArrayLengthNonNegative) {
@@ -2076,5 +2108,151 @@ TEST_F(ConstantPropagationTest, CheckNotNullEnablesNullCheckElimination) {
       (return v1)
     )
   )");
+  EXPECT_CODE_EQ(code.get(), expected_code.get());
+}
+
+namespace {
+
+// Applies branch forwarding to `code` as the body of the static method
+// `LFoo;.bar` with prototype `proto`.
+void forward_targets_in_static_method(IRCode* code, std::string_view proto) {
+  auto* foo = DexType::make_type("LFoo;");
+  ClassCreator creator(foo);
+  creator.set_super(type::java_lang_Object());
+  DexStore store("store");
+  store.add_classes({creator.create()});
+  DexStoresVector stores{store};
+  XStoreRefs xstores(stores, /* normal_primary_dex */ false);
+
+  code->build_cfg();
+  cp::NullCheckMethods state;
+  cp::intraprocedural::FixpointIterator intra_cp(
+      code->cfg(), cp::ConstantPrimitiveAnalyzer(),
+      cp::intraprocedural::make_default_no_throw_analyzer(&state));
+  intra_cp.run(ConstantEnvironment());
+  cp::Transform tf(cp::Transform::Config(), state);
+  tf.legacy_apply_forward_targets(intra_cp, code->cfg(), /* is_static */ true,
+                                  foo, DexProto::make_proto(proto), &xstores);
+  code->clear_cfg();
+}
+
+} // namespace
+
+// Branch forwarding skips a method with a catch block that returns a value of
+// an unavailable type, to avoid an Android bug. That includes a value returned
+// by a method handle call.
+TEST_F(ConstantPropagationTest, NoForwardingWithUnavailableMethodHandleResult) {
+  auto code = assembler::ircode_from_string(R"(
+    (
+      (load-param-object v0)
+      (load-param v1)
+      (.try_start a)
+      (invoke-polymorphic (v0) "Ljava/lang/invoke/MethodHandle;.invokeExact:([Ljava/lang/Object;)Ljava/lang/Object;" "()LUnavailable;")
+      (move-result-object v2)
+      (.try_end a)
+      (if-eqz v1 :L1)
+      (const v3 1)
+      (goto :L2)
+      (:L1)
+      (const v3 0)
+      (:L2)
+      (if-eqz v3 :L3)
+      (const v4 0)
+      (:L3)
+      (return-object v2)
+      (.catch (a))
+      (const v2 0)
+      (return-object v2)
+    )
+  )");
+  auto expected_code = std::make_unique<IRCode>(*code);
+  // Only the round trip through the CFG.
+  expected_code->build_cfg();
+  expected_code->clear_cfg();
+
+  forward_targets_in_static_method(
+      code.get(), "(Ljava/lang/invoke/MethodHandle;I)LUnavailable;");
+
+  EXPECT_CODE_EQ(code.get(), expected_code.get());
+}
+
+// The same holds for a value returned by invoke-custom.
+TEST_F(ConstantPropagationTest, NoForwardingWithUnavailableCallSiteResult) {
+  auto code = assembler::ircode_from_string(R"(
+    (
+      (load-param-object v0)
+      (load-param v1)
+      (.try_start a)
+      (invoke-static (v0) "LFoo;.placeholder:(Ljava/lang/Object;)LUnavailable;")
+      (move-result-object v2)
+      (.try_end a)
+      (if-eqz v1 :L1)
+      (const v3 1)
+      (goto :L2)
+      (:L1)
+      (const v3 0)
+      (:L2)
+      (if-eqz v3 :L3)
+      (const v4 0)
+      (:L3)
+      (return-object v2)
+      (.catch (a))
+      (const v2 0)
+      (return-object v2)
+    )
+  )");
+  redex::make_invoke_custom(code.get(), "run",
+                            "(Ljava/lang/Object;)LUnavailable;");
+  auto expected_code = std::make_unique<IRCode>(*code);
+  // Only the round trip through the CFG.
+  expected_code->build_cfg();
+  expected_code->clear_cfg();
+
+  forward_targets_in_static_method(code.get(),
+                                   "(Ljava/lang/Object;I)LUnavailable;");
+
+  EXPECT_CODE_EQ(code.get(), expected_code.get());
+}
+
+// A method handle or method type constant, like a string or class constant,
+// leaves its value in the result register for a move-result-pseudo. Its value
+// is not modeled, so the null test stays.
+TEST_F(ConstantPropagationTest, MethodHandleConstantIsUnknown) {
+  auto code = assembler::ircode_from_string(R"(
+    (
+      (const-method-handle invoke-static "LFoo;.bar:()V")
+      (move-result-pseudo-object v0)
+      (if-eqz v0 :null)
+      (const v1 1)
+      (return v1)
+      (:null)
+      (const v1 0)
+      (return v1)
+    )
+  )");
+  auto expected_code = std::make_unique<IRCode>(*code);
+
+  do_const_prop(code.get());
+
+  EXPECT_CODE_EQ(code.get(), expected_code.get());
+}
+
+TEST_F(ConstantPropagationTest, MethodTypeConstantIsUnknown) {
+  auto code = assembler::ircode_from_string(R"(
+    (
+      (const-method-type "(I)V")
+      (move-result-pseudo-object v0)
+      (if-eqz v0 :null)
+      (const v1 1)
+      (return v1)
+      (:null)
+      (const v1 0)
+      (return v1)
+    )
+  )");
+  auto expected_code = std::make_unique<IRCode>(*code);
+
+  do_const_prop(code.get());
+
   EXPECT_CODE_EQ(code.get(), expected_code.get());
 }

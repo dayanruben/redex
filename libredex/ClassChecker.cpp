@@ -5,17 +5,24 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+#include <algorithm>
+#include <iterator>
 #include <mutex>
+#include <optional>
+#include <string>
+#include <vector>
 
 #include "ClassChecker.h"
 #include "ClassHierarchy.h"
 #include "Debug.h"
 #include "DeterministicContainers.h"
 #include "DexClass.h"
+#include "RedexContext.h"
 #include "Show.h"
 #include "Timer.h"
 #include "TypeUtil.h"
 #include "Walkers.h"
+#include "WorkQueue.h"
 
 namespace {
 
@@ -139,7 +146,159 @@ bool has_colliding_methods(const DexClass* cls,
   }
   return result;
 }
+
+// The type and, if it has a definition, where that comes from.
+std::string describe(const DexType* type) {
+  std::string res = show(type);
+  const auto* cls = type_class(type);
+  if (cls != nullptr && cls->get_location() != nullptr &&
+      !cls->get_location()->get_file_name().empty()) {
+    res += " (from " + cls->get_location()->get_file_name() + ")";
+  }
+  return res;
+}
+
+std::vector<const DexClass*> get_defined_supertypes(const DexClass* cls) {
+  std::vector<const DexClass*> res;
+  if (cls->get_super_class() != nullptr) {
+    const auto* super_cls = type_class(cls->get_super_class());
+    if (super_cls != nullptr) {
+      res.push_back(super_cls);
+    }
+  }
+  for (const auto* intf : *cls->get_interfaces()) {
+    const auto* intf_cls = type_class(intf);
+    if (intf_cls != nullptr) {
+      res.push_back(intf_cls);
+    }
+  }
+  return res;
+}
+
+// Describes a cycle of defined supertypes for each supertype edge that closes
+// one, searching depth-first from `classes` with an explicit stack, as
+// hierarchies can be deep.
+void find_supertype_cycles(const std::vector<const DexClass*>& classes,
+                           std::vector<std::string>* errors) {
+  enum class State { kOnStack, kDone };
+  UnorderedMap<const DexClass*, State> states;
+  struct Frame {
+    const DexClass* cls;
+    std::vector<const DexClass*> supertypes;
+    size_t next{0};
+  };
+  for (const auto* root : classes) {
+    if (states.find(root) != states.end()) {
+      continue;
+    }
+    std::vector<Frame> stack;
+    stack.push_back({root, get_defined_supertypes(root)});
+    states.emplace(root, State::kOnStack);
+    while (!stack.empty()) {
+      auto& frame = stack.back();
+      if (frame.next == frame.supertypes.size()) {
+        states[frame.cls] = State::kDone;
+        stack.pop_back();
+        continue;
+      }
+      const auto* super_cls = frame.supertypes[frame.next++];
+      auto it = states.find(super_cls);
+      if (it == states.end()) {
+        states.emplace(super_cls, State::kOnStack);
+        stack.push_back({super_cls, get_defined_supertypes(super_cls)});
+        continue;
+      }
+      if (it->second == State::kDone) {
+        continue;
+      }
+      if (super_cls == frame.cls) {
+        // The superclass, when defined, comes first in `supertypes`.
+        bool via_superclass =
+            frame.next == 1 && frame.cls->get_super_class() != nullptr &&
+            type_class(frame.cls->get_super_class()) == frame.cls;
+        errors->push_back(
+            "Class " + describe(super_cls->get_type()) +
+            (via_superclass ? " extends itself" : " implements itself"));
+        continue;
+      }
+      auto start =
+          std::find_if(stack.begin(), stack.end(),
+                       [&](const Frame& f) { return f.cls == super_cls; });
+      std::string cycle;
+      for (auto f = start; f != stack.end(); ++f) {
+        cycle += describe(f->cls->get_type()) + " -> ";
+      }
+      cycle += show(super_cls);
+      errors->push_back("Class " + show(super_cls) +
+                        " is its own supertype: " + cycle);
+    }
+  }
+}
+
 } // namespace
+
+std::optional<std::string> check_class_hierarchy(const Scope& scope) {
+  std::vector<const DexClass*> classes(scope.begin(), scope.end());
+  const auto& external_classes = g_redex->external_classes();
+  classes.insert(classes.end(), external_classes.begin(),
+                 external_classes.end());
+  std::sort(classes.begin(), classes.end(), compare_dexclasses);
+  classes.erase(std::unique(classes.begin(), classes.end()), classes.end());
+
+  // The messages follow ART's ClassLinker. Each class's messages go to its own
+  // slot, so that the report does not depend on thread scheduling.
+  std::vector<std::vector<std::string>> errors_by_class(classes.size());
+  workqueue_run_for<size_t>(0, classes.size(), [&](size_t i) {
+    const auto* cls = classes[i];
+    auto& errors = errors_by_class[i];
+    const auto* super = cls->get_super_class();
+    if (is_interface(cls)) {
+      if (super != type::java_lang_Object()) {
+        errors.push_back(
+            "Interface " + describe(cls->get_type()) +
+            (super == nullptr ? std::string(" has no superclass")
+                              : " has superclass " + describe(super)) +
+            ", but interfaces must have java.lang.Object as superclass");
+      }
+    } else if (super != nullptr) {
+      const auto* super_cls = type_class(super);
+      if (super_cls != nullptr && is_interface(super_cls)) {
+        errors.push_back("Superclass " + describe(super) + " of " +
+                         describe(cls->get_type()) + " is an interface");
+      } else if (super_cls != nullptr && is_final(super_cls)) {
+        errors.push_back("Superclass " + describe(super) + " of " +
+                         describe(cls->get_type()) + " is declared final");
+      }
+    }
+    for (const auto* intf : *cls->get_interfaces()) {
+      const auto* intf_cls = type_class(intf);
+      if (intf_cls != nullptr && !is_interface(intf_cls)) {
+        errors.push_back("Class " + describe(cls->get_type()) +
+                         " implements non-interface class " + describe(intf));
+      }
+    }
+  });
+  std::vector<std::string> errors;
+  for (auto& class_errors : errors_by_class) {
+    errors.insert(errors.end(), std::make_move_iterator(class_errors.begin()),
+                  std::make_move_iterator(class_errors.end()));
+  }
+  find_supertype_cycles(classes, &errors);
+  if (errors.empty()) {
+    return std::nullopt;
+  }
+
+  std::ostringstream oss;
+  oss << "Classes the runtime cannot link (inconsistent input, e.g. a library "
+         "jar older than the code compiled against it):\n";
+  for (size_t i = 0; i < errors.size() && i < MAX_ITEMS_TO_PRINT; ++i) {
+    oss << errors[i] << '\n';
+  }
+  if (errors.size() > MAX_ITEMS_TO_PRINT) {
+    oss << "...truncated (" << errors.size() << " in total)...\n";
+  }
+  return oss.str();
+}
 
 ClassChecker::ClassChecker() : m_good(true) {}
 
@@ -169,6 +328,14 @@ void ClassChecker::init_setting(
 }
 
 void ClassChecker::run(const Scope& scope) {
+  // Checked again here so that a pass that breaks these properties is caught.
+  m_class_hierarchy_errors = check_class_hierarchy(scope);
+  if (m_class_hierarchy_errors) {
+    // Some of the checks below walk the class hierarchy and rely on these
+    // properties; a cycle would make them loop.
+    m_good = false;
+    return;
+  }
   std::mutex finals_mutex;
   std::unordered_map<const DexClass*, NamedMethodMap> class_to_final_methods;
   auto hierarchy = build_type_hierarchy(scope);
@@ -258,8 +425,8 @@ void ClassChecker::run(const Scope& scope) {
       for (const auto& child_type : child_types) {
         auto* child_cls = type_class(child_type);
         always_assert(child_cls != nullptr);
-        if (has_colliding_methods(
-                cls, final_methods, child_cls, &m_failed_methods)) {
+        if (has_colliding_methods(cls, final_methods, child_cls,
+                                  &m_failed_methods)) {
           m_good = false;
         }
       }
@@ -269,6 +436,9 @@ void ClassChecker::run(const Scope& scope) {
 
 std::ostringstream ClassChecker::print_failed_classes() {
   std::ostringstream oss;
+  if (m_class_hierarchy_errors) {
+    oss << *m_class_hierarchy_errors << '\n';
+  }
   if (!m_failed_classes_external_check.empty()) {
     oss << "External classes with internal class hierarchy (likely dependency "
            "setting issue if fail at input):"
