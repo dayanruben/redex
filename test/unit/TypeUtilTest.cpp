@@ -289,4 +289,132 @@ TEST_F(TypeUtilTest, is_instance_of_if_known) {
   EXPECT_EQ(is_instance_of_if_known(integer, serializable), true);
   EXPECT_EQ(is_instance_of_if_known(integer, java_lang_String()), false);
   EXPECT_EQ(is_instance_of_if_known(number, integer), false);
+
+  // class Bar implements LibMarker {}  // LibMarker is not loaded
+  // Only interfaces lie behind LibMarker, so Bar is no Number, but may be
+  // Serializable.
+  auto* bar = DexType::make_type("LBar;");
+  ClassCreator bc(bar);
+  bc.set_super(object);
+  bc.add_interface(DexType::make_type("LLibMarker;"));
+  bc.create();
+  EXPECT_EQ(is_instance_of_if_known(bar, number), false);
+  EXPECT_EQ(is_instance_of_if_known(bar, serializable), std::nullopt);
+
+  // class Baz extends LibBase implements Serializable {}  // LibBase unloaded
+  // Serializable, as every interface, leads to Object.
+  auto* baz = DexType::make_type("LBaz;");
+  ClassCreator zc(baz);
+  zc.set_super(DexType::make_type("LLibBase;"));
+  zc.add_interface(serializable);
+  zc.create();
+  EXPECT_EQ(is_instance_of_if_known(baz, object), true);
+  EXPECT_EQ(is_instance_of_if_known(baz, number), std::nullopt);
+}
+
+// I0 extends A1 and B1, A1 and B1 extend both A2 and B2, and so on: an
+// interface hierarchy with 2^40 paths to its top, which a walk that visits an
+// interface more than once does not finish.
+TEST_F(TypeUtilTest, is_instance_of_if_known_shared_interface_ancestors) {
+  using namespace type;
+  ClassCreator(java_lang_Object()).create();
+  auto make_interface = [](const std::string& name,
+                           const std::vector<DexType*>& supers) {
+    ClassCreator creator(DexType::make_type(name));
+    creator.set_super(java_lang_Object());
+    creator.set_access(ACC_PUBLIC | ACC_INTERFACE | ACC_ABSTRACT);
+    for (auto* super : supers) {
+      creator.add_interface(super);
+    }
+    return creator.create()->get_type();
+  };
+  constexpr int kLayers = 40;
+  std::vector<DexType*> layer;
+  for (int i = kLayers; i > 0; --i) {
+    auto n = std::to_string(i);
+    layer = {make_interface("LA" + n + ";", layer),
+             make_interface("LB" + n + ";", layer)};
+  }
+  auto* top = make_interface("LI0;", layer);
+  auto* unrelated = make_interface("LJ;", {});
+  ClassCreator cc(DexType::make_type("LC;"));
+  cc.set_super(java_lang_Object());
+  cc.add_interface(top);
+  auto* c = cc.create()->get_type();
+
+  EXPECT_EQ(is_instance_of_if_known(top, unrelated), false);
+  EXPECT_FALSE(check_cast(c, unrelated));
+  EXPECT_TRUE(check_cast(c, DexType::make_type("LB40;")));
+}
+
+// A method may name a class that is public or in its own package, as on the
+// device; the private flag of a class does not matter.
+TEST_F(TypeUtilTest, can_access_a_class) {
+  auto make_class = [](const char* name, DexAccessFlags access) {
+    ClassCreator creator(DexType::make_type(name));
+    creator.set_super(type::java_lang_Object());
+    creator.set_access(access);
+    return creator.create();
+  };
+  auto make_method = [](const char* name) {
+    return DexMethod::make_method(name)->make_concrete(ACC_PUBLIC | ACC_STATIC,
+                                                       false);
+  };
+  auto* hidden = make_class("Lp/Hidden;", DexAccessFlags(0));
+  auto* nested = make_class("Lp/Outer$Nested;", ACC_PRIVATE);
+  auto* open = make_class("Lp/Open;", ACC_PUBLIC);
+  auto* in_p = make_method("Lp/User;.run:()V");
+  auto* in_q = make_method("Lq/User;.run:()V");
+
+  EXPECT_TRUE(type::can_access(in_p, hidden));
+  EXPECT_TRUE(type::can_access(in_p, nested));
+  EXPECT_TRUE(type::can_access(in_p, open));
+  EXPECT_FALSE(type::can_access(in_q, hidden));
+  EXPECT_FALSE(type::can_access(in_q, nested));
+  EXPECT_TRUE(type::can_access(in_q, open));
+  EXPECT_TRUE(type::can_access(in_q, static_cast<const DexClass*>(nullptr)));
+}
+
+// Code a pass adds may name any app class when a later pass makes every app
+// class public; a class outside the app keeps its access. An array is named by
+// its element class.
+TEST_F(TypeUtilTest, can_name_a_type) {
+  auto make_class = [](const char* name, bool external) {
+    ClassCreator creator(DexType::make_type(name));
+    creator.set_super(type::java_lang_Object());
+    creator.set_access(DexAccessFlags(0));
+    if (external) {
+      creator.set_external();
+    }
+    return creator.create()->get_type();
+  };
+  auto* app = make_class("Lp/AppHidden;", /* external */ false);
+  auto* framework = make_class("Lp/FrameworkHidden;", /* external */ true);
+  auto* app_array = DexType::make_type("[[Lp/AppHidden;");
+  auto* in_q = DexMethod::make_method("Lq/Adder;.run:()V")
+                   ->make_concrete(ACC_PUBLIC | ACC_STATIC, false);
+
+  EXPECT_FALSE(type::can_name_type(in_q, app, false));
+  EXPECT_FALSE(type::can_name_type(in_q, app_array, false));
+  EXPECT_FALSE(type::can_name_type(in_q, framework, false));
+  EXPECT_TRUE(type::can_name_type(in_q, app, true));
+  EXPECT_TRUE(type::can_name_type(in_q, app_array, true));
+  EXPECT_FALSE(type::can_name_type(in_q, framework, true));
+}
+
+// Code a pass adds may not name a class Redex has no definition of, while a
+// check of existing code assumes such a class accessible. Primitive types are
+// always nameable.
+TEST_F(TypeUtilTest, can_name_only_a_type_redex_can_see) {
+  auto* unknown = DexType::make_type("Lp/Unknown;");
+  auto* unknown_array = DexType::make_type("[Lp/Unknown;");
+  auto* in_q = DexMethod::make_method("Lq/Adder2;.run:()V")
+                   ->make_concrete(ACC_PUBLIC | ACC_STATIC, false);
+
+  EXPECT_TRUE(type::can_access_type(in_q, unknown));
+  EXPECT_FALSE(type::can_name_type(in_q, unknown, false));
+  EXPECT_FALSE(type::can_name_type(in_q, unknown, true));
+  EXPECT_FALSE(type::can_name_type(in_q, unknown_array, true));
+  EXPECT_TRUE(type::can_name_type(in_q, type::_int(), false));
+  EXPECT_TRUE(type::can_name_type(in_q, DexType::make_type("[I"), false));
 }

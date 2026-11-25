@@ -19,26 +19,13 @@ LDADD = $(COMMON_TEST_LIBS)
 LOG_COMPILER = sh
 AM_LOG_FLAGS = -c 'if [ -f $$0.env ] ; then . ./$$0.env ; fi ; sdk_path=$(ANDROID_SDK) android_target=$(ANDROID_PLATFORM_VERSION) ./$$0'
 
-# make_env: Simple helper to generate test-specific env.
-#
-# $1: test name
-# $2: space-separated list of env values
-#
-# Use: $(eval $(call make_env,test_name,a=b c=d))
-define make_env
-
-$(1).env:
-	rm -f $$@
-	$(foreach pair,$(2), echo "export $(pair)" >> $$@ ;)
-
-endef
-
 ####
 # Actual test definitions
 ####
 
 check_PROGRAMS = \
     access_marking_method_handle_test \
+    accessibility_checker_test \
     aliased_registers_test \
     analysis_usage_test \
     anno_kill_test \
@@ -51,6 +38,7 @@ check_PROGRAMS = \
     assert_test \
     atomic_field_updater_lowering_test \
     atomic_map_test \
+    atomic_stat_counter_test \
     baseline_profile_test \
     blaming_escape_test \
     block_offset_sink_test \
@@ -81,6 +69,8 @@ check_PROGRAMS = \
     constant_uses_test \
     constructor_accesses_test \
     constructor_analysis_test \
+    constructor_field_analyzer_test \
+    constructor_fields_test \
     control_flow_test \
     copy_propagation_test \
     cpp_util_test \
@@ -119,6 +109,7 @@ check_PROGRAMS = \
     graph_util_test \
     hierarchy_util_test \
     hot_callsites_test \
+    hot_cold_method_specializing_test \
     init_class_test \
     init_class_pruner_test \
     init_class_lowering_pass_test \
@@ -167,6 +158,7 @@ check_PROGRAMS = \
     native_names_test \
     never_compile_selection_test \
     never_inline_eligibility_test \
+    nopper_test \
     null_propagation_test \
     obfuscate_method_handle_test \
     object_inliner_test \
@@ -175,6 +167,7 @@ check_PROGRAMS = \
     outliner_type_analysis_test \
     package_private_preprocessor_method_handle_test \
     partial_pass_test \
+    pass_input_edits_test \
     pass_manager_feature_test \
     peephole_test \
     position_interning_test \
@@ -234,16 +227,19 @@ check_PROGRAMS = \
     stringbuilder_append_chain_test \
     stringbuilder_outline_test \
     strip_debug_info_test \
+    string_propagation_test \
     string_switch_test \
     string_switch_transform_test \
     switch_dispatch_test \
     switch_equiv_test \
+    tail_duplication_test \
     throw_propagation_test \
     rare_suffix_selection_test \
     rare_suffix_method_splitting_test \
     timer_test \
     trace_multithreading_test \
     true_virtuals_test \
+    type_analysis_runtime_assert_test \
     type_analysis_transform_test \
     type_inference_test \
     type_ref_updater_test \
@@ -254,6 +250,8 @@ check_PROGRAMS = \
     typed_nonreturning_methods_test \
     uninitialized_objects_test \
     unique_method_tracker_test \
+    unknown_virtuals_test \
+    unreachable_lowering_pass_test \
     up_code_motion_test \
     used_vars_test \
     vertical_merging_method_handle_test \
@@ -268,6 +266,8 @@ check_PROGRAMS = \
     string_tree_test
 
 access_marking_method_handle_test_SOURCES = AccessMarkingMethodHandleTest.cpp
+
+accessibility_checker_test_SOURCES = AccessibilityCheckerTest.cpp
 
 aliased_registers_test_SOURCES = AliasedRegistersTest.cpp
 
@@ -364,6 +364,9 @@ concurrent_hashtable_test_SOURCES = ConcurrentHashtableTest.cpp
 
 atomic_map_test_SOURCES = AtomicMapTest.cpp
 
+pass_input_edits_test_SOURCES = PassInputEditsTest.cpp $(top_srcdir)/test/common/pass_input_edits/PassInputEdits.cpp
+pass_input_edits_test_CPPFLAGS = $(AM_CPPFLAGS) -I$(top_srcdir)/test/common/pass_input_edits -I$(top_srcdir)/opt/remove-unused-fields
+
 pass_manager_feature_test_SOURCES = PassManagerFeatureTest.cpp
 
 configurable_test_SOURCES = ConfigurableTest.cpp
@@ -379,6 +382,12 @@ constant_uses_test_LDADD = $(COMMON_MOCK_TEST_LIBS)
 constructor_accesses_test_SOURCES = ConstructorAccessesTest.cpp
 
 constructor_analysis_test_SOURCES = ConstructorAnalysisTest.cpp
+
+constructor_field_analyzer_test_SOURCES = constant-propagation/ConstructorFieldAnalyzerTest.cpp
+constructor_field_analyzer_test_LDADD = $(COMMON_MOCK_TEST_LIBS)
+
+constructor_fields_test_SOURCES = constant-propagation/ConstructorFieldsTest.cpp
+constructor_fields_test_LDADD = $(COMMON_MOCK_TEST_LIBS)
 
 control_flow_test_SOURCES = ControlFlowTest.cpp
 control_flow_test_LDADD = $(COMMON_MOCK_TEST_LIBS)
@@ -587,7 +596,7 @@ never_inline_eligibility_test_SOURCES = NeverInlineEligibilityTest.cpp
 
 nopper_test_SOURCES = NopperTest.cpp
 
-null_propagation_test_SOURCES = constant-propagation/NullPropagationTest.cpp
+null_propagation_test_SOURCES = constant-propagation/NullPropagationTest.cpp OpcodeList.cpp
 
 obfuscate_method_handle_test_SOURCES = ObfuscateMethodHandleTest.cpp $(top_srcdir)/test/common/RedexTestUtils.cpp
 
@@ -766,6 +775,8 @@ trace_multithreading_test_LDADD = $(COMMON_MOCK_TEST_LIBS)
 true_virtuals_test_SOURCES = TrueVirtualsTest.cpp ScopeHelper.cpp
 true_virtuals_test_LDADD = $(COMMON_MOCK_TEST_LIBS)
 
+type_analysis_runtime_assert_test_SOURCES = type-analysis/TypeAnalysisRuntimeAssertTest.cpp
+
 type_analysis_transform_test_SOURCES = type-analysis/TypeAnalysisTransformTest.cpp
 
 type_inference_test_SOURCES = TypeInferenceTest.cpp $(top_srcdir)/test/common/RedexTestUtils.cpp
@@ -788,6 +799,8 @@ uninitialized_objects_test_SOURCES = UninitializedObjectsTest.cpp
 
 unique_method_tracker_test_SOURCES = UniqueMethodTrackerTest.cpp
 unique_method_tracker_test_LDADD = $(COMMON_MOCK_TEST_LIBS)
+
+unknown_virtuals_test_SOURCES = UnknownVirtualsTest.cpp
 
 up_code_motion_test_SOURCES = UpCodeMotionTest.cpp
 up_code_motion_test_LDADD = $(COMMON_MOCK_TEST_LIBS)

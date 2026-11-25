@@ -138,40 +138,62 @@ bool Transform::replace_with_const(const ConstantEnvironment& env,
                                    const DexType* declaring_type) {
   auto* insn = cfg_it->insn;
   auto value = env.get(insn->dest());
+  if (opcode::is_a_move_result_pseudo(insn->opcode())) {
+    return replace_primary_with_const(value, cfg_it, xstores, declaring_type);
+  }
   auto replacement = ConstantValue::apply_visitor(
       value_to_instruction_visitor(insn, xstores, declaring_type), value);
   if (replacement.empty()) {
     return false;
   }
-  if (opcode::is_a_move_result_pseudo(insn->opcode())) {
-    auto primary_it = cfg_it.cfg().primary_instruction_of_move_result(cfg_it);
-    // Materializing a constant into a move-result-pseudo's dest replaces -- and
-    // therefore deletes -- the primary instruction. Keep a check-cast that
-    // could throw, since deleting it would drop the exception.
-    if (is_possibly_throwing_check_cast(primary_it->insn, value)) {
-      return false;
-    }
-    always_assert(!replacement.empty());
-    if (replacement.size() == 1) {
-      IROpcode opcode = replacement.front()->opcode();
-      always_assert(opcode::is_a_literal_const(opcode) ||
-                    opcode == IOPCODE_R_CONST);
-      // The move-result-pseudo instruction might be in a different block. We
-      // cannot use the CFGMutator's replace functionality, as it would put the
-      // replacement into the wrong block --- the block of the primary
-      // instruction, not the following block. This is not generally a problem,
-      // except that we might later want to run forward_targets, which requires
-      // blocks, their recorded entry/state states and containing instructions
-      // to be consistent. So we work around that here by directly inserting in
-      // the right place...
-      cfg_it.cfg().insert_after(cfg_it, replacement);
-      m_mutation->remove(primary_it);
-    } else {
-      always_assert(opcode::may_throw(replacement.front()->opcode()));
-      m_mutation->replace(primary_it, replacement);
-    }
+  m_mutation->replace(cfg_it, replacement);
+  ++m_stats.materialized_consts;
+  return true;
+}
+
+/*
+ * Materializing a constant into the dest of a move-result(-pseudo) replaces --
+ * and therefore deletes -- the primary instruction.
+ */
+bool Transform::replace_primary_with_const(
+    const ConstantValue& value,
+    const cfg::InstructionIterator& move_result_it,
+    const XStoreRefs* xstores,
+    const DexType* declaring_type) {
+  auto replacement = ConstantValue::apply_visitor(
+      value_to_instruction_visitor(move_result_it->insn, xstores,
+                                   declaring_type),
+      value);
+  if (replacement.empty()) {
+    return false;
+  }
+  auto primary_it =
+      move_result_it.cfg().primary_instruction_of_move_result(move_result_it);
+  // Keep a check-cast that could throw, since deleting it would drop the
+  // exception.
+  if (is_possibly_throwing_check_cast(primary_it->insn, value)) {
+    return false;
+  }
+  always_assert(!replacement.empty());
+  if (replacement.size() == 1) {
+    IROpcode opcode = replacement.front()->opcode();
+    always_assert(opcode::is_a_literal_const(opcode) ||
+                  opcode == IOPCODE_R_CONST);
+    // The move-result(-pseudo) instruction might be in a different block. We
+    // cannot use the CFGMutator's replace functionality, as it would put the
+    // replacement into the wrong block --- the block of the primary
+    // instruction, not the following block. This is not generally a problem,
+    // except that we might later want to run forward_targets, which requires
+    // blocks, their recorded entry/state states and containing instructions
+    // to be consistent. So we work around that here by directly inserting in
+    // the right place...
+    move_result_it.cfg().insert_after(move_result_it, replacement);
+    m_mutation->remove(primary_it);
   } else {
-    m_mutation->replace(cfg_it, replacement);
+    // A constant that takes more than one instruction starts with a
+    // const-string or const-class, and both may throw.
+    always_assert(opcode::may_throw(replacement.front()->opcode()));
+    m_mutation->replace(primary_it, replacement);
   }
   ++m_stats.materialized_consts;
   return true;
@@ -336,9 +358,8 @@ void Transform::swap_kotlin_areequal(
   }
 }
 
-bool Transform::replace_kotlin_areequal(
-    const ConstantEnvironment& env, const cfg::InstructionIterator& cfg_it) {
-  auto* insn = cfg_it->insn;
+bool Transform::can_replace_kotlin_areequal(const ConstantEnvironment& env,
+                                            const IRInstruction* insn) const {
   if (insn->opcode() != OPCODE_INVOKE_STATIC) {
     return false;
   }
@@ -351,15 +372,15 @@ bool Transform::replace_kotlin_areequal(
   // Both invoke-static areEqual and invoke-virtual equals take two source
   // registers (the static args / receiver + arg), so in-place modification
   // preserves the associated move-result-pseudo.
-  if (!is_known_non_null(env.get(insn->src(0)))) {
-    return false;
-  }
+  return is_known_non_null(env.get(insn->src(0)));
+}
+
+void Transform::replace_kotlin_areequal(IRInstruction* insn) {
   auto* object_equals = method::java_lang_Object_equals();
   always_assert(object_equals != nullptr);
   insn->set_opcode(OPCODE_INVOKE_VIRTUAL);
   insn->set_method(object_equals);
   ++m_stats.kotlin_areequal_replaced;
-  return true;
 }
 
 bool Transform::eliminate_redundant_put(
@@ -393,7 +414,13 @@ bool Transform::eliminate_redundant_put(
     // The ConstantEnvironment tells us the abstract value of a non-escaping
     // field at this particular program point.
     ConstantValue existing_val;
-    if (m_config.class_under_init == field->get_class()) {
+    if (m_config.constructor_fields != nullptr &&
+        m_config.constructor_fields->get_class() == field->get_class()) {
+      if (!m_config.constructor_fields->is_this_access(insn)) {
+        break;
+      }
+      existing_val = env.get(field);
+    } else if (m_config.class_under_init == field->get_class()) {
       existing_val = env.get(field);
     } else {
       existing_val = wps.get_field_value(field);
@@ -850,6 +877,34 @@ struct ClassLiteralMethodsReplacer {
 
 } // namespace
 
+/*
+ * A call that certainly reaches a registered attribute getter without side
+ * effects, on an object that is known not to be null, can be removed when its
+ * result is a known constant: the constant replaces the whole call.
+ */
+void Transform::remove_attribute_getter_call(
+    const ConstantEnvironment& env,
+    const cfg::InstructionIterator& cfg_it,
+    const XStoreRefs* xstores,
+    const DexType* declaring_type) {
+  if (m_config.getter_methods_for_immutable_fields == nullptr ||
+      m_config.pure_methods == nullptr) {
+    return;
+  }
+  auto* getter = resolve_attribute_getter_call(
+      *m_config.getter_methods_for_immutable_fields, cfg_it->insn, env);
+  if (getter == nullptr || !assumenosideeffects(getter, getter)) {
+    return;
+  }
+  auto move_result_it = cfg_it.cfg().move_result_of(cfg_it);
+  if (!move_result_it.is_end() &&
+      replace_primary_with_const(env.get(RESULT_REGISTER), move_result_it,
+                                 xstores, declaring_type)) {
+    m_redundant_move_results.insert(move_result_it->insn);
+    ++m_stats.attribute_getter_calls_removed;
+  }
+}
+
 bool Transform::assumenosideeffects(DexMethodRef* ref, DexMethod* meth) const {
   if (::assumenosideeffects(meth)) {
     return true;
@@ -950,12 +1005,18 @@ void Transform::simplify_instruction(const ConstantEnvironment& env,
   case OPCODE_AND_INT:
   case OPCODE_OR_INT:
   case OPCODE_XOR_INT:
+  case OPCODE_SHL_INT:
+  case OPCODE_SHR_INT:
+  case OPCODE_USHR_INT:
   case OPCODE_ADD_LONG:
   case OPCODE_SUB_LONG:
   case OPCODE_MUL_LONG:
   case OPCODE_AND_LONG:
   case OPCODE_OR_LONG:
   case OPCODE_XOR_LONG:
+  case OPCODE_SHL_LONG:
+  case OPCODE_SHR_LONG:
+  case OPCODE_USHR_LONG:
   case OPCODE_NOT_INT:
   case OPCODE_NEG_INT:
   case OPCODE_NEG_LONG:
@@ -993,7 +1054,12 @@ void Transform::simplify_instruction(const ConstantEnvironment& env,
           insn, insn->get_method(), env, cfg_it, *m_mutation, m_stats, context);
       break;
     }
+    remove_attribute_getter_call(env, cfg_it, xstores, declaring_type);
+    break;
+  }
 
+  case OPCODE_INVOKE_INTERFACE: {
+    remove_attribute_getter_call(env, cfg_it, xstores, declaring_type);
     break;
   }
 
@@ -1259,12 +1325,21 @@ void Transform::legacy_apply_constants_and_prune_unreachable(
     auto ii = InstructionIterable(block);
     for (auto it = ii.begin(); it != ii.end(); it++) {
       auto cfg_it = block->to_cfg_instruction_iterator(it);
-      bool any_changes = eliminate_redundant_put(env, wps, cfg_it) ||
-                         eliminate_redundant_null_check(env, wps, cfg_it) ||
-                         replace_kotlin_areequal(env, cfg_it) ||
-                         replace_with_throw(env, cfg_it, &npe_creator);
       auto* insn = cfg_it->insn;
+      bool replaces_areequal = false;
+      bool any_changes = eliminate_redundant_put(env, wps, cfg_it) ||
+                         eliminate_redundant_null_check(env, wps, cfg_it);
+      if (!any_changes) {
+        replaces_areequal = can_replace_kotlin_areequal(env, insn);
+        any_changes =
+            replaces_areequal || replace_with_throw(env, cfg_it, &npe_creator);
+      }
       intra_cp.analyze_instruction(insn, &env, insn == last_insn->insn);
+      // The call to equals replaces the one to areEqual only after the
+      // analysis reads it, as the analysis may know what areEqual returns.
+      if (replaces_areequal) {
+        replace_kotlin_areequal(insn);
+      }
       if (!any_changes && (m_redundant_move_results.count(insn) == 0u)) {
         simplify_instruction(env, wps, cfg_it, xstores, declaring_type,
                              context);
@@ -1695,6 +1770,8 @@ void Transform::Stats::log_metrics(ScopedMetrics& sm, bool with_scope) const {
   sm.set_metric("kotlin_areequal_replaced", kotlin_areequal_replaced);
   sm.set_metric("branches_with_both_successors_infeasible",
                 branches_with_both_successors_infeasible);
+  sm.set_metric("attribute_getter_calls_removed",
+                attribute_getter_calls_removed);
 }
 
 } // namespace constant_propagation

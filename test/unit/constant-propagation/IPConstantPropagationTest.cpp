@@ -537,6 +537,113 @@ INSTANTIATE_TEST_SUITE_P(
                       AncestorCalleeProofCase::NoOptimizations,
                       AncestorCalleeProofCase::External));
 
+class SelfDelegationTest : public InterproceduralConstantPropagationTest,
+                           public ::testing::WithParamInterface<bool> {};
+
+TEST_P(SelfDelegationTest, constructorCallingItselfAssignsNothingForSure) {
+  // `Foo(int)` calls itself on `this`, directly or through `Foo()`, before it
+  // stores `x`. Neither call assigns `x` for sure.
+  const bool through_other = GetParam();
+  auto* field = DexField::make_field("LFoo;.x:I")->make_concrete(ACC_PUBLIC);
+  ClassCreator creator(DexType::make_type("LFoo;"));
+  creator.set_super(type::java_lang_Object());
+  creator.add_field(field);
+  creator.add_method(assembler::method_from_string(
+      std::string(R"(
+    (method (public constructor) "LFoo;.<init>:(I)V"
+      (
+        (load-param-object v0)
+        (load-param v1)
+        (if-eqz v1 :base)
+  )") +
+      (through_other ? R"((invoke-direct (v0) "LFoo;.<init>:()V"))"
+                     : R"((const v2 0)
+                            (invoke-direct (v0 v2) "LFoo;.<init>:(I)V"))") +
+      R"(
+        (return-void)
+        (:base)
+        (invoke-direct (v0) "Ljava/lang/Object;.<init>:()V")
+        (const v2 1)
+        (iput v2 v0 "LFoo;.x:I")
+        (return-void)
+      )
+    )
+  )"));
+  creator.add_method(assembler::method_from_string(R"(
+    (method (public constructor) "LFoo;.<init>:()V"
+      (
+        (load-param-object v0)
+        (const v1 0)
+        (invoke-direct (v0 v1) "LFoo;.<init>:(I)V")
+        (return-void)
+      )
+    )
+  )"));
+  Scope scope{creator.create()};
+  walk::code(scope, [](DexMethod*, IRCode& code) {
+    code.build_cfg();
+    code.cfg().calculate_exit_block();
+  });
+  auto assigned =
+      definitely_assigned_ifields::get_definitely_assigned_ifields(scope);
+  EXPECT_EQ(assigned.count(field), 0u);
+}
+
+INSTANTIATE_TEST_SUITE_P(SelfDelegation, SelfDelegationTest, ::testing::Bool());
+
+class CycleOrderTest : public InterproceduralConstantPropagationTest,
+                       public ::testing::WithParamInterface<bool> {};
+
+TEST_P(CycleOrderTest, resultDoesNotDependOnWhichConstructorComesFirst) {
+  // `a` stores `x` and may then call `b` on `this`; `b` only calls `a` on
+  // `this`. Both assign `x` for sure. Swapping their signatures swaps which
+  // one the analysis meets first.
+  const bool swapped = GetParam();
+  const std::string a_sig = swapped ? "LFoo;.<init>:(I)V" : "LFoo;.<init>:()V";
+  const std::string b_sig = swapped ? "LFoo;.<init>:()V" : "LFoo;.<init>:(I)V";
+  const auto call = [](const std::string& sig) {
+    return sig == "LFoo;.<init>:()V"
+               ? std::string(R"((invoke-direct (v0) "LFoo;.<init>:()V"))")
+               : std::string(R"((const v2 0)
+                                (invoke-direct (v0 v2) "LFoo;.<init>:(I)V"))");
+  };
+  const auto params = [](const std::string& sig) {
+    return sig == "LFoo;.<init>:()V" ? std::string("(load-param-object v0)")
+                                     : std::string(R"((load-param-object v0)
+                                                      (load-param v1))");
+  };
+  auto* field = DexField::make_field("LFoo;.x:I")->make_concrete(ACC_PUBLIC);
+  ClassCreator creator(DexType::make_type("LFoo;"));
+  creator.set_super(type::java_lang_Object());
+  creator.add_field(field);
+  creator.add_method(
+      assembler::method_from_string("(method (public constructor) \"" + a_sig +
+                                    "\" (" + params(a_sig) +
+                                    R"(
+        (const v3 1)
+        (iput v3 v0 "LFoo;.x:I")
+        (const v3 0)
+        (if-eqz v3 :done)
+      )" + call(b_sig) +
+                                    R"(
+        (:done)
+        (return-void)
+      )))"));
+  creator.add_method(assembler::method_from_string(
+      "(method (public constructor) \"" + b_sig + "\" (" + params(b_sig) +
+      call(a_sig) + "(return-void)))"));
+  Scope scope{creator.create()};
+  walk::code(scope, [](DexMethod*, IRCode& code) {
+    code.build_cfg();
+    code.cfg().calculate_exit_block();
+  });
+  auto assigned =
+      definitely_assigned_ifields::get_definitely_assigned_ifields(scope);
+  EXPECT_EQ(assigned.count(field), 1u);
+}
+
+INSTANTIATE_TEST_SUITE_P(CycleOrder, CycleOrderTest, ::testing::Bool());
+
 TEST_F(InterproceduralConstantPropagationTest, constantArgument) {
   // Let bar() be the only method calling baz(I)V, passing it a constant
   // argument. baz() should be optimized for that constant argument.
@@ -5856,4 +5963,212 @@ TEST_F(InterproceduralConstantPropagationTest,
                                                      conf);
   clinit->get_code()->clear_cfg();
   EXPECT_EQ(assembler::to_s_expr(clinit->get_code()), expected);
+}
+
+namespace {
+
+// Runs IPCP on a class `LFoo;` with super class `super`, field `x`, the
+// constructor `ctor` and a static reader `LFoo;.get:(LFoo;)I`, and returns the
+// reader's code.
+std::string ipcp_reader_code(const DexType* super,
+                             const std::string& ctor,
+                             Scope scope,
+                             ConfigFiles& conf) {
+  ClassCreator creator(DexType::make_type("LFoo;"));
+  creator.set_super(const_cast<DexType*>(super));
+  creator.add_field(
+      DexField::make_field("LFoo;.x:I")->make_concrete(ACC_PUBLIC));
+  auto* init = assembler::method_from_string(ctor);
+  init->rstate.set_root();
+  creator.add_method(init);
+  auto* get = assembler::method_from_string(R"(
+    (method (public static) "LFoo;.get:(LFoo;)I"
+     (
+      (load-param-object v0)
+      (iget v0 "LFoo;.x:I")
+      (move-result-pseudo v0)
+      (return v0)
+     )
+    )
+  )");
+  get->rstate.set_root();
+  creator.add_method(get);
+  scope.push_back(creator.create());
+  walk::code(scope, [](DexMethod*, IRCode& code) {
+    code.build_cfg();
+    code.cfg().calculate_exit_block();
+  });
+  InterproceduralConstantPropagationPass::Config config;
+  config.max_heap_analysis_iterations = 2;
+  InterproceduralConstantPropagationPass(config).run(make_simple_stores(scope),
+                                                     conf);
+  get->get_code()->clear_cfg();
+  return assembler::to_string(get->get_code());
+}
+
+} // namespace
+
+TEST_F(InterproceduralConstantPropagationTest,
+       benignUsesOfThisDoNotEndDefiniteAssignment) {
+  const auto code = ipcp_reader_code(type::java_lang_Object(), R"(
+    (method (public constructor) "LFoo;.<init>:()V"
+     (
+      (load-param-object v0)
+      (invoke-direct (v0) "Ljava/lang/Object;.<init>:()V")
+      (monitor-enter v0)
+      (instance-of v0 "LFoo;")
+      (move-result-pseudo v1)
+      (check-cast v0 "LFoo;")
+      (move-result-pseudo-object v2)
+      (const v3 1)
+      (iput v3 v2 "LFoo;.x:I")
+      (monitor-exit v0)
+      (return-void)
+     )
+    )
+  )",
+                                     Scope{}, conf);
+  // Neither the monitor, the type test nor the cast lets `this` escape, so
+  // `x` is always 1.
+  EXPECT_EQ(code.find("iget"), std::string::npos) << code;
+}
+
+class CopyOfThisEscapeTest : public InterproceduralConstantPropagationTest,
+                             public ::testing::WithParamInterface<const char*> {
+};
+
+TEST_P(CopyOfThisEscapeTest, escapeOfACopyEndsDefiniteAssignment) {
+  // The type test, null check and monitor let nothing escape, but `get` reads
+  // the zero `x` through a copy of `this`.
+  const auto code = ipcp_reader_code(type::java_lang_Object(), std::string(R"(
+    (method (public constructor) "LFoo;.<init>:()V"
+     (
+      (load-param-object v0)
+      (invoke-direct (v0) "Ljava/lang/Object;.<init>:()V")
+      (instance-of v0 "LFoo;")
+      (move-result-pseudo v1)
+      (if-eqz v0 :skip)
+      (:skip)
+      (monitor-enter v0)
+      (monitor-exit v0)
+  )") + GetParam() + R"(
+      (invoke-static (v2) "LFoo;.get:(LFoo;)I")
+      (move-result v1)
+      (const v3 1)
+      (iput v3 v0 "LFoo;.x:I")
+      (return-void)
+     )
+    )
+  )",
+                                     Scope{}, conf);
+  EXPECT_NE(code.find("iget"), std::string::npos) << code;
+}
+
+INSTANTIATE_TEST_SUITE_P(CopiesOfThis,
+                         CopyOfThisEscapeTest,
+                         ::testing::Values(R"((move-object v2 v0))",
+                                           R"((check-cast v0 "LFoo;")
+                         (move-result-pseudo-object v2))"));
+
+class AncestorReadTest : public InterproceduralConstantPropagationTest,
+                         public ::testing::WithParamInterface<bool> {};
+
+TEST_P(AncestorReadTest, ancestorReadingTheFieldEndsDefiniteAssignment) {
+  // `Foo` extends `Middle`, which extends `Base`, and `Foo()` calls `Base()`
+  // directly, as Redex's constructor inlining leaves it. If `Base()` casts
+  // `this` down and reads `x`, it sees zero, though `this` never escapes.
+  const bool reads = GetParam();
+  ClassCreator base(DexType::make_type("LBase;"));
+  base.set_super(type::java_lang_Object());
+  base.add_method(assembler::method_from_string(std::string(R"(
+    (method (public constructor) "LBase;.<init>:()V"
+     (
+      (load-param-object v0)
+      (invoke-direct (v0) "Ljava/lang/Object;.<init>:()V")
+  )") +
+                                                (reads ? R"(
+      (check-cast v0 "LFoo;")
+      (move-result-pseudo-object v1)
+      (iget v1 "LFoo;.x:I")
+      (move-result-pseudo v2)
+      (sput v2 "LBase;.seen:I")
+  )"
+                                                       : "") +
+                                                R"(
+      (return-void)
+     )
+    )
+  )"));
+  auto* seen = DexField::make_field("LBase;.seen:I")
+                   ->make_concrete(ACC_PUBLIC | ACC_STATIC);
+  seen->rstate.set_root();
+  base.add_field(seen);
+  auto* base_cls = base.create();
+  ClassCreator middle(DexType::make_type("LMiddle;"));
+  middle.set_super(base_cls->get_type());
+  const auto code = ipcp_reader_code(DexType::make_type("LMiddle;"), R"(
+    (method (public constructor) "LFoo;.<init>:()V"
+     (
+      (load-param-object v0)
+      (invoke-direct (v0) "LBase;.<init>:()V")
+      (const v1 1)
+      (iput v1 v0 "LFoo;.x:I")
+      (return-void)
+     )
+    )
+  )",
+                                     Scope{base_cls, middle.create()}, conf);
+  EXPECT_EQ(code.find("iget") != std::string::npos, reads) << code;
+}
+
+INSTANTIATE_TEST_SUITE_P(AncestorReads, AncestorReadTest, ::testing::Bool());
+
+TEST_F(InterproceduralConstantPropagationTest,
+       fieldStoredAfterSuperConstructorIsDefinitelyAssigned) {
+  ClassCreator base(DexType::make_type("LBase;"));
+  base.set_super(type::java_lang_Object());
+  base.add_method(assembler::method_from_string(R"(
+    (method (public constructor) "LBase;.<init>:()V"
+     (
+      (load-param-object v0)
+      (invoke-direct (v0) "Ljava/lang/Object;.<init>:()V")
+      (return-void)
+     )
+    )
+  )"));
+  const auto code = ipcp_reader_code(DexType::make_type("LBase;"), R"(
+    (method (public constructor) "LFoo;.<init>:()V"
+     (
+      (load-param-object v0)
+      (invoke-direct (v0) "LBase;.<init>:()V")
+      (const v1 1)
+      (iput v1 v0 "LFoo;.x:I")
+      (return-void)
+     )
+    )
+  )",
+                                     Scope{base.create()}, conf);
+  // The superclass constructor does not let `this` escape, so nobody reads
+  // the zero `x` held before the store.
+  EXPECT_EQ(code.find("iget"), std::string::npos) << code;
+}
+
+TEST_F(InterproceduralConstantPropagationTest,
+       fieldStoredAfterCallOfUndefinedOwnConstructorIsNotDefinitelyAssigned) {
+  // `Foo(int)` does not exist, so the call fails verification; it assigns
+  // nothing.
+  const auto code = ipcp_reader_code(type::java_lang_Object(), R"(
+    (method (public constructor) "LFoo;.<init>:()V"
+     (
+      (load-param-object v0)
+      (const v1 0)
+      (invoke-direct (v0 v1) "LFoo;.<init>:(I)V")
+      (const v1 1)
+      (iput v1 v0 "LFoo;.x:I")
+      (return-void)
+     )
+    )
+  )",
+                                     Scope{}, conf);
+  EXPECT_NE(code.find("iget"), std::string::npos) << code;
 }

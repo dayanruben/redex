@@ -7,6 +7,7 @@
 
 #include "LocalPointersAnalysis.h"
 
+#include <algorithm>
 #include <ostream>
 
 #include "Debug.h"
@@ -22,6 +23,16 @@ using namespace local_pointers;
 namespace {
 
 using namespace ir_analyzer;
+
+// Whether every value a register may hold comes from a `const 0`, i.e. is null.
+// A register that holds no value yet counts too: otherwise an escape found
+// while its set is empty would disappear once the `const 0` arrives, and an
+// analysis across calls requires each method's summary only to grow.
+bool has_no_non_null_origins(const PointerSet& pointers) {
+  return pointers.is_value() &&
+         std::all_of(pointers.elements().begin(), pointers.elements().end(),
+                     is_null_constant);
+}
 
 /*
  * Whether the dest of an instruction may be a pointer value. The only time
@@ -159,7 +170,7 @@ bool dest_may_be_pointer(const IRInstruction* insn) {
   case OPCODE_USHR_INT_LIT:
     return false;
   case OPCODE_CONST:
-    return insn->get_literal() == 0;
+    return is_null_constant(insn);
   case OPCODE_FILL_ARRAY_DATA:
   case OPCODE_SWITCH:
     not_reached_log("No dest");
@@ -252,7 +263,7 @@ void analyze_invoke_with_summary(const EscapeSummary& summary,
   for (auto src_idx : UnorderedIterable(summary.returned_parameters)) {
     if (src_idx == FRESH_RETURN) {
       returned_ptrs.add(insn);
-    } else if (src_idx == ESCAPED_FRESH_RETURN) {
+    } else if (src_idx == ESCAPED_FRESH_RETURN || src_idx == NULL_RETURN) {
       returned_ptrs.add(insn);
       // escape just insn right here; we are going to override
       // RESULT_REGISTER in a moment with a more precise pointer set.
@@ -367,14 +378,30 @@ void FixpointIterator::analyze_instruction(const IRInstruction* insn,
     } else {
       analyze_generic_invoke(insn, env);
     }
+    // The receiver's class decides which method a virtual or interface call
+    // runs, so a replacement of another class may run other code.
+    if (m_escape_type_and_identity_uses != nullptr &&
+        (op == OPCODE_INVOKE_VIRTUAL || op == OPCODE_INVOKE_INTERFACE)) {
+      env->set_may_escape(insn->src(0), insn);
+    }
   } else if (may_alloc(op)) {
     env->set_fresh_pointer(RESULT_REGISTER, insn);
   } else if (op == IOPCODE_LOAD_PARAM_OBJECT) {
     env->set_fresh_pointer(insn->dest(), insn);
   } else {
     default_instruction_handler(insn, env);
-    if (m_escape_check_cast && op == OPCODE_CHECK_CAST) {
-      env->set_may_escape(insn->src(0), insn);
+    if (m_escape_type_and_identity_uses != nullptr) {
+      if (op == OPCODE_CHECK_CAST || opcode::is_a_monitor(op) ||
+          (op == OPCODE_INSTANCE_OF &&
+           m_escape_type_and_identity_uses->instance_of_tells_apart(
+               insn->get_type()))) {
+        env->set_may_escape(insn->src(0), insn);
+      } else if ((op == OPCODE_IF_EQ || op == OPCODE_IF_NE) &&
+                 !has_no_non_null_origins(env->get_pointers(insn->src(0))) &&
+                 !has_no_non_null_origins(env->get_pointers(insn->src(1)))) {
+        env->set_may_escape(insn->src(0), insn);
+        env->set_may_escape(insn->src(1), insn);
+      }
     }
   }
 }
@@ -407,7 +434,8 @@ std::pair<std::unique_ptr<FixpointIterator>, EscapeSummary> analyze_method(
     const DexMethod* method,
     const call_graph::Graph& call_graph,
     const SummaryMap& summary_map,
-    const UnorderedSet<DexClass*>* excluded_classes) {
+    const UnorderedSet<DexClass*>* excluded_classes,
+    const TypeAndIdentityUses* escape_type_and_identity_uses) {
   UnorderedMap<const IRInstruction*, EscapeSummary> invoke_to_summary_map;
   if (call_graph.has_node(method)) {
     const auto& callee_edges = call_graph.node(method)->callees();
@@ -441,7 +469,7 @@ std::pair<std::unique_ptr<FixpointIterator>, EscapeSummary> analyze_method(
   auto fp_iter =
       std::make_unique<FixpointIterator>(cfg,
                                          std::move(invoke_to_summary_map),
-                                         /* escape_check_cast */ false,
+                                         escape_type_and_identity_uses,
                                          excluded_classes);
   fp_iter->run(Environment());
 
@@ -457,14 +485,21 @@ std::pair<std::unique_ptr<FixpointIterator>, EscapeSummary> analyze_method(
 EscapeCallGraphStrategy::EscapeCallGraphStrategy(
     const method_override_graph::Graph& method_override_graph,
     const Scope& scope,
-    uint32_t big_override_threshold)
+    uint32_t big_override_threshold,
+    const std::function<bool(const DexMethod*)>& is_root)
     : call_graph::MultipleCalleeStrategy(
           method_override_graph, scope, big_override_threshold) {
-  // A method that no root reaches would get no edges, and so no summary that
-  // uses its callees' summaries.
+  // The methods of classes created at runtime still decide which calls get
+  // edges; only the roots are chosen here. A method that no root reaches gets
+  // no edges, and so no summary that uses its callees' summaries.
   m_root_and_dynamic = MultipleCalleeStrategy::get_roots();
+  if (is_root) {
+    m_root_and_dynamic.roots.clear();
+  }
   walk::code(m_scope, [&](DexMethod* method, IRCode&) {
-    m_root_and_dynamic.roots.insert(method);
+    if (!is_root || is_root(method)) {
+      m_root_and_dynamic.roots.insert(method);
+    }
   });
 }
 
@@ -547,7 +582,10 @@ AnalyzeScopeResult analyze_scope(
     const Scope& scope,
     const call_graph::Graph& call_graph,
     SummaryMap* summary_map_ptr,
-    const UnorderedSet<DexClass*>* excluded_classes) {
+    const UnorderedSet<DexClass*>* excluded_classes,
+    const TypeAndIdentityUses* escape_type_and_identity_uses,
+    const std::function<bool(const DexMethod*)>& keep_fixpoint_iterator,
+    bool only_methods_in_call_graph) {
   FixpointIteratorMap fp_iter_map;
   SummaryMap summary_map;
   if (summary_map_ptr == nullptr) {
@@ -557,7 +595,9 @@ AnalyzeScopeResult analyze_scope(
 
   auto affected_methods = std::make_unique<ConcurrentSet<const DexMethod*>>();
   walk::parallel::code(scope, [&](const DexMethod* method, IRCode&) {
-    affected_methods->insert(method);
+    if (!only_methods_in_call_graph || call_graph.has_node(method)) {
+      affected_methods->insert(method);
+    }
   });
 
   size_t iterations = 0;
@@ -569,14 +609,17 @@ AnalyzeScopeResult analyze_scope(
         std::make_unique<ConcurrentSet<const DexMethod*>>();
     workqueue_run<const DexMethod*>(
         [&](const DexMethod* method) {
-          auto p = analyze_method(method, call_graph, *summary_map_ptr,
-                                  excluded_classes);
+          auto p =
+              analyze_method(method, call_graph, *summary_map_ptr,
+                             excluded_classes, escape_type_and_identity_uses);
           auto& new_fp_iter = p.first;
           auto& new_summary = p.second;
-          fp_iter_map.update(method, [&](auto*, auto& v, bool exists) {
-            redex_assert(!(exists ^ (v != nullptr)));
-            std::swap(new_fp_iter, v);
-          });
+          if (!keep_fixpoint_iterator || keep_fixpoint_iterator(method)) {
+            fp_iter_map.update(method, [&](auto*, auto& v, bool exists) {
+              redex_assert(!(exists ^ (v != nullptr)));
+              std::swap(new_fp_iter, v);
+            });
+          }
           auto it = summary_map_ptr->find(method);
           if (it != summary_map_ptr->end()) {
             always_assert_log(it->second <= new_summary,
@@ -664,6 +707,8 @@ EscapeSummary get_escape_summary(const FixpointIterator& fp_iter,
     for (const auto* insn : returned_ptrs.elements()) {
       if (insn->opcode() == IOPCODE_LOAD_PARAM_OBJECT) {
         summary.returned_parameters.insert(param_indexes.at(insn));
+      } else if (is_null_constant(insn)) {
+        summary.returned_parameters.insert(NULL_RETURN);
       } else if (!exit_state.may_have_escaped(insn)) {
         summary.returned_parameters.insert(FRESH_RETURN);
       } else {

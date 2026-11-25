@@ -43,12 +43,15 @@ enum class UnsafeType {
   kUsageIFieldSetOutsideInit,
   kUsageCastEnumArrayToObject,
   kUsageUsedInInstanceOf,
+  kUsageUsedInMonitor,
+  kUsageComparedByIdentity,
   kUsageUsedEnumEntries,
   kUsageNoOptimizationsMethod,
   kUsageUsedValuesField,
   kUsageConstantSetOutsideClinit,
   kUsagePassedToCallSiteOrMethodHandle,
   kUsageNamedByCallSiteOrMethodHandle,
+  kUsageInheritedFieldRef,
 };
 
 inline std::ostream& operator<<(std::ostream& os, const UnsafeType& u) {
@@ -134,6 +137,12 @@ inline std::ostream& operator<<(std::ostream& os, const UnsafeType& u) {
   case UnsafeType::kUsageUsedInInstanceOf:
     os << "UsageUsedInInstanceOf";
     break;
+  case UnsafeType::kUsageUsedInMonitor:
+    os << "UsageUsedInMonitor";
+    break;
+  case UnsafeType::kUsageComparedByIdentity:
+    os << "UsageComparedByIdentity";
+    break;
   case UnsafeType::kUsageUsedEnumEntries:
     os << "UsageUsedEnumEntries";
     break;
@@ -151,6 +160,9 @@ inline std::ostream& operator<<(std::ostream& os, const UnsafeType& u) {
     break;
   case UnsafeType::kUsageNamedByCallSiteOrMethodHandle:
     os << "UsageNamedByCallSiteOrMethodHandle";
+    break;
+  case UnsafeType::kUsageInheritedFieldRef:
+    os << "UsageInheritedFieldRef";
     break;
   }
   return os;

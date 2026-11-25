@@ -11,31 +11,45 @@
 #include "Debug.h"
 #include "IRCode.h"
 #include "LocalPointersAnalysis.h"
+#include "MethodUtil.h"
 #include "Show.h"
 #include "Trace.h"
 #include "TypeUtil.h"
 #include "Walkers.h"
 #include <algorithm>
-#include <utility>
 
 #include "KotlinNullCheckMethods.h"
 
 namespace ptrs = local_pointers;
 
 namespace {
-// The structure is used for hardcoding external method param summaries.
-struct ExternalMethodData {
-  std::string method_name;
-  std::optional<uint16_t> returned_param;
-  UnorderedSet<uint16_t> safe_params;
-  ExternalMethodData(std::string name,
-                     std::optional<uint16_t> returned,
-                     std::initializer_list<uint16_t> params)
-      : method_name(std::move(name)),
-        returned_param(returned),
-        safe_params(params) {}
-};
 
+// Whether `instance-of type` may tell a value of some enum, or an array of
+// them, apart from the Integer, or Integer array, that OptimizeEnumsPass boxes
+// it to. Both are instances of `Object`, `Comparable` and `Serializable`, and
+// neither of a class like `String`, but an enum may implement any interface.
+// For an array type, the same holds of its element type.
+bool may_tell_boxed_enum_apart(const DexType* type) {
+  type = type::make_element_type_if_array(type);
+  if (type::is_primitive(type)) {
+    return false;
+  }
+  auto integer = type::is_instance_of_if_known(type::java_lang_Integer(), type);
+  if (integer == std::optional<bool>(true) &&
+      type::is_instance_of_if_known(type::java_lang_Enum(), type) ==
+          std::optional<bool>(true)) {
+    return false;
+  }
+  const auto* cls = type_class(type);
+  return cls == nullptr || is_interface(cls) ||
+         integer != std::optional<bool>(false) ||
+         type::is_instance_of_if_known(type, type::java_lang_Enum()) !=
+             std::optional<bool>(false);
+}
+
+// The uses of a value that can tell an enum constant apart from its boxed
+// Integer.
+const ptrs::TypeAndIdentityUses BOXED_ENUM_USES{may_tell_boxed_enum_apart};
 void sanity_check_method_summary(const DexMethodRef* method,
                                  const optimize_enums::ParamSummary& summary,
                                  const DexType* object_type) {
@@ -67,57 +81,15 @@ void sanity_check_method_summary(const DexMethodRef* method,
  */
 void load_external_method_summaries(
     const DexType* object_type, optimize_enums::SummaryMap* param_summary_map) {
-  std::vector<ExternalMethodData> methods(
-      {ExternalMethodData("Lcom/google/common/base/Objects;.equal:(Ljava/lang/"
-                          "Object;Ljava/lang/"
-                          "Object;)Z",
-                          std::nullopt, {0, 1})});
-  for (auto& item : methods) {
-    auto* method = DexMethod::get_method(item.method_name);
-    if (method == nullptr) {
-      continue;
-    }
-    always_assert(!param_summary_map->count(method));
-    optimize_enums::ParamSummary summary(std::move(item.safe_params),
-                                         item.returned_param);
-    sanity_check_method_summary(method, summary, object_type);
-    param_summary_map->emplace(method, summary);
-  }
   // Load summaries for kotlin null assertion methods.
-  auto null_check_methods =
-      kotlin_nullcheck_wrapper::get_kotlin_null_assertions();
-  // The code of a copy marked `no_optimizations` may not be what runs, and the
-  // summary below takes the first argument to be the checked value.
-  auto is_untrusted_copy = [](const DexMethodRef* ref) {
-    if (!ref->is_def()) {
-      return false;
-    }
-    const auto* def = ref->as_def();
-    return def->rstate.no_optimizations() || !is_static(def);
-  };
-  for (auto* method : UnorderedIterable(null_check_methods)) {
+  const auto trusted_null_checks =
+      kotlin_nullcheck_wrapper::get_trusted_kotlin_null_assertions();
+  for (auto* method : UnorderedIterable(trusted_null_checks)) {
     if (param_summary_map->count(method) != 0u) {
       // Already summarized from its code.
       continue;
     }
-    if (is_untrusted_copy(method)) {
-      continue;
-    }
-    // A wrapper that RemoveNullcheckStringArg made does what the null check it
-    // calls does, so it is no more trusted than that one.
-    const auto* code =
-        method->is_def() ? method->as_def()->get_code() : nullptr;
-    if (code != nullptr) {
-      auto ii = cfg::ConstInstructionIterable(code->cfg());
-      if (std::any_of(ii.begin(), ii.end(), [&](const auto& mie) {
-            return opcode::is_a_method_invoke(mie.insn->opcode()) &&
-                   null_check_methods.count(mie.insn->get_method()) != 0u &&
-                   is_untrusted_copy(mie.insn->get_method());
-          })) {
-        continue;
-      }
-    }
-    // Kotlin's null checks, and the wrappers Redex makes for them, only check
+    // Kotlin's null checks, and the wrappers Redex makes for them, only test
     // the nullity of their first argument and return void, wherever their code
     // lives. A summary of a wrapper from its code alone would count the call
     // to the null check it wraps as an escape.
@@ -168,7 +140,7 @@ ParamSummary calculate_param_summary(DexMethod* method,
   ParamSummary summary;
 
   ptrs::FixpointIterator fp_iter(cfg, ptrs::InvokeToSummaryMap(),
-                                 /*escape_check_cast*/ true);
+                                 &BOXED_ENUM_USES);
   fp_iter.run(ptrs::Environment());
   bool result_may_be_pointer =
       !type::is_primitive(method->get_proto()->get_rtype());
@@ -177,27 +149,32 @@ ParamSummary calculate_param_summary(DexMethod* method,
 
   auto* args = method->get_proto()->get_args();
   auto& escaping_params = escape_summary.escaping_parameters;
+  // The parameters the method may return. A returned null hands the caller
+  // no object it did not pass in; any other object does.
   auto& returned_elements = escape_summary.returned_parameters;
-  if (returned_elements.count(ptrs::ESCAPED_FRESH_RETURN) == 0u) {
-    if (returned_elements.size() == 1) {
-      auto returned = *unordered_any(returned_elements);
-      if (returned != ptrs::FRESH_RETURN &&
-          (escaping_params.count(returned) == 0u)) {
-        const DexType* cmp = is_static(method) ? *(args->begin() + returned)
-                             : returned == 0
-                                 ? method->get_class() // Implicit `this`
-                                 : *(args->begin() + returned - 1);
-        if (method->get_proto()->get_rtype() == cmp) {
-          // Set returned_param to the only one returned parameter index.
-          summary.returned_param = returned;
-        } else {
-          escaping_params.insert(returned);
-        }
+  returned_elements.erase(ptrs::NULL_RETURN);
+  const bool returns_other_object =
+      returned_elements.erase(ptrs::FRESH_RETURN) +
+          returned_elements.erase(ptrs::ESCAPED_FRESH_RETURN) >
+      0;
+  if (returned_elements.size() == 1 && !returns_other_object) {
+    auto returned = only(returned_elements);
+    if (!escaping_params.contains(returned)) {
+      const DexType* cmp = is_static(method) ? *(args->begin() + returned)
+                           : returned == 0
+                               ? method->get_class() // Implicit `this`
+                               : *(args->begin() + returned - 1);
+      if (method->get_proto()->get_rtype() == cmp) {
+        // Set returned_param to the only one returned parameter index.
+        summary.returned_param = returned;
+      } else {
+        escaping_params.insert(returned);
       }
-    } else {
-      // Treat as escaping if there are multiple returns.
-      insert_unordered_iterable(escaping_params, returned_elements);
     }
+  } else {
+    // The caller cannot tell which value it got, so a parameter returned
+    // beside another parameter or beside some other object escapes.
+    insert_unordered_iterable(escaping_params, returned_elements);
   }
   // Non-escaping java.lang.Object params are stored in safe_params.
   auto arg_it = args->begin();
@@ -227,8 +204,7 @@ void calculate_param_summaries(
       [object_type, &override_graph](DexMethod* method) {
         // The code of a method marked `no_optimizations` may not be what
         // runs, so its body says nothing about what it does.
-        return (method->get_code() != nullptr) &&
-               !method->rstate.no_optimizations() &&
+        return method::is_optimizable(method) &&
                !method_override_graph::is_true_virtual(override_graph,
                                                        method) &&
                params_contain_object_type(method, object_type);

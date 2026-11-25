@@ -228,6 +228,9 @@ struct Inlinable {
   // Whether the callee is a virtual method different from the one referenced in
   // the invoke instruction.
   const DexType* needs_receiver_cast;
+  // Whether `reduced_code` was released to save memory and must be rebuilt
+  // from the call site's summary before inlining.
+  bool rebuild_reduced_code{false};
 };
 
 struct CalleeCallerRefs {
@@ -260,13 +263,17 @@ struct InlinedCost {
   size_t insn_size;
   // For a specific call-site, partially inlined code.
   PartialCode partial_code{};
+  // Whether `reduced_code` was released to save memory; the costs still
+  // describe it.
+  bool reduced_code_released{false};
 
   bool operator==(const InlinedCost& other) const {
     // TODO: Also check that reduced_cfg's are equivalent
     return full_code == other.full_code && code == other.code &&
            method_refs == other.method_refs && other_refs == other.other_refs &&
            no_return == other.no_return && result_used == other.result_used &&
-           insn_size == other.insn_size && partial_code == other.partial_code;
+           insn_size == other.insn_size && partial_code == other.partial_code &&
+           reduced_code_released == other.reduced_code_released;
   }
 };
 
@@ -423,6 +430,11 @@ class MultiMethodInliner {
 
  private:
   void make_partial(const DexMethod* method, InlinedCost* inlined_Cost);
+
+  // Rebuilds the reduced code of a call site whose cost `make_partial`
+  // released.
+  std::shared_ptr<ReducedCode> rebuild_call_site_reduced_code(
+      const IRInstruction* invoke_insn, const DexMethod* callee);
 
   const DexType* get_needs_init_class(DexMethod* callee) const;
 
@@ -592,18 +604,14 @@ class MultiMethodInliner {
   /**
    * Whether it's beneficial to inline the callee at a particular callsite.
    * no_return may be set to true when the return value is false.
-   * reduced_cfg and insn_size are set when the return value is true.
    */
-  bool should_inline_at_call_site(
-      DexMethod* caller,
-      cfg::Block* caller_block,
-      const IRInstruction* invoke_insn,
-      DexMethod* callee,
-      bool* no_return = nullptr,
-      bool* for_speed = nullptr,
-      std::shared_ptr<ReducedCode>* reduced_code = nullptr,
-      size_t* insn_size = nullptr,
-      PartialCode* partial_code = nullptr);
+  bool should_inline_at_call_site(DexMethod* caller,
+                                  cfg::Block* caller_block,
+                                  const IRInstruction* invoke_insn,
+                                  DexMethod* callee,
+                                  bool* no_return = nullptr,
+                                  bool* for_speed = nullptr,
+                                  PartialCode* partial_code = nullptr);
 
   /**
    * Whether we should, and legally can, partially inline a particular callee

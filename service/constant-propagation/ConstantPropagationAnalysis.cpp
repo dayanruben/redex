@@ -905,6 +905,7 @@ bool PrimitiveAnalyzer::analyze_binop(const IRInstruction* insn,
   if (cst_left && cst_right) {
     TRACE(CONSTP, 5, "Attempting to fold %s", SHOW(insn));
     bool use_result_reg = false;
+    bool folded = true;
     switch (op) {
     case OPCODE_ADD_INT:
     case OPCODE_ADD_LONG: {
@@ -953,19 +954,24 @@ bool PrimitiveAnalyzer::analyze_binop(const IRInstruction* insn,
       break;
     }
     default:
-      return analyze_default(insn, env);
+      // Fall through to the transfer functions below; shifts get exact
+      // results there, masking the distance as Dalvik does.
+      folded = false;
+      break;
     }
-    auto res_const_dom = SignedConstantDomain::top();
-    if (result != std::nullopt) {
-      if (opcode::is_binop64(op)) {
-        res_const_dom = SignedConstantDomain(*result);
-      } else {
-        int32_t result32 = (int32_t)(*result & 0xFFFFFFFF);
-        res_const_dom = SignedConstantDomain(result32);
+    if (folded) {
+      auto res_const_dom = SignedConstantDomain::top();
+      if (result != std::nullopt) {
+        if (opcode::is_binop64(op)) {
+          res_const_dom = SignedConstantDomain(*result);
+        } else {
+          int32_t result32 = (int32_t)(*result & 0xFFFFFFFF);
+          res_const_dom = SignedConstantDomain(result32);
+        }
       }
+      env->set(use_result_reg ? RESULT_REGISTER : insn->dest(), res_const_dom);
+      return true;
     }
-    env->set(use_result_reg ? RESULT_REGISTER : insn->dest(), res_const_dom);
-    return true;
   }
 
   switch (op) {
@@ -1226,34 +1232,6 @@ bool StaticFinalFieldAnalyzer::analyze_sget(const IRInstruction* insn,
   return false;
 }
 
-bool InitFieldAnalyzer::analyze_iget(const DexType* class_under_init,
-                                     const IRInstruction* insn,
-                                     ConstantEnvironment* env) {
-  auto* field = resolve_field(insn->get_field());
-  if (field == nullptr) {
-    return false;
-  }
-  if (field->get_class() == class_under_init) {
-    env->set(RESULT_REGISTER, env->get(field));
-    return true;
-  }
-  return false;
-}
-
-bool InitFieldAnalyzer::analyze_iput(const DexType* class_under_init,
-                                     const IRInstruction* insn,
-                                     ConstantEnvironment* env) {
-  auto* field = resolve_field(insn->get_field());
-  if (field == nullptr) {
-    return false;
-  }
-  if (field->get_class() == class_under_init) {
-    env->set(field, env->get(insn->src(0)));
-    return true;
-  }
-  return false;
-}
-
 bool InitFieldAnalyzer::analyze_invoke(const DexType* class_under_init,
                                        const IRInstruction* insn,
                                        ConstantEnvironment* env) {
@@ -1276,6 +1254,245 @@ bool InitFieldAnalyzer::analyze_dynamic_invoke(
   // The call may reach a method of the class under initialization.
   env->clear_field_environment();
   return false;
+}
+
+namespace {
+
+// The fields of `cls` that the constructor analysis tracks.
+UnorderedSet<const DexField*> get_tracked_fields(const DexClass* cls) {
+  UnorderedSet<const DexField*> fields;
+  for (const auto* field : cls->get_ifields()) {
+    if (!is_volatile(field)) {
+      fields.insert(field);
+    }
+  }
+  return fields;
+}
+
+} // namespace
+
+ConstructorFieldAnalyzerState ConstructorFieldAnalyzerState::create(
+    const cfg::ControlFlowGraph& cfg,
+    const DexClass* cls,
+    const UnorderedSet<const DexMethod*>& constructors_keeping_this,
+    const UnorderedSet<const DexField*>& constructor_only_fields) {
+  ConstructorFieldAnalyzerState state(
+      cls, get_tracked_fields(cls),
+      local_pointers::ConstructorAccesses(cfg, cls, constructors_keeping_this));
+  // Callers may pass the fields of the whole program, so look up the class's
+  // own fields in them rather than scanning them.
+  for (const auto* field : UnorderedIterable(state.m_tracked_fields)) {
+    if (constructor_only_fields.count(field) != 0u) {
+      state.m_constructor_only_fields.insert(field);
+    }
+  }
+  for (const auto& [insn, access] :
+       UnorderedIterable(state.m_accesses.field_accesses())) {
+    if (state.m_tracked_fields.count(access.field) == 0u) {
+      continue;
+    }
+    const bool constructor_only =
+        state.m_constructor_only_fields.count(access.field) != 0u;
+    if (opcode::is_an_iput(insn->opcode()) &&
+        access.receiver != local_pointers::Receiver::This) {
+      // After `this` escapes, a call can hand it back under a name the
+      // pointer analysis does not connect to `this`, so such a store could
+      // change a constructor-only field. Callers name only fields that this
+      // constructor stores through `this` alone.
+      always_assert_log(!constructor_only,
+                        "Constructor-only field %s is stored through another "
+                        "receiver: %s",
+                        SHOW(access.field), SHOW(insn));
+    }
+    // Once `this` may have escaped, other code may change its fields at any
+    // later point, for instance through a saved reference, so only
+    // constructor-only fields are tracked after an escape.
+    if ((access.after_escape || state.m_accesses.is_escape(insn)) &&
+        !constructor_only) {
+      continue;
+    }
+    if (access.receiver == local_pointers::Receiver::This) {
+      state.m_this_accesses.emplace(insn, access.field);
+    } else if (access.receiver == local_pointers::Receiver::MaybeThis &&
+               opcode::is_an_iput(insn->opcode())) {
+      state.m_maybe_this_stores.emplace(insn, access.field);
+    }
+  }
+  return state;
+}
+
+namespace {
+
+// The tracked fields that a constructor may store to `this` before it
+// escapes.
+UnorderedSet<const DexField*> get_stored_before_escape(
+    const ConstructorFieldAnalyzerState& state) {
+  UnorderedSet<const DexField*> stored;
+  for (const auto& [insn, access] :
+       UnorderedIterable(state.accesses().field_accesses())) {
+    if (opcode::is_an_iput(insn->opcode()) && !access.after_escape &&
+        access.receiver != local_pointers::Receiver::Other &&
+        state.tracked_fields().count(access.field) != 0u) {
+      stored.insert(access.field);
+    }
+  }
+  return stored;
+}
+
+// A call of a constructor of the class on `this`, and the tracked fields that
+// may already hold a value other than zero when the callee starts.
+struct OwnConstructorCall {
+  const DexMethod* caller;
+  const DexMethod* callee;
+  UnorderedSet<const DexField*> stored;
+};
+
+} // namespace
+
+ClassConstructorFields ClassConstructorFields::create(
+    const DexClass* cls,
+    const UnorderedSet<const DexMethod*>& constructors_keeping_this,
+    const UnorderedSet<const DexField*>& constructor_only_fields) {
+  ClassConstructorFields fields;
+  std::vector<OwnConstructorCall> own_calls;
+  bool has_excluded_constructor = false;
+  for (auto* ctor : cls->get_ctors()) {
+    has_excluded_constructor =
+        has_excluded_constructor || ctor->rstate.no_optimizations();
+    auto* code = ctor->get_code();
+    if (code == nullptr) {
+      continue;
+    }
+    always_assert_log(code->cfg_built(), "No CFG for %s", SHOW(ctor));
+    auto& cfg = code->cfg();
+    auto state = ConstructorFieldAnalyzerState::create(
+        cfg, cls, constructors_keeping_this, constructor_only_fields);
+    const auto stored_before_escape = get_stored_before_escape(state);
+    for (const auto& mie : cfg::InstructionIterable(cfg)) {
+      const auto* call = state.accesses().get_delegating_call(mie.insn);
+      // A constructor that the class does not define, which fails
+      // verification, has no fields to start with.
+      const auto* callee = call != nullptr ? call->callee->as_def() : nullptr;
+      if (callee != nullptr) {
+        // Once `this` has escaped, any code may have stored to it.
+        own_calls.push_back(OwnConstructorCall{ctor, callee,
+                                               call->after_escape
+                                                   ? state.tracked_fields()
+                                                   : stored_before_escape});
+      }
+    }
+    fields.constructors.emplace(ctor, std::move(state));
+  }
+  // A constructor also passes on what was written before it started, as in a
+  // chain this(...) -> this(...). Iterate until no entry set grows.
+  bool changed = true;
+  while (changed) {
+    changed = false;
+    for (const auto& call : own_calls) {
+      auto& callee_writes = fields.entry_writes[call.callee];
+      auto before = callee_writes.size();
+      insert_unordered_iterable(callee_writes, call.stored);
+      // A constructor that calls itself passes on nothing beyond what it
+      // stored before the call.
+      auto caller_writes = fields.entry_writes.find(call.caller);
+      if (call.caller != call.callee &&
+          caller_writes != fields.entry_writes.end()) {
+        insert_unordered_iterable(callee_writes, caller_writes->second);
+      }
+      changed = changed || callee_writes.size() != before;
+    }
+  }
+  // The code of a constructor excluded from optimization may differ at
+  // runtime, so it may store to any field and then call any constructor of the
+  // class on `this`.
+  if (has_excluded_constructor) {
+    for (const auto& [ctor, state] : UnorderedIterable(fields.constructors)) {
+      insert_unordered_iterable(fields.entry_writes[ctor],
+                                state.tracked_fields());
+    }
+  }
+  return fields;
+}
+
+void ClassConstructorFields::initialize_fields(
+    const DexMethod* ctor,
+    const UnorderedSet<const DexField*>& fields,
+    ConstantEnvironment* env) const {
+  auto writes = entry_writes.find(ctor);
+  for (const auto* field :
+       UnorderedIterable(constructors.at(ctor).tracked_fields())) {
+    if (fields.count(field) == 0u) {
+      continue;
+    }
+    if (writes != entry_writes.end() && writes->second.count(field) != 0u) {
+      env->set(field, ConstantValue::top());
+    } else {
+      env->set(field, SignedConstantDomain(0));
+    }
+  }
+}
+
+namespace {
+
+// After an escape, only constructor-only fields keep their values. After a
+// call of a constructor of the class on `this`, none do: the callee may store
+// to any of them, even when it keeps `this`.
+void forget_fields_others_may_change(const ConstructorFieldAnalyzerState& state,
+                                     const IRInstruction* insn,
+                                     ConstantEnvironment* env) {
+  if (state.accesses().get_delegating_call(insn) != nullptr) {
+    env->clear_field_environment();
+  } else if (state.accesses().is_escape(insn)) {
+    for (const auto* field : UnorderedIterable(state.tracked_fields())) {
+      if (state.constructor_only_fields().count(field) == 0u) {
+        env->set(field, ConstantValue::top());
+      }
+    }
+  }
+}
+
+} // namespace
+
+bool ConstructorFieldAnalyzer::analyze_default(
+    const ConstructorFieldAnalyzerState* state,
+    const IRInstruction* insn,
+    ConstantEnvironment* env) {
+  forget_fields_others_may_change(*state, insn, env);
+  return false;
+}
+
+bool ConstructorFieldAnalyzer::analyze_iget(
+    const ConstructorFieldAnalyzerState* state,
+    const IRInstruction* insn,
+    ConstantEnvironment* env) {
+  const auto* field = state->get_this_access(insn);
+  if (field == nullptr) {
+    return analyze_default(state, insn, env);
+  }
+  env->set(RESULT_REGISTER, env->get_field_environment().get(field));
+  forget_fields_others_may_change(*state, insn, env);
+  return true;
+}
+
+bool ConstructorFieldAnalyzer::analyze_iput(
+    const ConstructorFieldAnalyzerState* state,
+    const IRInstruction* insn,
+    ConstantEnvironment* env) {
+  const auto* field = state->get_this_access(insn);
+  if (field != nullptr) {
+    // Every iput has two sources: the stored value, then the receiver.
+    env->set(field, env->get(insn->src(0)));
+    // Storing `this` into one of its own fields also lets it escape.
+    forget_fields_others_may_change(*state, insn, env);
+    return true;
+  }
+  field = state->get_maybe_this_store(insn);
+  if (field != nullptr) {
+    env->set(field, ConstantValue::top());
+    forget_fields_others_may_change(*state, insn, env);
+    return true;
+  }
+  return analyze_default(state, insn, env);
 }
 
 bool EnumFieldAnalyzer::analyze_sget(const EnumFieldAnalyzerState&,
@@ -1772,6 +1989,57 @@ bool ImmutableAttributeAnalyzer::analyze_iget(
   }
 }
 
+DexMethod* resolve_attribute_getter_call(
+    const ConcurrentSet<DexMethod*>& attribute_methods,
+    const IRInstruction* insn,
+    const ConstantEnvironment& env) {
+  if (insn->opcode() != OPCODE_INVOKE_VIRTUAL &&
+      insn->opcode() != OPCODE_INVOKE_INTERFACE) {
+    return nullptr;
+  }
+  const auto obj = env.get(insn->src(0)).maybe_get<ObjectWithImmutAttrDomain>();
+  if (!obj || !obj->is_value()) {
+    return nullptr;
+  }
+  // This also resolves an invoke-virtual of a method that only an interface of
+  // the class declares.
+  const auto* called = resolve_invoke_method_deprecated(insn);
+  if (called == nullptr || !(is_public(called) || is_protected(called))) {
+    return nullptr;
+  }
+  const auto* cls = type_class(obj->get_constant()->type);
+  if (cls == nullptr ||
+      !type::check_cast(cls->get_type(), called->get_class())) {
+    return nullptr;
+  }
+  const bool implements_interface_method =
+      is_interface(type_class(called->get_class()));
+  // An invoke-virtual resolves to an interface method only when no superclass
+  // of the referenced class declares the method. A superclass missing from the
+  // input could declare it, even package-private, and the call would then reach
+  // that method instead of the getter.
+  if (implements_interface_method && insn->opcode() == OPCODE_INVOKE_VIRTUAL &&
+      !type::is_subclass(type::java_lang_Object(),
+                         insn->get_method()->get_class())) {
+    return nullptr;
+  }
+  // Registered getters are class methods, so only superclasses are searched,
+  // not the default methods of interfaces.
+  auto* getter =
+      resolve_virtual_deprecated(cls, called->get_name(), called->get_proto());
+  if (getter == nullptr || attribute_methods.count_unsafe(getter) == 0u) {
+    return nullptr;
+  }
+  const bool known_to_override =
+      is_public(getter) ||
+      (is_protected(getter) && !implements_interface_method);
+  const bool overridable = !is_final(cls) && !is_final(getter);
+  if (!known_to_override || overridable) {
+    return nullptr;
+  }
+  return getter;
+}
+
 bool ImmutableAttributeAnalyzer::analyze_invoke(
     const ImmutableAttributeAnalyzerState* state,
     const IRInstruction* insn,
@@ -1791,6 +2059,10 @@ bool ImmutableAttributeAnalyzer::analyze_invoke(
     return analyze_method_initialization(state, insn, env, method);
   } else if (state->attribute_methods.count_unsafe(method) != 0u) {
     return analyze_method_attr(state, insn, env, method);
+  }
+  if (auto* getter =
+          resolve_attribute_getter_call(state->attribute_methods, insn, *env)) {
+    return analyze_method_attr(state, insn, env, getter);
   }
   return false;
 }
@@ -2081,13 +2353,10 @@ bool DefaultNoThrowAnalyzer::analyze_default(
     }
     src_index = 0;
   }
-  if (insn->has_dest()) {
-    auto dest = insn->dest();
-    if ((dest == *src_index) ||
-        (insn->dest_is_wide() && dest + 1 == *src_index)) {
-      return false;
-    }
-  }
+  // An instruction that may throw writes no register itself; any result goes
+  // to a separate move-result(-pseudo). So the object register still holds
+  // the dereferenced object here.
+  always_assert_log(!insn->has_dest(), "%s", SHOW(insn));
   auto src = insn->src(*src_index);
   auto value = env->get(src);
   value.meet_with(SignedConstantDomain(sign_domain::Interval::NEZ));

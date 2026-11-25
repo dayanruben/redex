@@ -27,6 +27,7 @@
 #include "Show.h"
 #include "SourceBlocks.h"
 #include "Trace.h"
+#include "TypeInference.h"
 #include "TypeReference.h"
 #include "UsedVarsAnalysis.h"
 #include "Walkers.h"
@@ -127,14 +128,11 @@ struct EnumUtil {
       DexType::make_type("Ljava/lang/IllegalArgumentException;");
 
   const DexMethodRef* ENUM_ORDINAL_METHOD = method::java_lang_Enum_ordinal();
-  const DexMethodRef* ENUM_EQUALS_METHOD =
-      DexMethod::make_method("Ljava/lang/Enum;.equals:(Ljava/lang/Object;)Z");
+  const DexMethodRef* ENUM_EQUALS_METHOD = method::java_lang_Enum_equals();
   const DexMethodRef* ENUM_COMPARETO_METHOD =
-      DexMethod::make_method("Ljava/lang/Enum;.compareTo:(Ljava/lang/Enum;)I");
-  const DexMethodRef* ENUM_TOSTRING_METHOD =
-      DexMethod::make_method("Ljava/lang/Enum;.toString:()Ljava/lang/String;");
-  const DexMethodRef* ENUM_HASHCODE_METHOD =
-      DexMethod::make_method("Ljava/lang/Enum;.hashCode:()I");
+      method::java_lang_Enum_compareTo();
+  const DexMethodRef* ENUM_TOSTRING_METHOD = method::java_lang_Enum_toString();
+  const DexMethodRef* ENUM_HASHCODE_METHOD = method::java_lang_Enum_hashCode();
   const DexMethodRef* ENUM_NAME_METHOD = method::java_lang_Enum_name();
   const DexMethodRef* STRING_VALUEOF_METHOD = DexMethod::make_method(
       "Ljava/lang/String;.valueOf:(Ljava/lang/Object;)Ljava/lang/String;");
@@ -153,9 +151,6 @@ struct EnumUtil {
       "Ljava/lang/IllegalArgumentException;.<init>:(Ljava/lang/String;)V");
   DexMethodRef* STRING_EQ_METHOD =
       DexMethod::make_method("Ljava/lang/String;.equals:(Ljava/lang/Object;)Z");
-  DexMethodRef* KT_ENUM_ENTRIES_FACTORY_METHOD = DexMethod::make_method(
-      "Lkotlin/enums/EnumEntriesKt;.enumEntries:([Ljava/lang/Enum;)Lkotlin/"
-      "enums/EnumEntries;");
 
   InsertOnlyConcurrentMap<DexClass*, DexMethod*>
       m_user_defined_tostring_method_cache;
@@ -740,6 +735,10 @@ class CodeTransformer final {
     cfg::ControlFlowGraph& cfg = m_method->get_code()->cfg();
     optimize_enums::EnumFixpointIterator engine(cfg, m_enum_util->m_config);
     engine.run(start_env);
+    // What the verifier knows about each register, before any rewriting.
+    type_inference::TypeInference verifier_types(cfg);
+    verifier_types.run(m_method);
+    m_verifier_envs = &verifier_types.get_type_environments();
     for (auto& block : cfg.blocks()) {
       optimize_enums::EnumTypeEnvironment env =
           engine.get_entry_state_at(block);
@@ -755,6 +754,8 @@ class CodeTransformer final {
         }
       }
     }
+    m_verifier_envs = nullptr;
+    auto casts = find_integer_cast_positions();
 
     // We could not insert invoke-kind instructions to cfg when we
     // iterate the cfg. If we're inside a try region, inserting invoke-kind will
@@ -764,9 +765,97 @@ class CodeTransformer final {
     for (const auto& info : m_replacements) {
       cfg.replace_insns(info.original_insn, info.replacements);
     }
+    insert_integer_casts(cfg, casts);
   }
 
  private:
+  /**
+   * Record that the rewritten form of `insn` takes the value of its source
+   * `src_index` as an Integer. The verifier knows that value as an Integer if
+   * it knew it as a candidate enum, which becomes Integer, as an Integer or as
+   * null. Any other reference needs a cast. The analysis may know more about a
+   * value than the verifier does: given `static Object identity(Object x)`,
+   * whose parameter summary says it returns its argument, the analysis types
+   * `identity(E.A)` as E, while the verifier types it as Object.
+   */
+  void require_integer(IRInstruction* insn, src_index_t src_index) {
+    const auto reg = insn->src(src_index);
+    const auto& verifier_env = m_verifier_envs->at(insn);
+    // A `const 0` stays null to the verifier even after a use as a reference
+    // makes TypeInference call it one.
+    if (!verifier_env.get_type(reg).equals(
+            type_inference::TypeDomain(IRType::REFERENCE)) ||
+        verifier_env.get_type_domain(reg).is_null()) {
+      return;
+    }
+    const auto verifier_type = verifier_env.get_dex_type(reg);
+    if (verifier_type && (*verifier_type == type::java_lang_Integer() ||
+                          m_enum_attributes_map.count(*verifier_type) != 0u)) {
+      return;
+    }
+    m_integer_casts.emplace_back(insn, reg);
+  }
+
+  /**
+   * The registers to cast to Integer, by the instruction to cast them before:
+   * each use recorded by require_integer, or the first instruction of its
+   * replacement. Must run before the replacements, whose original
+   * instructions the uses refer to.
+   */
+  UnorderedMap<const IRInstruction*, std::vector<reg_t>>
+  find_integer_cast_positions() const {
+    UnorderedMap<const IRInstruction*, std::vector<reg_t>> casts;
+    if (m_integer_casts.empty()) {
+      return casts;
+    }
+    UnorderedMap<const IRInstruction*, const IRInstruction*> replaced_by;
+    for (const auto& info : m_replacements) {
+      if (!info.replacements.empty()) {
+        replaced_by.emplace(info.original_insn->insn,
+                            info.replacements.front());
+      }
+    }
+    for (const auto& [use, reg] : m_integer_casts) {
+      auto it = replaced_by.find(use);
+      auto& regs = casts[it == replaced_by.end() ? use : it->second];
+      if (std::find(regs.begin(), regs.end(), reg) == regs.end()) {
+        regs.push_back(reg);
+      }
+    }
+    return casts;
+  }
+
+  /**
+   * Cast each register in `casts` to Integer right before its instruction.
+   * The cast cannot fail: the analysis proved the value is a candidate enum
+   * or null, which the transformation turns into an Integer or null.
+   */
+  void insert_integer_casts(
+      cfg::ControlFlowGraph& cfg,
+      const UnorderedMap<const IRInstruction*, std::vector<reg_t>>& casts) {
+    if (casts.empty()) {
+      return;
+    }
+    cfg::CFGMutation mutation(cfg);
+    size_t found = 0;
+    auto ii = cfg::InstructionIterable(cfg);
+    for (auto it = ii.begin(); it != ii.end(); ++it) {
+      auto casts_it = casts.find(it->insn);
+      if (casts_it == casts.end()) {
+        continue;
+      }
+      ++found;
+      for (auto reg : casts_it->second) {
+        mutation.insert_before(it,
+                               make_check_cast(type::java_lang_Integer(), reg));
+      }
+    }
+    always_assert_log(found == casts.size(),
+                      "%zu of %zu instructions to cast before are gone in %s",
+                      found, casts.size(), SHOW(m_method));
+    mutation.flush();
+  }
+
   void update_instructions(const optimize_enums::EnumTypeEnvironment& env,
                            cfg::ControlFlowGraph& cfg,
                            cfg::Block* block,
@@ -925,6 +1014,7 @@ class CodeTransformer final {
     auto vObj = insn->src(0);
     auto* get_ifield_method =
         m_enum_util->add_get_ifield_method(enum_type, ifield);
+    require_integer(insn, 0);
     m_replacements.emplace_back(
         cfg, block, mie,
         dasm(OPCODE_INVOKE_STATIC, get_ifield_method, {{VREG, vObj}}));
@@ -1002,6 +1092,7 @@ class CodeTransformer final {
     }
     auto* helper_method =
         m_enum_util->add_substitute_of_name(candidate_type, prev_sb);
+    require_integer(insn, 0);
     m_replacements.emplace_back(
         cfg, block, mie,
         dasm(OPCODE_INVOKE_STATIC, helper_method, {{VREG, reg}}));
@@ -1027,6 +1118,7 @@ class CodeTransformer final {
     }
     auto* helper_method =
         m_enum_util->add_substitute_of_hashcode(candidate_type, prev_sb);
+    require_integer(insn, 0);
     m_replacements.emplace_back(
         cfg, block, mie,
         dasm(OPCODE_INVOKE_STATIC, helper_method, {{VREG, src_reg}}));
@@ -1052,6 +1144,7 @@ class CodeTransformer final {
     }
     DexMethodRef* string_valueof_meth =
         m_enum_util->add_substitute_of_stringvalueof(candidate_type, prev_sb);
+    require_integer(insn, 0);
     m_replacements.emplace_back(cfg, block, mie,
                                 dasm(OPCODE_INVOKE_STATIC, string_valueof_meth,
                                      {{VREG, insn->src(0)}}));
@@ -1079,6 +1172,7 @@ class CodeTransformer final {
     }
     DexMethodRef* string_valueof_meth =
         m_enum_util->add_substitute_of_stringvalueof(candidate_type, prev_sb);
+    require_integer(insn, 1);
     auto reg0 = insn->src(0);
     auto reg1 = insn->src(1);
     auto str_reg = allocate_temp();
@@ -1115,6 +1209,7 @@ class CodeTransformer final {
     if (candidate_type == nullptr) {
       return;
     }
+    require_integer(insn, 0);
     auto* new_insn = new IRInstruction(OPCODE_INVOKE_VIRTUAL);
     new_insn->set_method(integer_meth)->set_srcs(insn->srcs());
     m_replacements.emplace_back(cfg, block, mie, new_insn);
@@ -1160,6 +1255,7 @@ class CodeTransformer final {
         !method->is_external() || is_static(method),
         "[%s] with candidate type %s resolved to external non-static method %s",
         SHOW(insn), SHOW(candidate_type), SHOW(method));
+    require_integer(insn, 0);
     auto* new_insn = (new IRInstruction(*insn))
                          ->set_opcode(OPCODE_INVOKE_STATIC)
                          ->set_method(method);
@@ -1227,6 +1323,12 @@ class CodeTransformer final {
   EnumUtil* m_enum_util;
   DexMethod* m_method;
   std::vector<InsnReplacement> m_replacements;
+  // The verifier's types before each instruction, while run() rewrites them.
+  const UnorderedMap<const IRInstruction*, type_inference::TypeEnvironment>*
+      m_verifier_envs{nullptr};
+  // Uses that rewritten instructions take as an Integer and the registers
+  // they read, where the verifier does not know the value as one.
+  std::vector<std::pair<const IRInstruction*, reg_t>> m_integer_casts;
 };
 
 /**
@@ -1244,10 +1346,12 @@ class EnumTransformer final {
         m_int_objs(0),
         m_disable_violation_fixes(disable_violation_fixes) {
     m_enum_util = std::make_unique<EnumUtil>(config);
+    always_assert(config.override_graph != nullptr);
+    optimize_enums::ConstantReadSummaries reads(*config.override_graph);
     for (const auto& enum_type : UnorderedIterable(config.candidate_enums)) {
       auto* enum_cls = type_class(enum_type);
       auto attributes = optimize_enums::analyze_enum_clinit(
-          enum_cls, config.support_kt_19_enum_entries);
+          enum_cls, config.support_kt_19_enum_entries, &reads);
       size_t num_enum_constants = attributes.m_constants_map.size();
       if (num_enum_constants == 0) {
         TRACE(ENUM, 2, "\tCannot analyze enum %s : ord %zu sfields %zu",
@@ -1724,8 +1828,8 @@ class EnumTransformer final {
    */
   void clean_generated_methods_fields(DexClass* enum_cls) {
     auto& sfields = enum_cls->get_sfields();
-    auto& enum_constants =
-        m_enum_attributes_map[enum_cls->get_type()].m_constants_map;
+    const auto& attributes = m_enum_attributes_map[enum_cls->get_type()];
+    const auto& enum_constants = attributes.m_constants_map;
     auto synth_field_access = synth_access();
     UnorderedSet<DexField*> synth_fields;
 
@@ -1751,8 +1855,7 @@ class EnumTransformer final {
     // Delete <init>, values() and valueOf(String) methods, and clean <clinit>.
     std::erase_if(dmethods, [&, this](auto* method) {
       if (method::is_clinit(method)) {
-        clean_clinit(enum_constants, m_enum_util->m_config, enum_cls, method,
-                     synth_fields, m_enum_util->KT_ENUM_ENTRIES_FACTORY_METHOD);
+        clean_clinit(attributes, enum_cls, method, synth_fields);
         return empty(method->get_code());
       }
       return this->is_generated_enum_method(method);
@@ -1760,13 +1863,17 @@ class EnumTransformer final {
   }
 
   /**
-   * Erase enum construction code. Erase the put instructions that write enum
-   * values and synthetic $VALUES array, then erase the dead instructions.
+   * Erase enum construction code. Replace each constant's allocation with a
+   * read of the constant's field, so that every use of the constant, before or
+   * after <clinit> assigns it, reads the boxed constant. Erase the put
+   * instructions that write enum values and synthetic $VALUES array, then
+   * erase the dead instructions.
    *
    * The code before the transformation:
    *
    * new-instance v0 LCandidateEnum;
    * invoke-direct v0 v1 v2 Ljava/lang/Enum;.<init>:(Ljava/lang/String;I)V
+   * ... // register v0 may be used.
    * sput-object v0 LCandidateEnum;.f:LCandidateEnum;
    * ... // maybe more objects construction.
    * sput-object v3 LCandidateEnum;.$VALUES:[LCandidateEnum;
@@ -1774,21 +1881,19 @@ class EnumTransformer final {
    *
    * The code after the transformation:
    *
-   * // Deleted. new-instance v0 LCandidateEnum;
+   * sget-object v0 LCandidateEnum;.f:LCandidateEnum;
    * // Deleted. invoke-direct v0 v1 v2
    * Ljava/lang/Enum;.<init>:(Ljava/lang/String;I)V
+   * ... // register v0 may be used.
    * // Deleted. sput-object v0 LCandidateEnum;.f:LCandidateEnum;
-   * sget-object v0 LCandidateEnum;.f:LCandidateEnum;
    * ... // maybe more objects construction.
    * // Deleted. sput-object v3 LCandidateEnum;.$VALUES:[LCandidateEnum;
    * ... // register v0 may be used.
    */
-  static void clean_clinit(const EnumConstantsMap& enum_constants,
-                           const Config& config,
+  static void clean_clinit(const EnumAttributes& attributes,
                            DexClass* enum_cls,
                            DexMethod* clinit,
-                           const UnorderedSet<DexField*>& synth_fields,
-                           DexMethodRef* kt_enum_entries_factory) {
+                           const UnorderedSet<DexField*>& synth_fields) {
     auto* code = clinit->get_code();
     auto ctors = enum_cls->get_ctors();
     auto* ctor = only(ctors);
@@ -1798,24 +1903,34 @@ class EnumTransformer final {
     cfg::CFGMutation m(cfg);
     for (auto it = ii.begin(); it != ii.end(); ++it) {
       auto* insn = it->insn;
-      if (opcode::is_an_sput(insn->opcode())) {
-        auto* field = resolve_field(insn->get_field());
-        if ((field != nullptr) && (enum_constants.count(field) != 0u)) {
-          cfg.insert_before(it, dasm(OPCODE_SGET_OBJECT, field));
-          cfg.insert_before(
+      if (insn->opcode() == OPCODE_NEW_INSTANCE) {
+        auto allocation_it = attributes.m_constant_allocations.find(insn);
+        if (allocation_it != attributes.m_constant_allocations.end()) {
+          m.replace(
               it,
-              dasm(IOPCODE_MOVE_RESULT_PSEUDO_OBJECT, {{VREG, insn->src(0)}}));
-          m.remove(it);
-        } else if (synth_fields.count(field) != 0u) {
+              {dasm(OPCODE_SGET_OBJECT, resolve_field(allocation_it->second)),
+               dasm(IOPCODE_MOVE_RESULT_PSEUDO_OBJECT,
+                    {{VREG, cfg.move_result_of(it)->insn->dest()}})});
+        }
+      } else if (opcode::is_an_sput(insn->opcode())) {
+        auto* field = resolve_field(insn->get_field());
+        if ((field != nullptr) &&
+            (attributes.m_constants_map.count(field) != 0u ||
+             synth_fields.count(field) != 0u)) {
           m.remove(it);
         }
       } else if (opcode::is_invoke_direct(insn->opcode()) &&
                  insn->get_method() == ctor) {
+        // The enum constructor is side-effect free (see is_safe_enum). Its
+        // instance is the boxed constant now, which may have other uses.
+        m.remove(it);
+      } else if ((opcode::is_invoke_static(insn->opcode()) &&
+                  is_kt_enum_entries_factory(insn->get_method())) ||
+                 (opcode::is_invoke_direct(insn->opcode()) &&
+                  is_kt_enum_entries_list_ctor(insn->get_method()))) {
+        // `enumEntries`, or its inlined body, only wraps an array for
+        // `$ENTRIES`.
         summaries.emplace(insn, side_effects::Summary());
-      } else if (opcode::is_invoke_static(insn->opcode()) &&
-                 insn->get_method() == kt_enum_entries_factory) {
-        summaries.emplace(insn, side_effects::Summary());
-        always_assert(config.support_kt_19_enum_entries);
       }
     }
     m.flush();

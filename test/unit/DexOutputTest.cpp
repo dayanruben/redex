@@ -7,6 +7,9 @@
 
 #include "DexOutput.h"
 #include "Creators.h"
+#include "DexAnnotation.h"
+#include "DexCallSite.h"
+#include "DexLoader.h"
 #include "DexPosition.h"
 #include "IODIMetadata.h"
 #include "IODIPlan.h"
@@ -21,6 +24,7 @@
 #include <gtest/gtest.h>
 #include <json/reader.h>
 #include <json/value.h>
+#include <optional>
 
 class IODIMetadataTest : public RedexTest {};
 
@@ -171,6 +175,55 @@ TEST_F(DexIoTest, WritesCompleteDexAndRecordsItsByteCount) {
   output->write();
   EXPECT_GT(output->m_stats.num_bytes, 0);
   EXPECT_EQ(redex::file_size(filename), output->m_stats.num_bytes);
+}
+
+TEST_F(DexIoTest, WritesJavaLangObjectWithoutSuperclass) {
+  // A platform dex such as core-oj defines Object, the one class whose class
+  // def has no superclass.
+  auto* object_type = type::java_lang_Object();
+  ClassCreator object_creator(object_type);
+  object_creator.set_access(ACC_PUBLIC);
+  object_creator.add_method(
+      DexMethod::make_method("Ljava/lang/Object;.hashCode:()I")
+          ->make_concrete(ACC_PUBLIC | ACC_NATIVE, /* is_virtual */ true));
+  classes.push_back(object_creator.create());
+  auto* sub_type = DexType::make_type("LSub;");
+  ClassCreator sub_creator(sub_type);
+  sub_creator.set_super(object_type);
+  classes.push_back(sub_creator.create());
+
+  auto temp = redex::make_tmp_dir("dex-io-%%%%-%%%%");
+  redex::create_directories(temp.path + "/meta");
+  ConfigFiles config(Json::Value(Json::objectValue), temp.path);
+  const auto filename = temp.path + "/output.dex";
+  make_output(filename, config)->write();
+
+  delete g_redex;
+  g_redex = new RedexContext();
+  auto loaded =
+      load_classes_from_dex(DexLocation::make_location("dex", filename));
+  ASSERT_EQ(loaded.size(), 2u);
+  const auto* loaded_object = type_class(type::java_lang_Object());
+  ASSERT_NE(loaded_object, nullptr);
+  EXPECT_EQ(loaded_object->get_super_class(), nullptr);
+  EXPECT_EQ(loaded_object->get_vmethods().size(), 1u);
+  const auto* loaded_sub = type_class(DexType::get_type("LSub;"));
+  ASSERT_NE(loaded_sub, nullptr);
+  EXPECT_EQ(loaded_sub->get_super_class(), type::java_lang_Object());
+}
+
+TEST_F(DexIoTest, RejectsMissingSuperclassOfOtherClasses) {
+  auto* type = DexType::make_type("LNoSuper;");
+  ClassCreator creator(type);
+  creator.set_super(type::java_lang_Object());
+  auto* cls = creator.create();
+  cls->set_super_class(nullptr);
+  classes.push_back(cls);
+
+  auto temp = redex::make_tmp_dir("dex-io-%%%%-%%%%");
+  redex::create_directories(temp.path + "/meta");
+  ConfigFiles config(Json::Value(Json::objectValue), temp.path);
+  EXPECT_THROW(make_output(temp.path + "/output.dex", config), RedexException);
 }
 
 TEST_F(DexIoTest, RejectsOpenFailureBeforeWritingSymbolFiles) {
@@ -496,4 +549,53 @@ TEST(IODIPlan, ExhaustedCandidatesFallBackToNormalDebugInfo) {
   EXPECT_TRUE(plan.programs.empty());
   EXPECT_EQ(plan.total_debug_size, 7);
   verify_plan(plan, method_sizes);
+}
+
+class CallSiteOrderTest : public RedexTest {};
+
+// Call sites and method handles are numbered in the order the code first refers
+// to them, wherever they lie in memory. Here the call sites are equal in
+// content, as are their bootstrap method handles, and they lie in memory in the
+// reverse of the order the code refers to them. The first one is referred to
+// again at the end.
+TEST_F(CallSiteOrderTest, NumbersCallSitesAndHandlesInReferenceOrder) {
+  auto* bootstrap = DexMethod::make_method(
+      "LBoot;.bootstrap:(Ljava/lang/invoke/MethodHandles$Lookup;"
+      "Ljava/lang/String;Ljava/lang/invoke/MethodType;)"
+      "Ljava/lang/invoke/CallSite;");
+  // The elements of a vector lie in memory in increasing address order.
+  constexpr size_t n = 3;
+  std::vector<std::optional<DexMethodHandle>> handles(n);
+  std::vector<std::optional<DexCallSite>> callsites(n);
+  std::vector<DexCallSite*> referenced;
+  for (size_t i = 0; i < n; ++i) {
+    const auto slot = n - 1 - i;
+    auto& handle =
+        handles[slot].emplace(METHOD_HANDLE_TYPE_INVOKE_STATIC, bootstrap);
+    referenced.push_back(&callsites[slot].emplace(
+        &handle, DexString::make_string("run"), DexProto::make_proto("()V"),
+        std::vector<std::unique_ptr<DexEncodedValue>>()));
+  }
+  referenced.push_back(referenced.front());
+  auto* method =
+      DexMethod::make_method("LCallSites;.run:()V")
+          ->make_concrete(ACC_PUBLIC | ACC_STATIC, std::make_unique<IRCode>(),
+                          /* is_virtual */ false);
+  auto* code = method->get_code();
+  for (auto* callsite : referenced) {
+    code->push_back(
+        (new IRInstruction(OPCODE_INVOKE_CUSTOM))->set_callsite(callsite));
+  }
+  code->push_back(new IRInstruction(OPCODE_RETURN_VOID));
+  ClassCreator creator(DexType::make_type("LCallSites;"));
+  creator.set_super(type::java_lang_Object());
+  creator.add_method(method);
+  DexClasses classes{creator.create()};
+
+  auto dodx = GatheredTypes(&classes).get_dodx();
+  EXPECT_EQ(dodx.callsitesize(), n);
+  for (size_t i = 0; i < n; ++i) {
+    EXPECT_EQ(dodx.callsiteidx(referenced[i]), i);
+    EXPECT_EQ(dodx.methodhandleidx(referenced[i]->method_handle()), i);
+  }
 }

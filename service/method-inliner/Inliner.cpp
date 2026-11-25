@@ -482,6 +482,7 @@ void MultiMethodInliner::inline_callees(DexMethod* caller,
           continue;
         }
         std::shared_ptr<ReducedCode> reduced_code;
+        bool rebuild_reduced_code{false};
         bool no_return{false};
         bool partial{false};
         bool for_speed{false};
@@ -491,16 +492,16 @@ void MultiMethodInliner::inline_callees(DexMethod* caller,
           auto timer2 = m_inline_callees_should_inline_timer.scope();
           // Cost model is based on fully inlining callee everywhere; let's
           // see if we can get more detailed call-site specific information
+          bool use_call_site_cost = false;
           if (should_inline_at_call_site(caller, block, insn, callee,
-                                         &no_return, &for_speed, &reduced_code,
-                                         &insn_size, &partial_code)) {
+                                         &no_return, &for_speed,
+                                         &partial_code)) {
             always_assert(!no_return);
             // Yes, we know might have dead_blocks and a refined insn_size
+            use_call_site_cost = true;
           } else if (should_inline_always(callee)) {
-            // We'll fully inline the callee without any adjustments
             no_return = false;
-            reduced_code = nullptr;
-            insn_size = get_callee_insn_size(callee);
+            use_call_site_cost = true;
           } else if (should_partially_inline(block, insn, callee,
                                              &partial_code)) {
             partial = true;
@@ -511,6 +512,20 @@ void MultiMethodInliner::inline_callees(DexMethod* caller,
             always_assert(!reduced_code);
           } else {
             continue;
+          }
+          if (use_call_site_cost) {
+            // Inline the code the call site's cost was estimated from: the
+            // callee as reduced by the site's constant arguments, if there are
+            // any. The cost is cached per instruction, so this second lookup is
+            // cheap.
+            const auto* inlined_cost = get_call_site_inlined_cost(insn, callee);
+            if (inlined_cost != nullptr) {
+              reduced_code = inlined_cost->reduced_code;
+              rebuild_reduced_code = inlined_cost->reduced_code_released;
+              insn_size = inlined_cost->insn_size;
+            } else {
+              insn_size = get_callee_insn_size(callee);
+            }
           }
         } else {
           insn_size = get_callee_insn_size(callee);
@@ -536,7 +551,8 @@ void MultiMethodInliner::inline_callees(DexMethod* caller,
         const auto* needs_receiver_cast = get_recorded_receiver_cast(insn);
         inlinables.push_back((Inlinable){callee, insn, no_return, partial,
                                          for_speed, std::move(reduced_code),
-                                         insn_size, needs_receiver_cast});
+                                         insn_size, needs_receiver_cast,
+                                         rebuild_reduced_code});
       }
     }
   }
@@ -654,12 +670,25 @@ void MultiMethodInliner::make_partial(const DexMethod* method,
         method, inlined_cost->reduced_code->cfg(),
         m_config.max_partially_inlined_code_units);
   }
-  inlined_cost->reduced_code.reset();
-  // `insn_size` was measured on the reduced cfg. Without that cfg the *full*
-  // callee body is what gets copied into the caller, so keeping the reduced
-  // number would make `inline_inlinables` under-charge `estimated_caller_size`
-  // and under-state the size passed to `is_inlinable`.
-  inlined_cost->insn_size = get_callee_insn_size(method);
+  // Release the reduced code to save memory. A call site that inlines the
+  // callee rebuilds it (`rebuild_call_site_reduced_code`), so the costs, which
+  // were measured on it, still describe the code that gets inlined.
+  if (inlined_cost->reduced_code) {
+    inlined_cost->reduced_code.reset();
+    inlined_cost->reduced_code_released = true;
+  }
+}
+
+std::shared_ptr<ReducedCode> MultiMethodInliner::rebuild_call_site_reduced_code(
+    const IRInstruction* invoke_insn, const DexMethod* callee) {
+  const auto* call_site_summary =
+      m_call_site_summarizer->get_instruction_call_site_summary(invoke_insn);
+  auto reduced_code = apply_call_site_summary(
+      is_static(callee), callee->get_class(), callee->get_proto(),
+      callee->get_code()->cfg(), call_site_summary);
+  // The released copy was built from the same summary, so this one exists too.
+  always_assert(reduced_code);
+  return reduced_code;
 }
 
 const DexType* MultiMethodInliner::get_needs_init_class(
@@ -792,8 +821,6 @@ size_t MultiMethodInliner::inline_inlinables(
   size_t constructor_fences = 0;
   for (const auto& inlinable : ordered_inlinables) {
     auto* callee_method = inlinable.callee;
-    const auto& reduced_code = inlinable.reduced_code;
-    const auto* reduced_cfg = reduced_code ? &reduced_code->cfg() : nullptr;
     auto* callsite_insn = inlinable.insn;
 
     if (remaining_callsites &&
@@ -862,6 +889,14 @@ size_t MultiMethodInliner::inline_inlinables(
         }
       }
     }
+
+    // A reduced callee that was released to save memory is rebuilt only for the
+    // call sites that get this far, and only for this iteration.
+    auto reduced_code =
+        inlinable.rebuild_reduced_code
+            ? rebuild_call_site_reduced_code(callsite_insn, callee_method)
+            : inlinable.reduced_code;
+    const auto* reduced_cfg = reduced_code ? &reduced_code->cfg() : nullptr;
 
     bool caller_too_large_;
     auto not_inlinable = !is_inlinable(
@@ -1091,7 +1126,14 @@ void MultiMethodInliner::compute_callee_costs(DexMethod* method) {
       m_call_site_summarizer
           ? m_call_site_summarizer->get_callee_call_site_invokes(method)
           : nullptr;
+  // Summaries for which no call site passes should_inline_at_call_site. Their
+  // reduced code is still needed if the method gets inlined everywhere, which
+  // is decided last.
+  std::shared_ptr<InsertOnlyConcurrentSet<const CallSiteSummary*>>
+      summaries_rejected_at_call_site;
   if (callee_call_site_invokes != nullptr) {
+    summaries_rejected_at_call_site =
+        std::make_shared<InsertOnlyConcurrentSet<const CallSiteSummary*>>();
     UnorderedMap<const CallSiteSummary*, std::vector<const IRInstruction*>>
         invokes;
     for (const auto* invoke_insn : *callee_call_site_invokes) {
@@ -1103,22 +1145,19 @@ void MultiMethodInliner::compute_callee_costs(DexMethod* method) {
     }
     for (auto& p : UnorderedIterable(invokes)) {
       m_scheduler.augment(method, [this, call_site_summary = p.first,
-                                   insns = std::move(p.second), method]() {
+                                   insns = std::move(p.second), method,
+                                   summaries_rejected_at_call_site]() {
         TraceContext context(method);
         // Populate caches
         auto timer = m_call_site_inlined_cost_timer.scope();
-        bool keep_reduced_code = false;
+        bool inlined_at_call_site = false;
         for (const auto* insn : insns) {
           if (should_inline_at_call_site(nullptr, nullptr, insn, method)) {
-            keep_reduced_code = true;
+            inlined_at_call_site = true;
           }
         }
-        if (!keep_reduced_code) {
-          CalleeCallSiteSummary key{method, call_site_summary};
-          const auto* cached = m_call_site_inlined_costs.get(key);
-          if (cached != nullptr) {
-            make_partial(method, const_cast<InlinedCost*>(cached));
-          }
+        if (!inlined_at_call_site) {
+          summaries_rejected_at_call_site->insert(call_site_summary);
         }
       });
     }
@@ -1140,10 +1179,22 @@ void MultiMethodInliner::compute_callee_costs(DexMethod* method) {
   // it as a "continuation".
   m_scheduler.augment(
       method,
-      [this, method] {
+      [this, method, summaries_rejected_at_call_site] {
         TraceContext context(method);
         // Populate cache
-        should_inline_always(method);
+        if (should_inline_always(method) ||
+            summaries_rejected_at_call_site == nullptr) {
+          return;
+        }
+        // Release the reduced code that no call site will inline.
+        for (const auto* call_site_summary :
+             UnorderedIterable(*summaries_rejected_at_call_site)) {
+          CalleeCallSiteSummary key{method, call_site_summary};
+          const auto* cached = m_call_site_inlined_costs.get(key);
+          if (cached != nullptr) {
+            make_partial(method, const_cast<InlinedCost*>(cached));
+          }
+        }
       },
       /* continuation */ true);
 }
@@ -2078,8 +2129,6 @@ bool MultiMethodInliner::should_inline_at_call_site(
     DexMethod* callee,
     bool* no_return,
     bool* for_speed,
-    std::shared_ptr<ReducedCode>* reduced_code,
-    size_t* insn_size,
     PartialCode* partial_code) {
   const auto* inlined_cost = get_call_site_inlined_cost(invoke_insn, callee);
   if (inlined_cost == nullptr) {
@@ -2118,12 +2167,6 @@ bool MultiMethodInliner::should_inline_at_call_site(
     return false;
   }
 
-  if (reduced_code != nullptr) {
-    *reduced_code = inlined_cost->reduced_code;
-  }
-  if (insn_size != nullptr) {
-    *insn_size = inlined_cost->insn_size;
-  }
   if (for_speed != nullptr) {
     *for_speed = size_increased;
   }
@@ -2897,6 +2940,35 @@ float MultiMethodInliner::compute_profile_guided_discount(
 
 namespace inliner {
 
+namespace {
+
+// Whether inlining the callee amounts to deleting the call: the callee does
+// nothing but load its parameters and return. Without branching instructions it
+// follows a single path from its entry, which must reach a return-void; an
+// empty infinite loop never does, even when an unreachable return block is left
+// over in the cfg.
+bool is_trivial_callee(const cfg::ControlFlowGraph& cfg) {
+  for (const auto& mie : InstructionIterable(cfg)) {
+    if (mie.insn->opcode() != OPCODE_RETURN_VOID &&
+        !opcode::is_load_param(mie.insn->opcode())) {
+      return false;
+    }
+  }
+  // Every block has at most one successor, so a path with more steps than there
+  // are blocks has entered a loop.
+  size_t steps = 0;
+  for (const auto* block = cfg.entry_block();
+       block->branchingness() != opcode::Branchingness::BRANCH_RETURN;
+       block = block->goes_to()) {
+    if (block->goes_to() == nullptr || ++steps > cfg.num_blocks()) {
+      return false;
+    }
+  }
+  return true;
+}
+
+} // namespace
+
 // return true on successful inlining, false otherwise
 bool inline_with_cfg(DexMethod* caller_method,
                      DexMethod* callee_method,
@@ -2927,15 +2999,7 @@ bool inline_with_cfg(DexMethod* caller_method,
   const auto& callee_cfg =
       reduced_cfg != nullptr ? *reduced_cfg : callee_code->cfg();
 
-  bool is_trivial = true;
-  for (const auto& mie : InstructionIterable(callee_cfg)) {
-    if (mie.insn->opcode() != OPCODE_RETURN_VOID &&
-        !opcode::is_load_param(mie.insn->opcode())) {
-      is_trivial = false;
-      break;
-    }
-  }
-  if (is_trivial) {
+  if (is_trivial_callee(callee_cfg)) {
     // no need to go through expensive general inlining, which would also add
     // unnecessary or even dubious positions
     caller_cfg.remove_insn(callsite_it);

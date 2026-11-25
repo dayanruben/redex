@@ -1225,6 +1225,68 @@ TEST_F(ControlFlowTest, structural_equals_catch_types) {
   EXPECT_FALSE(ise->cfg().structural_equals(rte->cfg()));
 }
 
+TEST_F(ControlFlowTest, structural_equals_chained_catches) {
+  // try { bar(); } catch (E1 e) { x(); } catch (E2 e) { y(); }
+  constexpr const char* kTwoCatches = R"(
+    (
+      (.try_start a)
+      (invoke-static () "LFoo;.bar:()V")
+      (.try_end a)
+      (return-void)
+      (.catch (a b) "LE1;")
+      (invoke-static () "LFoo;.x:()V")
+      (return-void)
+      (.catch (b) "LE2;")
+      (invoke-static () "LFoo;.y:()V")
+      (return-void)
+    )
+  )";
+  auto two = assembler::ircode_from_string(kTwoCatches);
+  auto two_copy = assembler::ircode_from_string(kTwoCatches);
+  EXPECT_TRUE(two->structural_equals(*two_copy));
+
+  // A chain can link back to a handler that appears earlier. After catch LE1
+  // (calls x()), region t tries the LE2 handler of region w (calls y()) or of
+  // region u (calls z()), so an LE2 thrown by bar() calls y() or z().
+  constexpr const char* kChain = R"(
+    (
+      (.try_start w)
+      (invoke-static () "LFoo;.baz:()V")
+      (.try_end w)
+      (.try_start u)
+      (invoke-static () "LFoo;.qux:()V")
+      (.try_end u)
+      (.try_start t)
+      (invoke-static () "LFoo;.bar:()V")
+      (.try_end t)
+      (return-void)
+      (.catch (w) "LE2;")
+      (invoke-static () "LFoo;.y:()V")
+      (return-void)
+      (.catch (u) "LE2;")
+      (invoke-static () "LFoo;.z:()V")
+      (return-void)
+      (.catch (t $NEXT) "LE1;")
+      (invoke-static () "LFoo;.x:()V")
+      (return-void)
+    )
+  )";
+  auto make_code = [&](const std::string& next) {
+    return assembler::ircode_from_string(ir(kChain, {{"$NEXT", next}}));
+  };
+  auto to_y = make_code("w");
+  auto to_y_copy = make_code("w");
+  auto to_z = make_code("u");
+  EXPECT_TRUE(to_y->structural_equals(*to_y_copy));
+  EXPECT_FALSE(to_y->structural_equals(*to_z));
+
+  to_y->build_cfg();
+  to_y_copy->build_cfg();
+  to_z->build_cfg();
+  EXPECT_TRUE(to_y->cfg().structural_equals(to_y_copy->cfg()));
+  EXPECT_FALSE(to_y->cfg().structural_equals(to_z->cfg()));
+}
+
 TEST_F(ControlFlowTest, structural_equals_inconsistent_block_pairing) {
   // Four switch arms reach two identical join blocks, X and Y. In `a` arms
   // 0,1 go to X and 2,3 to Y; in `b` arms 0,2 go to X and 1,3 to Y. X leads
@@ -3347,6 +3409,70 @@ TEST_F(ControlFlowTest, blocksReachingReturnOfAMethodThatAlwaysThrows) {
   )");
   code->build_cfg();
   EXPECT_TRUE(code->cfg().blocks_reaching_return().empty());
+}
+
+TEST_F(ControlFlowTest, blocksReachingABlock) {
+  auto code = assembler::ircode_from_string(R"(
+    (
+      (load-param v0)
+      (if-eqz v0 :other)
+      (const v1 1)
+      (goto :join)
+      (:other)
+      (const v1 2)
+      (:join)
+      (const v2 3)
+      (return v1)
+    )
+  )");
+  code->build_cfg();
+  auto& cfg = code->cfg();
+  cfg::Block* join = nullptr;
+  for (auto* block : cfg.blocks()) {
+    if (block->branchingness() == opcode::BRANCH_RETURN) {
+      join = block;
+    }
+  }
+  ASSERT_NE(join, nullptr);
+  // Every block but the join reaches it.
+  const auto reaching = cfg::ControlFlowGraph::blocks_reaching({join});
+  EXPECT_EQ(reaching.count(join), 0u);
+  EXPECT_EQ(reaching.count(cfg.entry_block()), 1u);
+  EXPECT_EQ(reaching.size(), cfg.num_blocks() - 1);
+  // Walking only through the entry block, nothing reaches the join, whose
+  // predecessors are the two branches; the entry reaches the branches.
+  const UnorderedSet<cfg::Block*> within{cfg.entry_block()};
+  const auto entry_only =
+      cfg::ControlFlowGraph::blocks_reaching({join}, &within);
+  EXPECT_EQ(entry_only.size(), 0u);
+  std::vector<cfg::Block*> branches;
+  for (const auto* edge : join->preds()) {
+    branches.push_back(edge->src());
+  }
+  EXPECT_EQ(cfg::ControlFlowGraph::blocks_reaching(branches, &within).size(),
+            1u);
+}
+
+TEST_F(ControlFlowTest, blockInALoopReachesItself) {
+  auto code = assembler::ircode_from_string(R"(
+    (
+      (load-param v0)
+      (:loop)
+      (add-int/lit v0 v0 -1)
+      (if-nez v0 :loop)
+      (return v0)
+    )
+  )");
+  code->build_cfg();
+  auto& cfg = code->cfg();
+  cfg::Block* loop = nullptr;
+  for (auto* block : cfg.blocks()) {
+    if (block->branchingness() == opcode::BRANCH_IF) {
+      loop = block;
+    }
+  }
+  ASSERT_NE(loop, nullptr);
+  EXPECT_EQ(cfg::ControlFlowGraph::blocks_reaching({loop}).count(loop), 1u);
 }
 
 TEST_F(ControlFlowTest, write_mermaid_format) {

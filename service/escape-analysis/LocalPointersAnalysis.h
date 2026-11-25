@@ -7,6 +7,7 @@
 
 #pragma once
 
+#include <functional>
 #include <iosfwd>
 #include <utility>
 
@@ -43,6 +44,12 @@ using PointerEnvironment =
 inline bool may_alloc(IROpcode op) {
   return op == OPCODE_NEW_INSTANCE || op == OPCODE_NEW_ARRAY ||
          op == OPCODE_FILLED_NEW_ARRAY || opcode::is_a_method_invoke(op);
+}
+
+// Whether `insn` is a `const 0`, the only instruction that puts null in a
+// register.
+inline bool is_null_constant(const IRInstruction* insn) {
+  return insn->opcode() == OPCODE_CONST && insn->get_literal() == 0;
 }
 
 /*
@@ -193,6 +200,11 @@ constexpr uint16_t FRESH_RETURN = std::numeric_limits<uint16_t>::max();
 // For denoting a returned value that escaped.
 constexpr uint16_t ESCAPED_FRESH_RETURN = FRESH_RETURN - 1;
 
+// For denoting a returned null. A caller treats it like ESCAPED_FRESH_RETURN;
+// it is kept apart for readers of a summary that ask whether a method may
+// return an object other than its parameters.
+constexpr uint16_t NULL_RETURN = FRESH_RETURN - 2;
+
 struct EscapeSummary {
   // The elements of this set represent the indexes of the src registers that
   // escape.
@@ -205,7 +217,8 @@ struct EscapeSummary {
   // We only track returned parameters that may pass "pointers". Other returned
   // values are not tracked. We do not model whether a method returns at all,
   // and thus the empty set is not special. See UsedVarsTest_noReturn for more
-  // background on that.
+  // background on that. A returned value that is not a parameter is denoted
+  // by FRESH_RETURN, ESCAPED_FRESH_RETURN or NULL_RETURN.
   ParamSet returned_parameters;
 
   EscapeSummary() = default;
@@ -258,26 +271,51 @@ class MayEscapeStore {
 using Environment = EnvironmentWithStoreImpl<MayEscapeStore>;
 
 /*
+ * The uses of an object that can tell it apart from a replacement that a client
+ * substitutes for it, as OptimizeEnumsPass substitutes a boxed Integer for an
+ * enum constant: a check-cast, a monitor, an `instance-of` of a type for which
+ * `instance_of_tells_apart` holds, a reference comparison with a register
+ * that may hold something other than `const 0`, and a virtual or interface
+ * call on it, whose receiver's class decides which method runs. A
+ * FixpointIterator refers to the rule it is given, so the rule must outlive it.
+ * `instance_of_tells_apart` must be set, safe to call from several threads at
+ * once, and give the same answer for a type every time: methods are analyzed in
+ * parallel, and a summary computed across calls may only grow from one round to
+ * the next.
+ */
+struct TypeAndIdentityUses {
+  std::function<bool(const DexType*)> instance_of_tells_apart;
+};
+
+/*
  * Analyze the given method to determine which pointers escape. Note that we do
  * not mark returned or thrown pointers as escaping here. This makes it easier
  * to use as part of an interprocedural analysis -- the analysis of the caller
  * can choose whether to track these pointers or treat them as having escaped.
- * Check-casts would not let source value escape in normal cases. But for
- * OptimizeEnumsPass which replaces enum object with boxed integer, check-casts
- * may result in cast error. So we add the option `escape_check_cast` to make
- * OptimizeEnumsPass able to treat check-cast as an escaping instruction.
+ * Check-casts, instance-of, monitors and reference comparisons would not let
+ * source value escape in normal cases. But OptimizeEnumsPass replaces enum
+ * objects with boxed integers, so these uses can change behavior: a check-cast
+ * may fail, instance-of a type that an enum and an Integer disagree on or `==`
+ * may give another result, and a monitor may lock an Integer shared with other
+ * code. So with `escape_type_and_identity_uses`, these uses count as escaping
+ * instructions; which instance-of tests count is up to the client. Comparing
+ * with a register that holds only `const 0` values, or no value, does not
+ * escape, since boxing cannot change its result.
  */
 class FixpointIterator final : public ir_analyzer::BaseIRAnalyzer<Environment> {
  public:
   explicit FixpointIterator(
       const cfg::ControlFlowGraph& cfg,
       InvokeToSummaryMap invoke_to_summary_map = InvokeToSummaryMap(),
-      bool escape_check_cast = false,
+      const TypeAndIdentityUses* escape_type_and_identity_uses = nullptr,
       const UnorderedSet<DexClass*>* excluded_classes = nullptr)
       : ir_analyzer::BaseIRAnalyzer<Environment>(cfg),
         m_invoke_to_summary_map(std::move(invoke_to_summary_map)),
-        m_escape_check_cast(escape_check_cast),
-        m_excluded_classes(excluded_classes) {}
+        m_escape_type_and_identity_uses(escape_type_and_identity_uses),
+        m_excluded_classes(excluded_classes) {
+    always_assert(escape_type_and_identity_uses == nullptr ||
+                  escape_type_and_identity_uses->instance_of_tells_apart);
+  }
 
   void analyze_instruction(const IRInstruction* insn,
                            Environment* env) const override;
@@ -292,7 +330,7 @@ class FixpointIterator final : public ir_analyzer::BaseIRAnalyzer<Environment> {
   // ourselves -- we are able to switch easily between different call graph
   // construction strategies.
   InvokeToSummaryMap m_invoke_to_summary_map;
-  const bool m_escape_check_cast;
+  const TypeAndIdentityUses* m_escape_type_and_identity_uses;
   const UnorderedSet<DexClass*>* m_excluded_classes;
 };
 
@@ -324,12 +362,14 @@ struct AnalyzeScopeResult {
 };
 
 /*
- * A call graph that lets `analyze_scope` summarize every method with code: each
- * such method is a root, and a call gets edges only when they reach every
- * method that can run for it. A call that may reach a native method, a method
- * of a class created at runtime, an overridable or unsummarized external
- * method, an abstract method, or one of more than `big_override_threshold`
- * overrides gets none, so `analyze_scope` treats it as a call to unknown code.
+ * A call graph that lets `analyze_scope` summarize methods with code: each
+ * method that `is_root` accepts (by default, every method with code) is a root,
+ * the graph holds every method a root may call, and a call gets edges only
+ * when they reach every method that can run for it. A call that may reach a
+ * native method, a method of a class created at runtime, an overridable or
+ * unsummarized external method, an abstract method, or one of more than
+ * `big_override_threshold` overrides gets none, so `analyze_scope` treats it as
+ * a call to unknown code.
  */
 class EscapeCallGraphStrategy : public call_graph::MultipleCalleeStrategy {
  public:
@@ -338,7 +378,8 @@ class EscapeCallGraphStrategy : public call_graph::MultipleCalleeStrategy {
   EscapeCallGraphStrategy(
       const method_override_graph::Graph& method_override_graph,
       const Scope& scope,
-      uint32_t big_override_threshold = DEFAULT_BIG_OVERRIDE_THRESHOLD);
+      uint32_t big_override_threshold = DEFAULT_BIG_OVERRIDE_THRESHOLD,
+      const std::function<bool(const DexMethod*)>& is_root = {});
 
   call_graph::CallSites get_callsites(const DexMethod* method) const override;
 
@@ -367,12 +408,28 @@ class EscapeCallGraphStrategy : public call_graph::MultipleCalleeStrategy {
  *
  * If a non-null SummaryMap pointer is passed in, it will get populated
  * with the escape summaries of the methods in scope.
+ *
+ * `escape_type_and_identity_uses` is passed to the FixpointIterator of every
+ * method, so that the summaries count those uses as escapes too; the kept
+ * FixpointIterators refer to it, so it must outlive the result.
+ *
+ * The result keeps the FixpointIterator of every method that
+ * `keep_fixpoint_iterator` accepts, or of every method if it is empty. They
+ * take far more memory than the summaries.
+ *
+ * With `only_methods_in_call_graph`, only the methods that have a node in the
+ * call graph are analyzed. Every callee of such a method has a node too, so
+ * their summaries are the same as when analyzing the whole scope; the other
+ * methods get neither a summary nor a FixpointIterator.
  */
 AnalyzeScopeResult analyze_scope(
     const Scope&,
     const call_graph::Graph&,
     SummaryMap* = nullptr,
-    const UnorderedSet<DexClass*>* excluded_classes = nullptr);
+    const UnorderedSet<DexClass*>* excluded_classes = nullptr,
+    const TypeAndIdentityUses* escape_type_and_identity_uses = nullptr,
+    const std::function<bool(const DexMethod*)>& keep_fixpoint_iterator = {},
+    bool only_methods_in_call_graph = false);
 
 /*
  * Join over all possible returned and thrown values.

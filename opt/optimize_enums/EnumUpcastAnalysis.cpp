@@ -7,8 +7,14 @@
 
 #include "EnumUpcastAnalysis.h"
 
+#include <functional>
+#include <memory>
+#include <utility>
+#include <vector>
+
 #include "Debug.h"
 #include "EnumClinitAnalysis.h"
+#include "Lazy.h"
 #include "LiveRange.h"
 #include "Macros.h"
 #include "Resolver.h"
@@ -59,6 +65,40 @@ UnorderedSet<const DexType*> discard_primitives(const EnumTypes& types) {
   return res;
 }
 
+// Boxing replaces a value of the candidate enum, or array of them, `type` with
+// an Integer, or an Integer array. Whether `instance-of test` holds changes
+// only where the two disagree on it, e.g. for `Number` or `Enum` but not
+// `Object`, `Comparable` or `String`.
+bool boxing_may_change_instance_of(const DexType* type, const DexType* test) {
+  while (type::is_array(type)) {
+    if (!type::is_array(test)) {
+      // Both arrays are instances of `Object`, `Cloneable` and `Serializable`,
+      // and of nothing else that is not an array.
+      return false;
+    }
+    type = type::make_array_component_type(type);
+    test = type::make_array_component_type(test);
+  }
+  if (type::is_primitive(test)) {
+    return false;
+  }
+  auto as_enum = type::is_instance_of_if_known(type, test);
+  auto as_integer =
+      type::is_instance_of_if_known(type::java_lang_Integer(), test);
+  return !as_enum || !as_integer || *as_enum != *as_integer;
+}
+
+// Whether a value of `type` may be an Integer, which boxing may make identical
+// to a boxed enum constant: for `Object` or `Number`, not for `String` or an
+// app class. Any interface may, since the verifier does not check interface
+// types, and so may a type Redex has not loaded, which may be an interface.
+bool may_be_integer(const DexType* type) {
+  const auto* cls = type_class(type);
+  return cls == nullptr || is_interface(cls) ||
+         type::is_instance_of_if_known(type::java_lang_Integer(), type)
+             .value_or(true);
+}
+
 bool is_static_field_on_enum_class(const DexFieldRef* fref) {
   const auto* field = fref->as_def();
   if ((field == nullptr) || !is_static(field)) {
@@ -88,8 +128,19 @@ class EnumUpcastDetector {
         m_candidate_enums(&config->candidate_enums),
         m_reject_fn(reject_fn) {}
 
+  // Pairs of candidates this method compares by identity with each other.
+  const std::vector<std::pair<const DexType*, const DexType*>>&
+  compared_candidates() const {
+    return m_compared_candidates;
+  }
+
   void run(const EnumFixpointIterator& engine,
            const cfg::ControlFlowGraph& cfg) {
+    if (m_config->support_kt_19_enum_entries && method::is_clinit(m_method) &&
+        m_candidate_enums->count_unsafe(m_method->get_class()) != 0u) {
+      m_clinit_chains.emplace(
+          [&cfg] { return std::make_unique<live_range::LazyLiveRanges>(cfg); });
+    }
     for (const auto& block : cfg.blocks()) {
       EnumTypeEnvironment env = engine.get_entry_state_at(block);
       if (env.is_bottom()) {
@@ -97,6 +148,9 @@ class EnumUpcastDetector {
       }
       for (const auto& mie : InstructionIterable(block)) {
         engine.analyze_instruction(mie.insn, &env);
+        if (compares_by_identity(mie.insn)) {
+          process_identity_comparison(engine, cfg, block, mie.insn, env);
+        }
         process_instruction(mie.insn, &env);
       }
     }
@@ -108,12 +162,16 @@ class EnumUpcastDetector {
    */
   void process_instruction(const IRInstruction* insn,
                            const EnumTypeEnvironment* env) {
+    reject_unless_candidate_defines(insn);
     switch (insn->opcode()) {
     case OPCODE_CHECK_CAST: {
       const auto* type = insn->get_type();
       // Assume the local upcast is safe and we only care about upcasting when
       // the value is escaping.
-      if (type != OBJECT_TYPE) {
+      if (type::is_enum_array(type)) {
+        process_enum_entries_input(insn, 0, env,
+                                   UnsafeType::kUsageCastCheckCast);
+      } else if (type != OBJECT_TYPE) {
         reject_if_inconsistent(insn, env->get(insn->src(0)), type,
                                UnsafeType::kUsageCastCheckCast);
       }
@@ -123,6 +181,12 @@ class EnumUpcastDetector {
       break;
     case OPCODE_INSTANCE_OF:
       reject(insn, insn->get_type(), UnsafeType::kUsageUsedInInstanceOf);
+      for (const auto* type : env->get(insn->src(0)).elements()) {
+        if (is_candidate(type) &&
+            boxing_may_change_instance_of(type, insn->get_type())) {
+          reject(insn, type, UnsafeType::kUsageUsedInInstanceOf);
+        }
+      }
       break;
     case OPCODE_INVOKE_CUSTOM:
     case OPCODE_INVOKE_POLYMORPHIC:
@@ -137,6 +201,10 @@ class EnumUpcastDetector {
     case OPCODE_CONST_METHOD_HANDLE:
     case OPCODE_CONST_METHOD_TYPE:
       reject_linkage_types(insn);
+      break;
+    case OPCODE_MONITOR_ENTER:
+    case OPCODE_MONITOR_EXIT:
+      reject(insn, env->get(insn->src(0)), UnsafeType::kUsageUsedInMonitor);
       break;
     case OPCODE_INVOKE_INTERFACE:
     case OPCODE_INVOKE_SUPER:
@@ -183,6 +251,123 @@ class EnumUpcastDetector {
     default:
       break;
     }
+  }
+
+  /**
+   * Whether `insn` compares its two sources by identity: `if-eq`, `if-ne`, or
+   * `Enum.equals(Object)`, which the transformation turns into
+   * `Integer.equals(Object)` on a boxed receiver. That compares values, and
+   * each constant is boxed to the one cached `Integer` of its ordinal, so it
+   * agrees with `==` on the boxed values.
+   */
+  bool compares_by_identity(const IRInstruction* insn) const {
+    if (insn->opcode() == OPCODE_IF_EQ || insn->opcode() == OPCODE_IF_NE) {
+      return true;
+    }
+    if (insn->opcode() != OPCODE_INVOKE_VIRTUAL) {
+      return false;
+    }
+    const auto* method = insn->get_method();
+    return (method->get_class() == ENUM_TYPE ||
+            m_candidate_enums->count_unsafe(method->get_class()) != 0u) &&
+           method::signatures_match(method, ENUM_EQUALS_METHOD);
+  }
+
+  struct IdentityRisks {
+    // Candidates whose comparison may give another result once boxed.
+    UnorderedSet<const DexType*> unsafe;
+    // Candidates compared with another candidate, which may give another
+    // result only if both are boxed.
+    std::vector<std::pair<const DexType*, const DexType*>> compared_candidates;
+  };
+
+  /**
+   * Boxing replaces each constant with the shared `Integer` of its ordinal.
+   * Within one enum that keeps identity: comparing two values of the same enum,
+   * or a value with null, keeps its result. (The exception is an enum in
+   * `break_reference_equality_allowlist`, whose constants from `max_enum_size`
+   * on are boxed with `Integer.valueOf` at every use, so their identity is not
+   * guaranteed, as the option's name allows.) Across enums, constants with
+   * equal ordinals become identical, and so does a constant and any other
+   * `Integer` with its ordinal. So a comparison keeps its result unless the
+   * other operand can be an Integer after boxing: a value of a type an Integer
+   * may belong to (see `may_be_integer`), or a value of another candidate enum,
+   * if that enum is boxed too, which is decided once the other checks have run.
+   * Only a register whose types include the enum can hold one of its
+   * constants: a local upcast keeps the enum's type on the register, and an
+   * upcast that lets a constant leave the method rejects the enum, so a
+   * `String` or app-class operand keeps the result.
+   *
+   * The analysis joins the types that reach the comparison along different
+   * paths. Where the joined types would reject, the comparison is judged again
+   * on each path into its block, so that operands from different incoming
+   * edges are not paired: `a == A` and `b == B`, merged into one block, are not
+   * mistaken for `a == B`.
+   */
+  void process_identity_comparison(const EnumFixpointIterator& engine,
+                                   const cfg::ControlFlowGraph& cfg,
+                                   const cfg::Block* block,
+                                   const IRInstruction* insn,
+                                   const EnumTypeEnvironment& env) {
+    IdentityRisks joined;
+    collect_identity_risks(insn, env, &joined);
+    if (joined.unsafe.empty() && joined.compared_candidates.empty()) {
+      return;
+    }
+    // Every execution enters the block along one edge, or at the method entry;
+    // joins in earlier blocks stay joined, which can only reject more.
+    IdentityRisks on_paths;
+    auto judge_path = [&](EnumTypeEnvironment path_env) {
+      if (path_env.is_bottom()) {
+        return;
+      }
+      for (const auto& mie : InstructionIterable(block)) {
+        engine.analyze_instruction(mie.insn, &path_env);
+        if (mie.insn == insn) {
+          break;
+        }
+      }
+      collect_identity_risks(insn, path_env, &on_paths);
+    };
+    if (block == cfg.entry_block()) {
+      judge_path(EnumFixpointIterator::gen_env(m_method));
+    }
+    for (auto* edge : block->preds()) {
+      judge_path(
+          engine.analyze_edge(edge, engine.get_exit_state_at(edge->src())));
+    }
+    reject(insn, on_paths.unsafe, UnsafeType::kUsageComparedByIdentity);
+    m_compared_candidates.insert(m_compared_candidates.end(),
+                                 on_paths.compared_candidates.begin(),
+                                 on_paths.compared_candidates.end());
+  }
+
+  void collect_identity_risks(const IRInstruction* insn,
+                              const EnumTypeEnvironment& env,
+                              IdentityRisks* risks) const {
+    auto left = discard_primitives(env.get(insn->src(0)));
+    auto right = discard_primitives(env.get(insn->src(1)));
+    auto collect = [&](const UnorderedSet<const DexType*>& side,
+                       const UnorderedSet<const DexType*>& other) {
+      for (const auto* type : UnorderedIterable(side)) {
+        if (type::is_array(type) || !is_candidate(type)) {
+          // Boxing keeps the identity of arrays and of non-candidate objects.
+          continue;
+        }
+        for (const auto* other_type : UnorderedIterable(other)) {
+          if (other_type == type || type::is_array(other_type)) {
+            continue;
+          }
+          if (is_candidate(other_type)) {
+            risks->compared_candidates.emplace_back(type, other_type);
+          } else if (may_be_integer(other_type)) {
+            risks->unsafe.insert(type);
+          }
+        }
+      }
+    };
+    collect(left, right);
+    collect(right, left);
   }
 
   /**
@@ -234,27 +419,137 @@ class EnumUpcastDetector {
     process_isput_object(insn, env);
   }
 
+  /**
+   * The transformation deletes `$ENTRIES` and the values array field, so no
+   * read of them may remain. It rewrites only `values()`, which is not
+   * analyzed, and the enum's own <clinit>. kotlinc reads `$ENTRIES` only in
+   * the `getEntries()` accessor; `<clinit>` reads it too once that accessor is
+   * inlined. `<clinit>` may read the values array field only to build
+   * `$ENTRIES` (see `process_enum_entries_input`).
+   */
   void process_sget_object(const IRInstruction* insn) const {
     DexFieldRef* field = insn->get_field();
-    // The transformation deletes the values array field and rewrites only
-    // `values()`, which is not analyzed, and the enum's own <clinit>.
-    if (is_enum_values_field(field) && !in_declaring_clinit(field)) {
+    if (is_enum_entries(field)) {
+      TRACE(ENUM, 5, "sget_object enum entries %s in %s", SHOW(field),
+            SHOW(m_method));
+      reject(insn, field->get_class(), UnsafeType::kUsageUsedEnumEntries);
+    } else if (is_enum_values_field(field) &&
+               (field->get_class() != m_method->get_class() ||
+                !only_used_by(insn, [this](const live_range::Use& use) {
+                  return builds_only_enum_entries(use, /*allow_cast=*/true);
+                }))) {
       TRACE(ENUM, 5, "sget_object values array %s in %s", SHOW(field),
             SHOW(m_method));
       reject(insn, field->get_class(), UnsafeType::kUsageUsedValuesField);
-      return;
     }
-    if (!is_enum_entries(field)) {
-      return;
+  }
+
+  /**
+   * A Kotlin enum's `<clinit>` builds `$ENTRIES` from its values array, which
+   * it upcasts to `Enum[]`:
+   *
+   *   $ENTRIES = EnumEntriesKt.enumEntries((Enum[]) $VALUES);
+   *   $ENTRIES = new EnumEntriesList($VALUES);  // the factory, inlined
+   *
+   * The transformation deletes the `$ENTRIES` store, and the code that only
+   * fed it becomes dead. The enum's own array may reach source `src` of
+   * `insn` as `Enum[]` only in this shape: any other code would receive the
+   * boxed integers.
+   */
+  void process_enum_entries_input(const IRInstruction* insn,
+                                  src_index_t src,
+                                  const EnumTypeEnvironment* env,
+                                  UnsafeType reason) const {
+    const bool builds_entries = builds_only_enum_entries(
+        live_range::Use{const_cast<IRInstruction*>(insn), src},
+        /*allow_cast=*/true);
+    for (const auto* type : env->get(insn->src(src)).elements()) {
+      if (!builds_entries ||
+          type::get_array_component_type(type) != m_method->get_class()) {
+        reject(insn, type, reason);
+      }
     }
-    auto* enum_cls = field->get_class();
-    auto* method_cls = m_method->get_class();
-    TRACE(ENUM, 5, "sget_object enum entries %s in %s", SHOW(field),
-          SHOW(m_method));
-    if (enum_cls == method_cls && method::is_clinit(m_method)) {
-      return;
+  }
+
+  /**
+   * Whether `use` of the candidate's values array only builds its `$ENTRIES`
+   * in `<clinit>`, in one of three shapes:
+   *
+   *   - a cast to `Enum[]` (allowed only when `allow_cast`) whose result is
+   *     used only by one of the next two;
+   *   - the argument of `enumEntries(Enum[])`, whose result is only stored in
+   *     the candidate's `$ENTRIES`;
+   *   - the argument of the `EnumEntriesList` constructor, whose object is
+   *     only stored in the candidate's `$ENTRIES`.
+   */
+  bool builds_only_enum_entries(const live_range::Use& use,
+                                bool allow_cast) const {
+    if (!m_clinit_chains) {
+      return false;
     }
-    reject(insn, enum_cls, UnsafeType::kUsageUsedEnumEntries);
+    const auto* insn = use.insn;
+    if (insn->opcode() == OPCODE_CHECK_CAST) {
+      return allow_cast && use.src_index == 0 &&
+             type::is_enum_array(insn->get_type()) &&
+             only_used_by(insn, [this](const live_range::Use& cast_use) {
+               return builds_only_enum_entries(cast_use,
+                                               /*allow_cast=*/false);
+             });
+    }
+    if (opcode::is_invoke_static(insn->opcode())) {
+      return use.src_index == 0 &&
+             is_kt_enum_entries_factory(insn->get_method()) &&
+             only_used_by(insn, [this](const live_range::Use& result_use) {
+               return is_own_enum_entries_store(result_use);
+             });
+    }
+    if (opcode::is_invoke_direct(insn->opcode())) {
+      if (use.src_index != 1 ||
+          !is_kt_enum_entries_list_ctor(insn->get_method())) {
+        return false;
+      }
+      const auto& use_defs = *(*m_clinit_chains)->use_def_chains;
+      auto defs_it = use_defs.find(live_range::Use{use.insn, 0});
+      if (defs_it == use_defs.end() || defs_it->second.empty()) {
+        return false;
+      }
+      return std::all_of(
+          defs_it->second.begin(), defs_it->second.end(),
+          [&](const IRInstruction* def) {
+            return def->opcode() == OPCODE_NEW_INSTANCE &&
+                   def->get_type() == insn->get_method()->get_class() &&
+                   only_used_by(def, [&](const live_range::Use& list_use) {
+                     return (list_use.insn == insn &&
+                             list_use.src_index == 0) ||
+                            is_own_enum_entries_store(list_use);
+                   });
+          });
+    }
+    return false;
+  }
+
+  // Whether every use of what `def` defines, other than a move, satisfies
+  // `pred`. False outside this candidate's `<clinit>`.
+  bool only_used_by(
+      const IRInstruction* def,
+      const std::function<bool(const live_range::Use&)>& pred) const {
+    if (!m_clinit_chains) {
+      return false;
+    }
+    const auto& def_uses = *(*m_clinit_chains)->def_use_chains;
+    auto it = def_uses.find(const_cast<IRInstruction*>(def));
+    if (it == def_uses.end()) {
+      return true;
+    }
+    return unordered_all_of(it->second, [&](const live_range::Use& use) {
+      return opcode::is_a_move(use.insn->opcode()) || pred(use);
+    });
+  }
+
+  bool is_own_enum_entries_store(const live_range::Use& use) const {
+    return use.insn->opcode() == OPCODE_SPUT_OBJECT && use.src_index == 0 &&
+           is_enum_entries(use.insn->get_field()) &&
+           use.insn->get_field()->get_class() == m_method->get_class();
   }
 
   /**
@@ -304,17 +599,16 @@ class EnumUpcastDetector {
   }
 
   /**
-   * No other direct invocation allowed on candidate enums except
-   * candidate enum constructor invocations in the enum classes'
-   * <clinit>.
+   * Direct calls are checked like any other call, including the constructor
+   * calls in a candidate's <clinit>: the candidate may stay an enum, and its
+   * constructor's parameters then keep their types.
    */
   void process_direct_invocation(const IRInstruction* insn,
                                  const EnumTypeEnvironment* env) const {
     always_assert(insn->opcode() == OPCODE_INVOKE_DIRECT);
     auto* invoked = insn->get_method();
-    auto* container = invoked->get_class();
-    if ((m_candidate_enums->count_unsafe(container) != 0u) &&
-        method::is_init(invoked) && method::is_clinit(m_method)) {
+    if (m_clinit_chains && is_kt_enum_entries_list_ctor(invoked)) {
+      process_enum_entries_input(insn, 1, env, UnsafeType::kUsageCastParameter);
       return;
     }
     process_general_invocation(insn, env);
@@ -336,6 +630,10 @@ class EnumUpcastDetector {
     if (method_ref == STRING_VALUEOF_METHOD) {
       EnumTypes types = env->get(insn->src(0));
       check_object_cast(types, insn);
+      return;
+    }
+    if (m_clinit_chains && is_kt_enum_entries_factory(method_ref)) {
+      process_enum_entries_input(insn, 0, env, UnsafeType::kUsageCastParameter);
       return;
     }
     auto* container = method_ref->get_class();
@@ -404,9 +702,15 @@ class EnumUpcastDetector {
         (m_candidate_enums->count_unsafe(container) != 0u)) {
       EnumTypes a_types = env->get(insn->src(0));
       auto this_types = discard_primitives(a_types);
-      // Method is equals or compareTo.
-      if (method::signatures_match(method, ENUM_EQUALS_METHOD) ||
-          method::signatures_match(method, ENUM_COMPARETO_METHOD)) {
+      if (method::signatures_match(method, ENUM_EQUALS_METHOD)) {
+        // `process_identity_comparison` judges the argument; the
+        // transformation needs a receiver of one enum.
+        if (this_types.size() > 1) {
+          reject(insn, this_types, UnsafeType::kUsageMultiEnumTypes);
+        }
+        return;
+      }
+      if (method::signatures_match(method, ENUM_COMPARETO_METHOD)) {
         EnumTypes b_types = env->get(insn->src(1));
         auto that_types = discard_primitives(b_types);
         const DexType* this_type =
@@ -509,19 +813,6 @@ class EnumUpcastDetector {
       }
     } else {
       for (const auto* possible_type : types.elements()) {
-        auto* const possible_elem_type =
-            type::make_array_component_type(possible_type);
-        if (m_config->support_kt_19_enum_entries &&
-            method::is_clinit(m_method) &&
-            m_method->get_class() == possible_elem_type &&
-            type::is_enum_array(required_type)) {
-          // EnumEntries upcast in the clinit method of the same enum class.
-          TRACE(ENUM, 5,
-                "Skip upcasting of EnumEntries construction in clinit method. "
-                "%s %s",
-                SHOW(possible_elem_type), SHOW(m_method));
-          continue;
-        }
         reject(insn, possible_type, reason);
       }
     }
@@ -536,6 +827,43 @@ class EnumUpcastDetector {
     for (const auto* type : types) {
       reject(insn, type, UnsafeType::kUsageNamedByCallSiteOrMethodHandle);
     }
+  }
+
+  /**
+   * Reject the candidate that a method or field reference names, directly or
+   * as the element type of an array, unless the candidate defines that member,
+   * or `process_virtual_invocation` rewrites the call: `equals`, `compareTo`,
+   * `toString`, `hashCode`, `name` and `ordinal`. The transformation turns a
+   * candidate into a subclass of `Object` whose methods are static, so a member
+   * it inherits, such as `Enum.valueOf(Class, String)` or
+   * `Enum.getDeclaringClass()`, does not exist on it, and it rewrites a call
+   * through an array of the candidate, like `clone()`, as a call of the
+   * candidate's own method.
+   */
+  void reject_unless_candidate_defines(const IRInstruction* insn) const {
+    if (insn->has_method()) {
+      const auto* method = insn->get_method();
+      if (is_candidate(method->get_class()) && !method->is_def() &&
+          !is_rewritten_enum_method(method)) {
+        reject(insn, method->get_class(),
+               UnsafeType::kUsageUnsafeInvocationOnCandidateEnum);
+      }
+    } else if (insn->has_field()) {
+      const auto* field = insn->get_field();
+      if (m_candidate_enums->count_unsafe(field->get_class()) != 0u &&
+          !field->is_def()) {
+        reject(insn, field->get_class(), UnsafeType::kUsageInheritedFieldRef);
+      }
+    }
+  }
+
+  bool is_rewritten_enum_method(const DexMethodRef* method) const {
+    return method::signatures_match(method, ENUM_EQUALS_METHOD) ||
+           method::signatures_match(method, ENUM_COMPARETO_METHOD) ||
+           method::signatures_match(method, ENUM_TOSTRING_METHOD) ||
+           method::signatures_match(method, ENUM_HASHCODE_METHOD) ||
+           method::signatures_match(method, ENUM_NAME_METHOD) ||
+           method::signatures_match(method, ENUM_ORDINAL_METHOD);
   }
 
   void reject(const IRInstruction* insn,
@@ -569,14 +897,11 @@ class EnumUpcastDetector {
     }
   }
 
-  const DexMethodRef* ENUM_EQUALS_METHOD =
-      DexMethod::make_method("Ljava/lang/Enum;.equals:(Ljava/lang/Object;)Z");
+  const DexMethodRef* ENUM_EQUALS_METHOD = method::java_lang_Enum_equals();
   const DexMethodRef* ENUM_COMPARETO_METHOD =
-      DexMethod::make_method("Ljava/lang/Enum;.compareTo:(Ljava/lang/Enum;)I");
-  const DexMethodRef* ENUM_TOSTRING_METHOD =
-      DexMethod::make_method("Ljava/lang/Enum;.toString:()Ljava/lang/String;");
-  const DexMethodRef* ENUM_HASHCODE_METHOD =
-      DexMethod::make_method("Ljava/lang/Enum;.hashCode:()I");
+      method::java_lang_Enum_compareTo();
+  const DexMethodRef* ENUM_TOSTRING_METHOD = method::java_lang_Enum_toString();
+  const DexMethodRef* ENUM_HASHCODE_METHOD = method::java_lang_Enum_hashCode();
   const DexMethodRef* ENUM_NAME_METHOD = method::java_lang_Enum_name();
   const DexMethodRef* ENUM_ORDINAL_METHOD = method::java_lang_Enum_ordinal();
   const DexMethodRef* STRING_VALUEOF_METHOD = DexMethod::make_method(
@@ -592,6 +917,10 @@ class EnumUpcastDetector {
   Config* m_config;
   const ConcurrentSet<const DexType*>* m_candidate_enums;
   const RejectFn& m_reject_fn;
+  // The chains of a candidate's `<clinit>`, where Kotlin builds `$ENTRIES`;
+  // absent elsewhere, and computed only when an instruction needs them.
+  mutable std::optional<Lazy<live_range::LazyLiveRanges>> m_clinit_chains;
+  std::vector<std::pair<const DexType*, const DexType*>> m_compared_candidates;
 };
 
 bool is_static_method_on_enum_class(const DexMethodRef* ref) {
@@ -652,6 +981,16 @@ void EnumFixpointIterator::analyze_instruction(const IRInstruction* insn,
     case OPCODE_INVOKE_CUSTOM:
     case OPCODE_INVOKE_POLYMORPHIC:
       env->set(dest, EnumTypes(insn->get_callsite_proto()->get_rtype()));
+      break;
+
+    // These dex 038 and 039 instructions cannot reach OptimizeEnumsPass, which
+    // supports dex 035 (`pass_support_dex_version()` is 35): PassManager aborts
+    // before running it on input that has them. Their results are objects all
+    // the same, never null, so an identity comparison with one cannot be judged
+    // as one with null.
+    case OPCODE_CONST_METHOD_HANDLE:
+    case OPCODE_CONST_METHOD_TYPE:
+      env->set(dest, EnumTypes(OBJECT_TYPE));
       break;
     case OPCODE_CONST_CLASS:
       env->set(dest, EnumTypes(type::java_lang_Class()));
@@ -868,6 +1207,8 @@ void reject_unsafe_enums(
     const std::function<void(const DexType*, UnsafeType u)>& reject_fn) {
   auto* candidate_enums = &config->candidate_enums;
   ConcurrentSet<const DexType*> rejected_enums;
+  ConcurrentMap<const DexType*, UnorderedSet<const DexType*>>
+      compared_candidates;
 
   walk::parallel::fields(
       classes, [candidate_enums, &rejected_enums, &reject_fn](DexField* field) {
@@ -963,6 +1304,11 @@ void reject_unsafe_enums(
 
     EnumUpcastDetector detector(method, config, local_reject_fn);
     detector.run(engine, cfg);
+    for (const auto& pair : detector.compared_candidates()) {
+      compared_candidates.update(pair.first, [&](auto*, auto& others, bool) {
+        others.insert(pair.second);
+      });
+    }
   });
 
   for (const auto* type : UnorderedIterable(rejected_enums)) {
@@ -971,6 +1317,26 @@ void reject_unsafe_enums(
 
   reject_enums_for_colliding_constructors(classes, candidate_enums);
   reject_enums_for_relaxed_inits(classes, candidate_enums);
+
+  // Comparing two candidates by identity may give another result only if both
+  // are boxed. Collect both ends of every pair against the candidates left now
+  // before erasing either, so that iteration order cannot decide which enum
+  // stays boxed: two enums that are compared only with each other both stay
+  // enums. Each pair is recorded in both orders, so rejecting each key rejects
+  // both ends.
+  std::vector<const DexType*> compared_with_candidate;
+  for (const auto& [type, others] : UnorderedIterable(compared_candidates)) {
+    if (candidate_enums->count(type) != 0u &&
+        unordered_any_of(others, [&](const DexType* other) {
+          return candidate_enums->count(other) != 0u;
+        })) {
+      compared_with_candidate.push_back(type);
+    }
+  }
+  for (const auto* type : compared_with_candidate) {
+    reject_fn(type, UnsafeType::kUsageComparedByIdentity);
+    candidate_enums->erase(type);
+  }
 }
 
 bool is_enum_valueof(const DexMethodRef* method) {
@@ -1005,6 +1371,34 @@ bool is_enum_values_field(const DexFieldRef* field_ref) {
   return check_required_access_flags(synth_access(), field->get_access()) &&
          type::get_array_component_type(field->get_type()) ==
              field->get_class();
+}
+
+namespace {
+
+// Whether the code that runs for the Kotlin library method `method` is
+// Kotlin's own: an app's copy marked `no_optimizations` may not be what runs.
+bool runs_kotlin_library_code(const DexMethodRef* method) {
+  const auto* def = method->as_def();
+  return def == nullptr || !def->rstate.no_optimizations();
+}
+
+} // namespace
+
+bool is_kt_enum_entries_factory(const DexMethodRef* method) {
+  const auto* factory = DexMethod::make_method(KT_ENUM_ENTRIES_FACTORY_METHOD);
+  const auto* rtype = method->get_proto()->get_rtype();
+  return method->get_class() == factory->get_class() &&
+         method->get_name() == factory->get_name() &&
+         method->get_proto()->get_args() == factory->get_proto()->get_args() &&
+         (rtype == factory->get_proto()->get_rtype() ||
+          rtype ==
+              DexMethod::make_method(KT_ENUM_ENTRIES_LIST_CTOR)->get_class()) &&
+         runs_kotlin_library_code(method);
+}
+
+bool is_kt_enum_entries_list_ctor(const DexMethodRef* method) {
+  return method == DexMethod::make_method(KT_ENUM_ENTRIES_LIST_CTOR) &&
+         runs_kotlin_library_code(method);
 }
 
 bool is_enum_entries(const DexFieldRef* field) {

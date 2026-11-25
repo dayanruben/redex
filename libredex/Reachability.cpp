@@ -1290,14 +1290,14 @@ void TransitiveClosureMarkerWorker::gather_and_push(
     check_strings = true;
   }
   if (m_shared_state->ignore_sets->string_literals.count(type) != 0u) {
-    ++m_shared_state->stats->num_ignore_check_strings;
+    m_shared_state->stats->record_ignore_check_strings(meth);
     check_strings = false;
   }
   if ((cls != nullptr) && check_strings) {
     for (const auto& ignore_anno_type :
          UnorderedIterable(m_shared_state->ignore_sets->string_literal_annos)) {
       if (has_anno(cls, ignore_anno_type)) {
-        ++m_shared_state->stats->num_ignore_check_strings;
+        m_shared_state->stats->record_ignore_check_strings(meth);
         check_strings = false;
         break;
       }
@@ -2421,7 +2421,7 @@ void sweep_code(
   *remove_uninstantiables_stats = walk::parallel::methods<
       remove_uninstantiables_impl::Stats>(scope, [&](DexMethod* method) {
     auto* code = method->get_code();
-    if ((code == nullptr) || method->rstate.no_optimizations()) {
+    if (!method::is_optimizable(method)) {
       return remove_uninstantiables_impl::Stats();
     }
     always_assert(code->cfg_built());
@@ -2505,7 +2505,7 @@ remove_uninstantiables_impl::Stats sweep_uncallable_virtual_methods(
       if (is_static(m)) {
         return;
       }
-      if (!m->rstate.no_optimizations() && (m->get_code() != nullptr) &&
+      if (method::is_optimizable(m) &&
           (reachable_aspects.callable_instance_methods.count_unsafe(m) == 0u)) {
         uncallable_instance_methods.insert(m);
       }

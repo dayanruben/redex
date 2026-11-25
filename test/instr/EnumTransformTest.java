@@ -118,7 +118,6 @@ class C extends B {
   // POSTCHECK: (STATIC) array$REDEX${{.*}}:java.lang.Integer[][]
   static SCORE[][] array;
   @Nullable SCORE i_score = SCORE.ONE;
-  @Nullable Object i_obj = null;
 
   public void set(SCORE score) { i_score = score; }
   public @Nullable SCORE get() { return i_score; }
@@ -218,6 +217,25 @@ enum USED_IN_INSTANCE_OF {
   public static void method(boolean b) {}
   public static void method() { method(ONE instanceof USED_IN_INSTANCE_OF); }
 }
+// CHECK: class: redex.INHERITED_METHOD_CALL
+// CHECK-NEXT: Access flags:
+// CHECK-NEXT: Superclass: java.lang.Enum
+enum INHERITED_METHOD_CALL {
+  ONE;
+  static Class<?> declaringClass(INHERITED_METHOD_CALL e) {
+    return e.getDeclaringClass();
+  }
+}
+// CHECK: class: redex.ARRAY_CLONED_TO_OBJECT
+// CHECK-NEXT: Access flags:
+// CHECK-NEXT: Superclass: java.lang.Enum
+enum ARRAY_CLONED_TO_OBJECT {
+  ONE;
+  // javac emits `[LARRAY_CLONED_TO_OBJECT;.clone()` with no cast back.
+  static Object snapshot(ARRAY_CLONED_TO_OBJECT[] values) {
+    return values.clone();
+  }
+}
 // CHECK: class: redex.CAST_CHECK_CAST
 // CHECK-NEXT: Access flags:
 // CHECK-NEXT: Superclass: java.lang.Enum
@@ -272,6 +290,67 @@ enum CAST_ENUM_ARRAY_TO_OBJECT {
     sb.append(CAST_ENUM_ARRAY_TO_OBJECT.values());
     sb.append(String.valueOf(CAST_ENUM_ARRAY_TO_OBJECT.values()));
     return sb.toString();
+  }
+}
+
+// An Object field may hold an Integer, so comparing with it keeps the enum.
+// CHECK: class: redex.OBJECT_IDENTITY_SCORE
+// CHECK-NEXT: Access flags:
+// CHECK-NEXT: Superclass: java.lang.Enum
+enum OBJECT_IDENTITY_SCORE { ONE; }
+
+class ObjectIdentityComparison {
+  @Nullable Object object = null;
+  OBJECT_IDENTITY_SCORE score = OBJECT_IDENTITY_SCORE.ONE;
+}
+
+// An Integer and an enum agree on `instanceof Comparable` and
+// `instanceof String`, so these checks let the enum be boxed.
+// CHECK: class: redex.TYPE_CHECKED_SCORE
+// CHECK-NEXT: Access flags:
+// PRECHECK-NEXT: Superclass: java.lang.Enum
+// POSTCHECK-NEXT: Superclass: java.lang.Object
+enum TYPE_CHECKED_SCORE { ONE, TWO; }
+
+// An Integer is never a String, so comparing with one lets the enum be boxed.
+// CHECK: class: redex.STRING_COMPARED_SCORE
+// CHECK-NEXT: Access flags:
+// PRECHECK-NEXT: Superclass: java.lang.Enum
+// POSTCHECK-NEXT: Superclass: java.lang.Object
+enum STRING_COMPARED_SCORE { ONE, TWO; }
+
+class StringComparison {
+  static boolean same(STRING_COMPARED_SCORE score, @Nullable String string) {
+    return (Object) score == string;
+  }
+}
+
+// Boxing could make a constant identical to an Integer with its ordinal, so
+// comparing with one keeps the enum.
+// CHECK: class: redex.INTEGER_COMPARED_SCORE
+// CHECK-NEXT: Access flags:
+// CHECK-NEXT: Superclass: java.lang.Enum
+enum INTEGER_COMPARED_SCORE { ONE; }
+
+// Boxing could make constants of two enums with equal ordinals identical, so
+// comparing them with each other keeps both enums.
+// CHECK: class: redex.CROSS_COMPARED_COLOR
+// CHECK-NEXT: Access flags:
+// CHECK-NEXT: Superclass: java.lang.Enum
+enum CROSS_COMPARED_COLOR { RED; }
+
+// CHECK: class: redex.CROSS_COMPARED_SHAPE
+// CHECK-NEXT: Access flags:
+// CHECK-NEXT: Superclass: java.lang.Enum
+enum CROSS_COMPARED_SHAPE { CIRCLE; }
+
+class IdentityComparison {
+  static boolean same(INTEGER_COMPARED_SCORE score, Integer integer) {
+    return (Object) score == integer;
+  }
+
+  static boolean same(CROSS_COMPARED_COLOR color, CROSS_COMPARED_SHAPE shape) {
+    return (Object) color == shape;
   }
 }
 
@@ -430,8 +509,8 @@ public class EnumTransformTest {
 
   @Test
   public void test_if() {
-    C c = new C();
-    if (c.i_obj == c.i_score) {
+    ObjectIdentityComparison c = new ObjectIdentityComparison();
+    if (c.object == c.score) {
       assertThat(true).isEqualTo(false);
     }
   }
@@ -456,6 +535,77 @@ public class EnumTransformTest {
   }
 
   enum COUNT { ONE, TWO };
+  enum OBSERVED_COLOR { RED };
+  enum TYPE_TESTED_COLOR { RED };
+
+  private static boolean isNumber(Object value) { return value instanceof Number; }
+  private static boolean isEnum(Object value) { return value instanceof Enum; }
+  private static boolean locksInteger(Object value) {
+    synchronized (value) {
+      return Thread.holdsLock(Integer.valueOf(0));
+    }
+  }
+
+  @Test
+  public void enumObjectParameterTypeChecks() {
+    assertThat(isNumber(TYPE_TESTED_COLOR.RED)).isFalse();
+    assertThat(isEnum(TYPE_TESTED_COLOR.RED)).isTrue();
+  }
+
+  @Test
+  public void enumLocalTypeChecks() {
+    Object value = TYPE_TESTED_COLOR.RED;
+    assertThat(value instanceof Number).isFalse();
+    assertThat(value instanceof Enum).isTrue();
+  }
+
+  @Test
+  public void enumComparedWithInteger() {
+    assertThat(IdentityComparison.same(INTEGER_COMPARED_SCORE.ONE, Integer.valueOf(0)))
+        .isFalse();
+  }
+
+  @Test
+  public void enumsComparedWithEachOther() {
+    assertThat(IdentityComparison.same(CROSS_COMPARED_COLOR.RED, CROSS_COMPARED_SHAPE.CIRCLE))
+        .isFalse();
+  }
+
+  @Test
+  public void enumMonitorIdentity() {
+    assertThat(locksInteger(OBSERVED_COLOR.RED)).isFalse();
+  }
+
+  enum INTEGER_CHECKED_COLOR { RED };
+  enum DIFFERENCE_CHECKED_COLOR { RED };
+
+  private static boolean isInteger(Object value) { return value instanceof Integer; }
+  private static boolean differ(Object left, Object right) { return left != right; }
+
+  @Test
+  public void enumObjectParameterIntegerTypeCheck() {
+    assertThat(isInteger(INTEGER_CHECKED_COLOR.RED)).isFalse();
+  }
+
+  @Test
+  public void enumObjectParameterIdentityDifference() {
+    assertThat(differ(DIFFERENCE_CHECKED_COLOR.RED, Integer.valueOf(0))).isTrue();
+  }
+
+  private static boolean isComparable(Object value) { return value instanceof Comparable; }
+  private static boolean isString(Object value) { return value instanceof String; }
+
+  @Test
+  public void enumTypeChecksThatBoxingKeeps() {
+    assertThat(isComparable(TYPE_CHECKED_SCORE.ONE)).isTrue();
+    assertThat(isString(TYPE_CHECKED_SCORE.TWO)).isFalse();
+  }
+
+  @Test
+  public void enumComparedWithString() {
+    assertThat(StringComparison.same(STRING_COMPARED_SCORE.ONE, "ONE")).isFalse();
+    assertThat(StringComparison.same(STRING_COMPARED_SCORE.TWO, null)).isFalse();
+  }
 
   @Test
   public void test_hashCode() {
@@ -552,4 +702,19 @@ public class EnumTransformTest {
   // POSTCHECK-NEXT: xor-int{{(/2addr)?}} [[DST:v[0-9]+]], {{.*}}
   // POSTCHECK-NEXT: return [[DST]]
   // POSTCHECK-NOT: redex.EnumTransformTest$COUNT.redex$OE$name
+
+  @Test
+  public void array_cloned_to_object() {
+    ARRAY_CLONED_TO_OBJECT[] values = {ARRAY_CLONED_TO_OBJECT.ONE};
+    Object copy = ARRAY_CLONED_TO_OBJECT.snapshot(values);
+    assertThat(copy == values).isFalse();
+    assertThat(((Object[]) copy).length).isEqualTo(1);
+  }
+
+  @Test
+  public void inherited_method_call() {
+    assertThat(INHERITED_METHOD_CALL.declaringClass(INHERITED_METHOD_CALL.ONE)
+                   .isEnum())
+        .isTrue();
+  }
 }

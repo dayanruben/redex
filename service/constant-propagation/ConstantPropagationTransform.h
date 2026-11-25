@@ -47,6 +47,11 @@ class Transform final {
     bool to_int_lit8{true};
     bool to_int_lit16{false}; // Does not seem beneficial by default.
     const DexType* class_under_init{nullptr};
+    // Set instead of `class_under_init` in a constructor analyzed with
+    // ConstructorFieldAnalyzer, whose class is then the class under init. Its
+    // field values describe `this`, so a store to another instance is not
+    // redundant.
+    const ConstructorFieldAnalyzerState* constructor_fields{nullptr};
     // These methods are known pure, we can replace their results with constant
     // value.
     const ConcurrentSet<DexMethod*>* getter_methods_for_immutable_fields{
@@ -72,6 +77,7 @@ class Transform final {
     // Conditional branches in reachable code for which the analysis finds
     // neither successor feasible.
     size_t branches_with_both_successors_infeasible{0};
+    size_t attribute_getter_calls_removed{0};
 
     Stats& operator+=(const Stats& that) {
       branches_removed += that.branches_removed;
@@ -88,6 +94,7 @@ class Transform final {
       kotlin_areequal_replaced += that.kotlin_areequal_replaced;
       branches_with_both_successors_infeasible +=
           that.branches_with_both_successors_infeasible;
+      attribute_getter_calls_removed += that.attribute_getter_calls_removed;
       return *this;
     }
 
@@ -95,7 +102,11 @@ class Transform final {
   };
 
   explicit Transform(Config config, const NullCheckMethods& state)
-      : m_config(config), m_null_check_methods(state) {}
+      : m_config(config), m_null_check_methods(state) {
+    always_assert_log(config.class_under_init == nullptr ||
+                          config.constructor_fields == nullptr,
+                      "The constructor fields name the class under init");
+  }
 
   // Apply all available transformations on cfg
   // May run cfg.calculate_exit_block as a side-effect.
@@ -148,6 +159,11 @@ class Transform final {
                           const cfg::InstructionIterator& cfg_it,
                           const XStoreRefs*,
                           const DexType*);
+  bool replace_primary_with_const(
+      const ConstantValue& value,
+      const cfg::InstructionIterator& move_result_it,
+      const XStoreRefs*,
+      const DexType*);
   void generate_const_param(const ConstantEnvironment&,
                             const cfg::InstructionIterator& cfg_it,
                             const XStoreRefs*,
@@ -159,8 +175,11 @@ class Transform final {
   bool eliminate_redundant_null_check(const ConstantEnvironment&,
                                       const WholeProgramState& wps,
                                       const cfg::InstructionIterator& cfg_it);
-  bool replace_kotlin_areequal(const ConstantEnvironment&,
-                               const cfg::InstructionIterator& cfg_it);
+  // Whether `insn` calls Intrinsics.areEqual on a known non-null first
+  // argument, which replace_kotlin_areequal turns into a call to equals.
+  bool can_replace_kotlin_areequal(const ConstantEnvironment&,
+                                   const IRInstruction* insn) const;
+  void replace_kotlin_areequal(IRInstruction* insn);
   bool replace_with_throw(const ConstantEnvironment&,
                           const cfg::InstructionIterator& cfg_it,
                           npe::NullPointerExceptionCreator* npe_creator);
@@ -196,6 +215,10 @@ class Transform final {
                               DexProto* proto,
                               const XStoreRefs*);
 
+  void remove_attribute_getter_call(const ConstantEnvironment& env,
+                                    const cfg::InstructionIterator& cfg_it,
+                                    const XStoreRefs* xstores,
+                                    const DexType* declaring_type);
   bool assumenosideeffects(DexMethodRef* ref, DexMethod* meth) const;
 
   const Config m_config;

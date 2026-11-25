@@ -16,6 +16,7 @@
 #include "ConcurrentContainers.h"
 #include "ConstantEnvironment.h"
 #include "ConstantPropagationState.h"
+#include "ConstructorAccesses.h"
 #include "DeterministicContainers.h"
 #include "IRCode.h"
 #include "InstructionAnalyzer.h"
@@ -303,21 +304,14 @@ class StaticFinalFieldAnalyzer final
 };
 
 /*
- * Handle instance fields in <init> methods.
+ * Forgets the instance fields of the class under construction when an <init>
+ * method calls a method of that class.
  */
 class InitFieldAnalyzer final
     : public InstructionAnalyzerBase<InitFieldAnalyzer,
                                      ConstantEnvironment,
                                      DexType* /* class_under_init */> {
  public:
-  static bool analyze_iget(const DexType* class_under_init,
-                           const IRInstruction* insn,
-                           ConstantEnvironment* env);
-
-  static bool analyze_iput(const DexType* class_under_init,
-                           const IRInstruction* insn,
-                           ConstantEnvironment* env);
-
   static bool analyze_invoke(const DexType* class_under_init,
                              const IRInstruction* insn,
                              ConstantEnvironment* env);
@@ -325,6 +319,135 @@ class InitFieldAnalyzer final
   static bool analyze_dynamic_invoke(const DexType* class_under_init,
                                      const IRInstruction* insn,
                                      ConstantEnvironment* env);
+};
+
+/*
+ * Tracks a constructor's own instance fields, which allocation sets to zero,
+ * until code outside the constructor may see `this`. Only stores whose
+ * receiver is `this` record a value, so a copy constructor that writes another
+ * instance's fields leaves the tracked values alone. A store whose receiver
+ * may or may not be `this` makes its field unknown.
+ *
+ * A caller can name fields that no code but the class's constructors writes,
+ * each only on the object it builds, and that this constructor stores only
+ * through `this`. They stay tracked after `this` escapes, since the code that
+ * sees `this` cannot change them.
+ */
+class ConstructorFieldAnalyzerState {
+ public:
+  // Classifies the instructions of a constructor of `cls`. A call of one of
+  // `constructors_keeping_this` on `this` is not an escape.
+  static ConstructorFieldAnalyzerState create(
+      const cfg::ControlFlowGraph& cfg,
+      const DexClass* cls,
+      const UnorderedSet<const DexMethod*>& constructors_keeping_this,
+      const UnorderedSet<const DexField*>& constructor_only_fields = {});
+
+  // The class under construction.
+  const DexType* get_class() const { return m_cls->get_type(); }
+
+  const UnorderedSet<const DexField*>& tracked_fields() const {
+    return m_tracked_fields;
+  }
+
+  const UnorderedSet<const DexField*>& constructor_only_fields() const {
+    return m_constructor_only_fields;
+  }
+
+  const local_pointers::ConstructorAccesses& accesses() const {
+    return m_accesses;
+  }
+
+  // The tracked field that `insn` accesses with `this` as receiver, or null.
+  const DexField* get_this_access(const IRInstruction* insn) const {
+    auto it = m_this_accesses.find(insn);
+    return it == m_this_accesses.end() ? nullptr : it->second;
+  }
+
+  bool is_this_access(const IRInstruction* insn) const {
+    return get_this_access(insn) != nullptr;
+  }
+
+  // The tracked field that `insn` stores to a receiver that may or may not be
+  // `this`, or null.
+  const DexField* get_maybe_this_store(const IRInstruction* insn) const {
+    auto it = m_maybe_this_stores.find(insn);
+    return it == m_maybe_this_stores.end() ? nullptr : it->second;
+  }
+
+ private:
+  ConstructorFieldAnalyzerState(const DexClass* cls,
+                                UnorderedSet<const DexField*> tracked_fields,
+                                local_pointers::ConstructorAccesses accesses)
+      : m_cls(cls),
+        m_tracked_fields(std::move(tracked_fields)),
+        m_accesses(std::move(accesses)) {}
+
+  const DexClass* m_cls;
+  // The class's instance fields that are tracked: all but volatile fields.
+  UnorderedSet<const DexField*> m_tracked_fields;
+  // Tracked fields that no code but the class's constructors writes, each only
+  // on the object it builds, and that this constructor stores only through
+  // `this`.
+  UnorderedSet<const DexField*> m_constructor_only_fields;
+  // How the constructor uses `this`. After each escape, only constructor-only
+  // fields keep their values.
+  local_pointers::ConstructorAccesses m_accesses;
+  // Accesses to tracked fields whose receiver is always `this`, where `this`
+  // cannot have escaped yet or the field is constructor-only.
+  UnorderedMap<const IRInstruction*, const DexField*> m_this_accesses;
+  // Stores to tracked fields whose receiver may or may not be `this`, where
+  // `this` cannot have escaped yet.
+  UnorderedMap<const IRInstruction*, const DexField*> m_maybe_this_stores;
+};
+
+// The constructor field analysis of all constructors of a class.
+struct ClassConstructorFields {
+  // Each constructor with code, classified.
+  UnorderedMap<const DexMethod*, ConstructorFieldAnalyzerState> constructors;
+  // For each constructor, the tracked fields that may already hold a value
+  // other than zero when it starts.
+  UnorderedMap<const DexMethod*, UnorderedSet<const DexField*>> entry_writes;
+
+  // Binds the tracked fields of `ctor` that are in `fields` to the values they
+  // hold when it starts.
+  void initialize_fields(const DexMethod* ctor,
+                         const UnorderedSet<const DexField*>& fields,
+                         ConstantEnvironment* env) const;
+
+  // Bytecode can store to an object under construction only through `this`,
+  // in a constructor of the field's own class. So a constructor starts with
+  // nonzero own fields only when another constructor of the class stored to
+  // them and then called it on its own `this`, as Java's this(...) does. A
+  // constructor called on a new object starts with every field zero.
+  //
+  // The constructors' CFGs must be built, as in a pass. Building one here
+  // could change a constructor that is excluded from optimization.
+  static ClassConstructorFields create(
+      const DexClass* cls,
+      const UnorderedSet<const DexMethod*>& constructors_keeping_this,
+      const UnorderedSet<const DexField*>& constructor_only_fields = {});
+};
+
+// Follows a constructor's tracked fields. It must see every instruction that
+// can let `this` escape, so in an InstructionAnalyzerCombiner it comes before
+// any analyzer that handles such instructions and stops the others.
+class ConstructorFieldAnalyzer final
+    : public InstructionAnalyzerBase<ConstructorFieldAnalyzer,
+                                     ConstantEnvironment,
+                                     const ConstructorFieldAnalyzerState*> {
+ public:
+  static bool analyze_default(const ConstructorFieldAnalyzerState* state,
+                              const IRInstruction* insn,
+                              ConstantEnvironment* env);
+
+  static bool analyze_iget(const ConstructorFieldAnalyzerState* state,
+                           const IRInstruction* insn,
+                           ConstantEnvironment* env);
+
+  static bool analyze_iput(const ConstructorFieldAnalyzerState* state,
+                           const IRInstruction* insn,
+                           ConstantEnvironment* env);
 };
 
 // Construction of this object is expensive because get_method acquires a
@@ -447,6 +570,18 @@ class ImmutableAttributeAnalyzer final
                            const IRInstruction* insn,
                            ConstantEnvironment* env);
 };
+
+// Returns the registered attribute getter that the virtual or interface call
+// `insn` dispatches to on its receiver, or nullptr. The receiver's recorded
+// type can be a proper supertype of its runtime type (the class whose
+// constructor initialized it, or a factory's declared return type), so the
+// getter must be one no subclass can override. A getter is known to override a
+// class method only when both are public or protected, and to implement an
+// interface method only when it is public.
+DexMethod* resolve_attribute_getter_call(
+    const ConcurrentSet<DexMethod*>& attribute_methods,
+    const IRInstruction* insn,
+    const ConstantEnvironment& env);
 
 // Construction of this object is expensive because get_type/field/method
 // acquires a global lock. Make sure to cache it.

@@ -18,10 +18,12 @@ LDADD = $(COMMON_MOCK_TEST_LIBS)
 
 # Need to set "dexfile" environment variable to point to the dex file ised in
 # the test. We do this with a helper script and naming convention.
+# Set any env that a test wants if a test.env file is found.
 LOG_COMPILER = sh
-AM_LOG_FLAGS = -c 'sdk_path=$(ANDROID_SDK) android_target=$(ANDROID_PLATFORM_VERSION) dexfile=$$0-class.dex ./$$0'
+AM_LOG_FLAGS = -c 'if [ -f $$0.env ] ; then . ./$$0.env ; fi ; sdk_path=$(ANDROID_SDK) android_target=$(ANDROID_PLATFORM_VERSION) dexfile=$$0-class.dex ./$$0'
 
 check_PROGRAMS = \
+    access_marking_test \
     app_module_usage_test \
     call_graph_test \
     clinit_side_effect_test \
@@ -82,6 +84,7 @@ endif
 #     type_inference_test
 
 TESTS = \
+    access_marking_test \
     call_graph_test \
     clinit_side_effect_test \
     constant_propagation_test \
@@ -119,7 +122,7 @@ TESTS += \
 endif
 
 app_module_usage_test_SOURCES = AppModuleUsageTest.cpp
-EXTRA_app_module_usage_test_DEPNDENCIES = uses_app_module_annotation-class.dex app_module_usage_test-class.dex app_module_usage_test_other-class.dex app_module_usage_test_third-class.dex
+EXTRA_app_module_usage_test_DEPENDENCIES = uses_app_module_annotation-class.dex app_module_usage_test-class.dex app_module_usage_test_other-class.dex app_module_usage_test_third-class.dex
 
 call_graph_test_SOURCES = CallGraphTest.cpp
 EXTRA_call_graph_test_DEPENDENCIES = call_graph_test-class.dex
@@ -152,7 +155,8 @@ final_inline_analysis_test_SOURCES = FinalInlineAnalysisTest.cpp
 EXTRA_final_inline_analysis_test_DEPENDENCIES = final_inline_analysis_test-class.dex
 
 access_marking_test_SOURCES = AccessMarkingTest.cpp
-EXTRA_access_marking_test_DEPENDENCIES = access_marking_test-class.dex
+EXTRA_access_marking_test_DEPENDENCIES = access_marking_test-class.dex access_marking_test.env
+$(eval $(call make_env,access_marking_test,config_file=$(srcdir)/AccessMarkingTest.config))
 
 global_type_analysis_test_SOURCES = GlobalTypeAnalysisTest.cpp
 EXTRA_global_type_analysis_test_DEPENDENCIES = global_type_analysis_test-class.dex
@@ -246,6 +250,9 @@ SUFFIXES = .dex
 	$(D8) --intermediate --output $@.d8 --lib $(ANDROID_JAR) $^
 	mv $@.d8/classes.dex $@
 	rm -rf $@.d8
+
+access_marking_test-class.jar: AccessMarkingTest.java
+	$(create_jar)
 
 app_module_usage_test-class.jar: AppModuleUsageClass.java
 	$(create_jar)

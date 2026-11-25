@@ -389,9 +389,8 @@ DexOutputIdx GatheredTypes::get_dodx() {
 
 namespace {
 
-template <typename Cout, typename Cin, typename Cmp>
-Cout create_index(Cin& in, const Cmp& cmp) {
-  std::sort(in.begin(), in.end(), cmp);
+template <typename Cout, typename Cin>
+Cout index_in_order(const Cin& in) {
   Cout sidx{};
   sidx.reserve(in.size());
   uint32_t idx = 0;
@@ -399,6 +398,12 @@ Cout create_index(Cin& in, const Cmp& cmp) {
     sidx.insert(std::make_pair(*it, idx++));
   }
   return sidx;
+}
+
+template <typename Cout, typename Cin, typename Cmp>
+Cout create_index(Cin& in, const Cmp& cmp) {
+  std::sort(in.begin(), in.end(), cmp);
+  return index_in_order<Cout>(in);
 }
 
 } // namespace
@@ -461,13 +466,12 @@ std::vector<DexTypeList*> GatheredTypes::get_typelist_list(
   return typel;
 }
 
-dexcallsite_to_idx GatheredTypes::get_callsite_index(cmp_callsite cmp) {
-  return create_index<dexcallsite_to_idx>(m_lcallsite, cmp);
+dexcallsite_to_idx GatheredTypes::get_callsite_index() {
+  return index_in_order<dexcallsite_to_idx>(m_lcallsite);
 }
 
-dexmethodhandle_to_idx GatheredTypes::get_methodhandle_index(
-    cmp_methodhandle cmp) {
-  return create_index<dexmethodhandle_to_idx>(m_lmethodhandle, cmp);
+dexmethodhandle_to_idx GatheredTypes::get_methodhandle_index() {
+  return index_in_order<dexmethodhandle_to_idx>(m_lmethodhandle);
 }
 
 void GatheredTypes::build_cls_load_map() {
@@ -928,7 +932,12 @@ void DexOutput::generate_class_data() {
     DexClass* clz = m_classes->at(i);
     cdefs[i].typeidx = m_dodx.typeidx(clz->get_type());
     cdefs[i].access_flags = clz->get_access();
-    cdefs[i].super_idx = m_dodx.typeidx(clz->get_super_class());
+    const auto* super_class = clz->get_super_class();
+    always_assert_log(super_class != nullptr ||
+                          clz->get_type() == type::java_lang_Object(),
+                      "Only Object has super=null, not %s", SHOW(clz));
+    cdefs[i].super_idx =
+        super_class == nullptr ? DEX_NO_INDEX : m_dodx.typeidx(super_class);
     cdefs[i].interfaces_off = 0;
     cdefs[i].annotations_off = 0;
     cdefs[i].interfaces_off = m_tl_emit_offsets[clz->get_interfaces()];
@@ -1093,7 +1102,7 @@ void DexOutput::generate_code_items(const std::vector<SortMode>& mode) {
 
 void DexOutput::generate_callsite_data() {
   auto callsites = m_gtypes->get_dexcallsite_emitlist();
-  // Redundant on today's code -- gather_components sort_uniques the list, so
+  // Redundant on today's code -- gather_components dedups the list, so
   // the emit list and the reserved id count are equal by construction -- but
   // they are two different quantities arriving by two different routes, and
   // this is the assertion that says so.
