@@ -15,6 +15,7 @@
 #include "IFieldAnalysisUtil.h"
 #include "IRAssembler.h"
 #include "IRCode.h"
+#include "MethodOverrideGraph.h"
 #include "RedexTest.h"
 #include "RedexTestUtils.h"
 #include "Show.h"
@@ -52,15 +53,16 @@ struct FinalInlineTest : public RedexTest {
     walk::code(scope, [&](DexMethod*, IRCode& code) { code.build_cfg(); });
     int min_sdk = 0;
     constant_propagation::NullCheckMethods state;
+    auto method_override_graph = method_override_graph::build_graph(scope);
     FinalInlinePassV2::run(scope, conf, min_sdk, init_classes_with_side_effects,
-                           xstores, state);
+                           xstores, state, *method_override_graph);
 
     const auto constructor_only_ifields =
         constant_propagation::gather_constructor_only_ifields(
             scope, local_pointers::analyze_constructors(scope, {}));
     auto eligible_ifields =
         constant_propagation::gather_safely_inferable_ifield_candidates(
-            scope, constructor_only_ifields, {});
+            scope, constructor_only_ifields, {}, *method_override_graph);
     FinalInlinePassV2::run_inline_ifields(
         scope, conf, min_sdk, init_classes_with_side_effects, xstores,
         eligible_ifields, constructor_only_ifields, state);
@@ -95,7 +97,7 @@ TEST_F(FinalInlineTest, finalFieldOfMultiConstructorClassIsEligible) {
           scope,
           constant_propagation::gather_constructor_only_ifields(
               scope, local_pointers::analyze_constructors(scope, {})),
-          {});
+          {}, *method_override_graph::build_graph(scope));
   EXPECT_EQ(eligible.count(count), 1u);
   walk::code(scope, [](DexMethod*, IRCode& code) { code.clear_cfg(); });
 }
@@ -2738,4 +2740,206 @@ TEST_F(FinalInlineTest,
   run({registry, base, cls}, nullptr);
 
   EXPECT_CODE_EQ(ctor->get_code(), expected.get());
+}
+
+TEST_F(FinalInlineTest, clinitWithNothingToEncodeIsStillSimplified) {
+  // Nothing in this <clinit> can be encoded, so its analysis runs once; the
+  // dead `const` is removed all the same.
+  create_field_with_zero_value("LFoo;.DEFAULT:LFoo;", m_cc.get(),
+                               ACC_PUBLIC | ACC_STATIC | ACC_FINAL);
+  auto* clinit = assembler::method_from_string(R"(
+    (method (public static constructor) "LFoo;.<clinit>:()V"
+     (
+      (const v1 5)
+      (new-instance "LFoo;")
+      (move-result-pseudo-object v0)
+      (invoke-direct (v0) "LFoo;.<init>:()V")
+      (sput-object v0 "LFoo;.DEFAULT:LFoo;")
+      (return-void)
+     )
+    )
+  )");
+  m_cc->add_method(clinit);
+  m_cc->add_method(assembler::method_from_string(R"(
+    (method (public constructor) "LFoo;.<init>:()V"
+     (
+      (load-param-object v0)
+      (invoke-direct (v0) "Ljava/lang/Object;.<init>:()V")
+      (return-void)
+     )
+    )
+  )"));
+  auto* cls = m_cc->create();
+  auto expected = assembler::ircode_from_string(R"(
+    (
+      (new-instance "LFoo;")
+      (move-result-pseudo-object v0)
+      (invoke-direct (v0) "LFoo;.<init>:()V")
+      (sput-object v0 "LFoo;.DEFAULT:LFoo;")
+      (return-void)
+    )
+  )");
+
+  run({cls}, /* xstores */ nullptr);
+
+  ASSERT_EQ(cls->get_clinit(), clinit);
+  EXPECT_CODE_EQ(clinit->get_code(), expected.get());
+}
+
+TEST_F(FinalInlineTest, initClassIsADep) {
+  // Java:
+  //   class A { static { Sink.record(B.y); } static int five() { return 5; } }
+  //   class B { static int y = A.five(); }
+  // When B is initialized first, it starts A's initializer, which records 0.
+  // Inlining A.five() leaves `init-class A` in B's initializer, so A and B
+  // still form an initialization cycle and B.y must not be encoded as 5.
+  ClassCreator a_creator(DexType::make_type("LA;"));
+  a_creator.set_super(type::java_lang_Object());
+  auto* a_clinit = assembler::method_from_string(R"(
+    (method (public static constructor) "LA;.<clinit>:()V"
+     (
+      (sget "LB;.y:I")
+      (move-result-pseudo v0)
+      (invoke-static (v0) "LSink;.record:(I)V")
+      (return-void)
+     )
+    )
+  )");
+  a_creator.add_method(a_clinit);
+  a_creator.add_method(assembler::method_from_string(R"(
+    (method (public static) "LA;.five:()I"
+     (
+      (const v0 5)
+      (return v0)
+     )
+    )
+  )"));
+  auto* a_cls = a_creator.create();
+
+  ClassCreator b_creator(DexType::make_type("LB;"));
+  b_creator.set_super(type::java_lang_Object());
+  auto* field_y = create_field_with_zero_value("LB;.y:I", &b_creator);
+  auto* b_clinit = assembler::method_from_string(R"(
+    (method (public static constructor) "LB;.<clinit>:()V"
+     (
+      (init-class "LA;")
+      (const v0 5)
+      (sput v0 "LB;.y:I")
+      (return-void)
+     )
+    )
+  )");
+  b_creator.add_method(b_clinit);
+  auto* b_cls = b_creator.create();
+  auto expected_b =
+      assembler::ircode_from_string(assembler::to_string(b_clinit->get_code()));
+  auto expected_a =
+      assembler::ircode_from_string(assembler::to_string(a_clinit->get_code()));
+
+  run({b_cls, a_cls}, /* xstores */ nullptr);
+
+  EXPECT_EQ(field_y->get_static_value()->value(), 0);
+  ASSERT_EQ(b_cls->get_clinit(), b_clinit);
+  EXPECT_CODE_EQ(b_clinit->get_code(), expected_b.get());
+  ASSERT_EQ(a_cls->get_clinit(), a_clinit);
+  EXPECT_CODE_EQ(a_clinit->get_code(), expected_a.get());
+}
+
+TEST_F(FinalInlineTest, callOnSuperclassWithoutDefinitionBlocksInference) {
+  // Java, where LibBase has no definition:
+  //   class D extends LibBase { D() { onInit(); } }
+  //   class Foo extends D {
+  //     int x;
+  //     Foo() { super(); x = 1; }
+  //     void onInit() { Log.v(x); }
+  //   }
+  // LibBase.onInit() may dispatch to Foo.onInit(), which logs 0 while x is
+  // still unwritten.
+  ClassCreator d_creator(DexType::make_type("LD;"));
+  d_creator.set_super(DexType::make_type("LLibBase;"));
+  d_creator.add_method(assembler::method_from_string(R"(
+    (method (public constructor) "LD;.<init>:()V"
+     (
+      (load-param-object v0)
+      (invoke-direct (v0) "LLibBase;.<init>:()V")
+      (invoke-virtual (v0) "LLibBase;.onInit:()V")
+      (return-void)
+     )
+    )
+  )"));
+  auto* d = d_creator.create();
+
+  m_cc->set_super(d->get_type());
+  add_instance_field("LFoo;.x:I");
+  m_cc->add_method(assembler::method_from_string(R"(
+    (method (public constructor) "LFoo;.<init>:()V"
+     (
+      (load-param-object v0)
+      (invoke-direct (v0) "LD;.<init>:()V")
+      (const v1 1)
+      (iput v1 v0 "LFoo;.x:I")
+      (return-void)
+     )
+    )
+  )"));
+  auto* on_init = assembler::method_from_string(R"(
+    (method (public) "LFoo;.onInit:()V"
+     (
+      (load-param-object v0)
+      (iget v0 "LFoo;.x:I")
+      (move-result-pseudo v1)
+      (invoke-static (v1) "LLog;.v:(I)V")
+      (return-void)
+     )
+    )
+  )");
+  m_cc->add_method(on_init);
+  auto* cls = m_cc->create();
+  auto expected =
+      assembler::ircode_from_string(assembler::to_string(on_init->get_code()));
+
+  run({d, cls}, nullptr);
+
+  EXPECT_CODE_EQ(on_init->get_code(), expected.get());
+}
+
+// `LBase;.<clinit>` calls `LHelper;.h` before it assigns 5 to `x`. `h` reads
+// `x` through the subclass, as `LSub;.x`, and sees 0. So `x` must keep its
+// encoded value 0.
+TEST_F(FinalInlineTest, fieldReadThroughSubclassNotEncoded) {
+  ClassCreator base_creator(DexType::make_type("LBase;"));
+  base_creator.set_super(type::java_lang_Object());
+  auto* field_x = create_field_with_zero_value("LBase;.x:I", &base_creator);
+  base_creator.add_method(assembler::method_from_string(R"(
+    (method (public static constructor) "LBase;.<clinit>:()V"
+      (
+        (invoke-static () "LHelper;.h:()I")
+        (const v0 5)
+        (sput v0 "LBase;.x:I")
+        (return-void)
+      )
+    )
+  )"));
+  auto* base = base_creator.create();
+
+  ClassCreator sub_creator(DexType::make_type("LSub;"));
+  sub_creator.set_super(DexType::make_type("LBase;"));
+  auto* sub = sub_creator.create();
+
+  ClassCreator helper_creator(DexType::make_type("LHelper;"));
+  helper_creator.set_super(type::java_lang_Object());
+  helper_creator.add_method(assembler::method_from_string(R"(
+    (method (public static) "LHelper;.h:()I"
+      (
+        (sget "LSub;.x:I")
+        (move-result-pseudo v0)
+        (return v0)
+      )
+    )
+  )"));
+  auto* helper = helper_creator.create();
+
+  run({base, sub, helper}, /* xstores */ nullptr);
+
+  EXPECT_EQ(field_x->get_static_value()->value(), 0);
 }

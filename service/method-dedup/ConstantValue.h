@@ -13,13 +13,18 @@
 #include "TypeTags.h"
 #include "TypeUtil.h"
 
+namespace constant_uses {
+class ConstantUses;
+} // namespace constant_uses
+
 class ConstantValue {
 
   /////////////////////////////////////////////////////////////////////////
   // The kind of constant value emitted in the @MethodMeta annotation.
   //
   // INT: @MethodMeta(constantTypes = "I", constantValues = "42")
-  //       A 64 bit integer constant like an offset or hash code.
+  //       A 32-bit int constant like an offset or hash code, written in
+  //       decimal (signed or unsigned) or as 0x hex.
   // TYPE: @MethodMeta(constantTypes = "T",
   //                   constantValues = "Lcom/facebook/CommentModels$ModelA;")
   //       The constant in the annotated method is a reference to a mergeable
@@ -54,11 +59,10 @@ class ConstantValue {
     return m_kind == ConstantKind::INT || m_kind == ConstantKind::TYPE;
   }
   bool is_str_value() const { return m_kind == ConstantKind::STRING; }
-  int64_t get_int_value() {
+  int32_t get_int_value() {
     always_assert(is_int_value());
     return m_int_val;
   }
-  bool is_int_kind() { return m_kind == ConstantKind::INT; }
   bool is_invalid() const { return m_kind == ConstantKind::INVALID; }
   bool is_valid() const { return !is_invalid(); }
   std::string get_str_value() {
@@ -73,8 +77,11 @@ class ConstantValue {
     }
   }
 
+  // An int constant matches only a `const` whose uses all accept an `int`
+  // parameter in its place; `uses` describes the uses in `cfg` and is needed
+  // only for an int constant.
   std::vector<ConstantLoad> collect_constant_loads_in(
-      cfg::ControlFlowGraph& cfg);
+      cfg::ControlFlowGraph& cfg, const constant_uses::ConstantUses* uses);
 
   std::vector<IRInstruction*> make_load_const(reg_t const_reg);
 
@@ -94,7 +101,7 @@ class ConstantValue {
 
  private:
   ConstantKind m_kind;
-  int64_t m_int_val;
+  int32_t m_int_val;
   std::string m_str_val;
   // The allocated param reg holding the original value of the constant.
   reg_t m_param_reg;
@@ -112,8 +119,7 @@ class ConstantValues {
                  const size_t stud_method_threshold,
                  cfg::ControlFlowGraph& cfg);
 
-  std::vector<ConstantValueLoad> collect_constant_loads(
-      cfg::ControlFlowGraph& cfg);
+  std::vector<ConstantValueLoad> collect_constant_loads(DexMethod* method);
 
   std::vector<ConstantValue> get_constant_values() const {
     return m_const_vals;
@@ -160,17 +166,5 @@ class ConstantValues {
 
  private:
   std::vector<ConstantValue> m_const_vals;
-  /**
-   * This is a hack. The issue is CFP will replace reference to its removed type
-   * to a `const 0`. This change conflicts with the parsing of constant loads
-   * when the annotated constant is an int of value 0. In this case, constant
-   * lifting will replace the `wrong const 0` to a move from the lifted int
-   * param. This unexpected transformation leads to a type violation detected by
-   * the IRTypeChecker. What we need to do here is whenever we failed to find a
-   * type constant, we will skip replacing multiple `const 0`, which will likely
-   * lead to the above mentioned bug.
-   */
-  bool m_skip_multiple_const_0 = false;
-
   size_t m_stub_method_threshold;
 };

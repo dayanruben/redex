@@ -162,7 +162,7 @@ TEST_F(ConstructorAnalysisTest, can_inline_init_supertype_relaxed) {
       foo_init1, /* finalizable_fields */ nullptr, /* relaxed */ true));
 }
 
-TEST_F(ConstructorAnalysisTest, can_detect_relaxed_inlined_init) {
+TEST_F(ConstructorAnalysisTest, find_relaxed_inits) {
   // Set up a couple of classes, and usages of them (some of which will look
   // like its constructor was inlined).
   auto* foo_cls = create_a_class("Lfoo;");
@@ -180,7 +180,7 @@ TEST_F(ConstructorAnalysisTest, can_detect_relaxed_inlined_init) {
     (class (public) "Luse;"
       (method (public static) "Luse;.a:(I)V"
         (
-          ; not complex
+          ; relaxed, initialized by Object's constructor
           (new-instance "Lfoo;")
           (move-result-pseudo-object v1)
           (invoke-direct (v1) "Ljava/lang/Object;.<init>:()V")
@@ -190,10 +190,16 @@ TEST_F(ConstructorAnalysisTest, can_detect_relaxed_inlined_init) {
           (move-result-pseudo-object v2)
           (invoke-direct (v2) "Lbar;.<init>:()V")
 
-          ; complex
+          ; relaxed, through a move
           (new-instance "Lbaz;")
           (move-result-pseudo-object v3)
-          (invoke-direct (v3) "Lbar;.<init>:()V")
+          (move-object v4 v3)
+          (invoke-direct (v4) "Lbar;.<init>:()V")
+
+          ; does not resolve
+          (new-instance "Lbar;")
+          (move-result-pseudo-object v5)
+          (invoke-direct (v5) "Lbar;.<init>:(I)V")
           (return-void)
         )
       )
@@ -209,8 +215,22 @@ TEST_F(ConstructorAnalysisTest, can_detect_relaxed_inlined_init) {
       }
     }
   }
-  auto result = constructor_analysis::find_complex_init_inlined_types(scope);
-  EXPECT_EQ(result.size(), 1);
-  EXPECT_EQ(*unordered_any(result), baz_cls->get_type())
-      << "GOT " << show(*unordered_any(result));
+  auto* method = use_cls->get_dmethods().front();
+  auto relaxed_inits = constructor_analysis::find_relaxed_inits(
+      method, [](const DexType*) { return true; });
+  ASSERT_EQ(relaxed_inits.size(), 3);
+  EXPECT_EQ(relaxed_inits[0].new_instance->get_type(), foo_cls->get_type());
+  // java.lang.Object is not defined in this test, so its constructor does not
+  // resolve.
+  EXPECT_EQ(relaxed_inits[0].resolved_init, nullptr);
+  EXPECT_EQ(relaxed_inits[1].new_instance->get_type(), baz_cls->get_type());
+  EXPECT_EQ(relaxed_inits[1].resolved_init, bar_init);
+  EXPECT_EQ(show(relaxed_inits[1].invoke->get_method()), "Lbar;.<init>:()V");
+  EXPECT_EQ(relaxed_inits[2].new_instance->get_type(), bar_cls->get_type());
+  EXPECT_EQ(relaxed_inits[2].resolved_init, nullptr);
+
+  auto baz_only = constructor_analysis::find_relaxed_inits(
+      method, [&](const DexType* type) { return type == baz_cls->get_type(); });
+  ASSERT_EQ(baz_only.size(), 1);
+  EXPECT_EQ(baz_only[0].invoke, relaxed_inits[1].invoke);
 }

@@ -786,6 +786,36 @@ TEST_F(SourceBlocksTest, chain_and_dom_magnitude_fires_below_entry_block) {
   EXPECT_EQ(violations, 1u);
 }
 
+// The call can throw, so the source block before it does not cover the
+// `return-void` after it. A source block between the two covers it.
+TEST_F(SourceBlocksTest, uncovered_throw_delineated_blocks_counts_segments) {
+  auto count = [](const std::string& code) {
+    auto* method = create_method("LThrowSegments");
+    method->set_code(assembler::ircode_from_string(code));
+    method->get_code()->build_cfg();
+    return source_blocks::compute(
+        ViolationsHelper::Violation::kUncoveredThrowDelineatedBlocks,
+        method->get_code()->cfg());
+  };
+  EXPECT_EQ(count(R"(
+    (
+      (.src_block "LThrowSegments;.bar:()V" 0 (1.0 1.0))
+      (invoke-static () "LThrowSegments;.baz:()V")
+      (return-void)
+    )
+  )"),
+            1u);
+  EXPECT_EQ(count(R"(
+    (
+      (.src_block "LThrowSegments;.bar:()V" 0 (1.0 1.0))
+      (invoke-static () "LThrowSegments;.baz:()V")
+      (.src_block "LThrowSegments;.bar:()V" 1 (1.0 1.0))
+      (return-void)
+    )
+  )"),
+            0u);
+}
+
 // The whole-CFG scale is a SHARE of the dominated block's executions, so it is
 // at most 1. A dominating value larger than the dominated one -- incomplete
 // tracking, or a denominator pinned to a positive-magnitude floor -- must not
@@ -1035,7 +1065,7 @@ B4: LFoo;.bar:()V@3(0.4:0.2))");
 }
 
 TEST_F(SourceBlocksTest, coalesce) {
-  IRList::CONSECUTIVE_STYLE = IRList::ConsecutiveStyle::kChain;
+  ScopedConsecutiveStyle style(IRList::ConsecutiveStyle::kChain);
 
   auto* foo_method = create_method("LFoo");
 
@@ -1221,7 +1251,7 @@ TEST_F(SourceBlocksTest, get_last_source_block_before_non_entry) {
 // dedup the diamond test code from the DedupBlocks unit tests
 TEST_F(SourceBlocksTest, dedup_diamond_with_interactions) {
   g_redex->instrument_mode = true;
-  IRList::CONSECUTIVE_STYLE = IRList::ConsecutiveStyle::kChain;
+  ScopedConsecutiveStyle style(IRList::ConsecutiveStyle::kChain);
   DexMethod* method = create_method("diamond");
 
   const auto* str = R"(
@@ -1280,7 +1310,7 @@ TEST_F(SourceBlocksTest, dedup_diamond_with_interactions) {
 
 TEST_F(SourceBlocksTest, dedup_multiple_interactions_in_same_block) {
   g_redex->instrument_mode = true;
-  IRList::CONSECUTIVE_STYLE = IRList::ConsecutiveStyle::kChain;
+  ScopedConsecutiveStyle style(IRList::ConsecutiveStyle::kChain);
   DexMethod* method = create_method("multiple_interactions");
 
   const auto* str = R"(
@@ -1350,7 +1380,7 @@ TEST_F(SourceBlocksTest, dedup_multiple_interactions_in_same_block) {
 
 TEST_F(SourceBlocksTest, create_synth_sb_from_val) {
   g_redex->instrument_mode = true;
-  IRList::CONSECUTIVE_STYLE = IRList::ConsecutiveStyle::kChain;
+  ScopedConsecutiveStyle style(IRList::ConsecutiveStyle::kChain);
   auto* foo_method = create_method("LFoo");
 
   constexpr const char* kFoo = R"(
@@ -1395,7 +1425,7 @@ TEST_F(SourceBlocksTest, create_synth_sb_from_val) {
 
 TEST_F(SourceBlocksTest, create_synth_sb_from_opt_val) {
   g_redex->instrument_mode = true;
-  IRList::CONSECUTIVE_STYLE = IRList::ConsecutiveStyle::kChain;
+  ScopedConsecutiveStyle style(IRList::ConsecutiveStyle::kChain);
   auto* foo_method = create_method("LFoo");
 
   constexpr const char* kFoo = R"(
@@ -1440,7 +1470,7 @@ TEST_F(SourceBlocksTest, create_synth_sb_from_opt_val) {
 
 TEST_F(SourceBlocksTest, create_synth_sb_from_val_list) {
   g_redex->instrument_mode = true;
-  IRList::CONSECUTIVE_STYLE = IRList::ConsecutiveStyle::kChain;
+  ScopedConsecutiveStyle style(IRList::ConsecutiveStyle::kChain);
   auto* foo_method = create_method("LFoo");
 
   constexpr const char* kFoo = R"(
@@ -1902,6 +1932,26 @@ TEST_F(SourceBlocksTest, clone_as_synthetic_summing) {
   // Contrast: the plain (max) clone maxes val -- would undercount an outline.
   auto maxed = source_blocks::clone_as_synthetic(&s1, nullptr, many);
   EXPECT_FLOAT_EQ(*maxed->get_val(0), 30.0f); // max, not 60
+}
+
+// A method created for two call sites runs as often as both together.
+TEST_F(SourceBlocksTest, insert_source_blocks_summing_call_sites) {
+  const auto* s = DexString::make_string("x");
+  SourceBlock s1(s, 7, std::vector<SourceBlock::Val>{SourceBlock::Val(10, 5)});
+  SourceBlock s2(s, 8, std::vector<SourceBlock::Val>{SourceBlock::Val(20, 90)});
+  auto* method = create_method("LBar");
+  method->set_code(assembler::ircode_from_string("((return-void))"));
+  method->get_code()->build_cfg();
+
+  source_blocks::insert_source_blocks_summing_call_sites(method, {});
+  EXPECT_EQ(source_blocks::get_first_source_block_of_method(method), nullptr);
+
+  source_blocks::insert_source_blocks_summing_call_sites(method, {&s1, &s2});
+  auto* sb = source_blocks::get_first_source_block_of_method(method);
+  ASSERT_NE(sb, nullptr);
+  EXPECT_EQ(sb->id, SourceBlock::kSyntheticId);
+  EXPECT_FLOAT_EQ(*sb->get_val(0), 30.0f);
+  EXPECT_FLOAT_EQ(*sb->get_appear100(0), 90.0f);
 }
 TEST_F(SourceBlocksTest, violation_name_round_trip) {
   for (size_t i = 0;

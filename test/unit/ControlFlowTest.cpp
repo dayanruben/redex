@@ -5,6 +5,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+#include <functional>
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 #include <memory>
@@ -1968,6 +1969,125 @@ TEST_F(ControlFlowTest, insertion_with_source_blocks_middle) {
   }
 }
 
+// A split in the middle of an insertion starts its new block with a copy of
+// the latest source block before the insertion point. Here that is the second
+// one, even though non-throwing code is inserted before the split and the
+// third source block lies after the insertion point.
+TEST_F(ControlFlowTest, insertion_split_copies_source_block_before_position) {
+  auto code = assembler::ircode_from_string(R"(
+    (
+      (:main)
+      (.src_block "LFoo;.bar:()V" 1 (0.1 1.0) (0.1 1.0) (0.1 1.0))
+      (load-param-object v0)
+      (load-param-object v1)
+      (load-param v2)
+      (.try_start foo)
+      (.src_block "LFoo;.bar:()V" 2 (0.2 1.0) (0.2 1.0) (0.2 1.0))
+      (add-int v1 v1 v1)
+      (.src_block "LFoo;.bar:()V" 3 (0.3 1.0) (0.3 1.0) (0.3 1.0))
+      (aput-object v0 v1 v2)
+      (goto :return)
+      (.try_end foo)
+
+      (:return)
+      (return v1)
+
+      (:catch)
+      (.catch (foo))
+      (.src_block "LFoo;.bar:()V" 4 (0.4 1.0) (0.4 1.0) (0.4 1.0))
+      (const v1 0)
+      (return v1)
+    )
+  )");
+  code->build_cfg();
+  auto& cfg = code->cfg();
+  auto* const_before_split = new IRInstruction(OPCODE_CONST);
+  const_before_split->set_dest(3)->set_literal(0);
+  auto* div = new IRInstruction(OPCODE_DIV_INT);
+  div->set_srcs_size(2);
+  div->set_src(0, 2);
+  div->set_src(1, 2);
+  auto* move_result = new IRInstruction(IOPCODE_MOVE_RESULT_PSEUDO);
+  move_result->set_dest(2);
+  auto* const_after_split = new IRInstruction(OPCODE_CONST);
+  const_after_split->set_dest(4)->set_literal(1);
+  auto ii = cfg::InstructionIterable(cfg);
+  auto add_it = std::find_if(ii.begin(), ii.end(), [](const auto& mie) {
+    return mie.insn->opcode() == OPCODE_ADD_INT;
+  });
+  ASSERT_FALSE(add_it.is_end());
+  cfg.insert_before(add_it, std::vector<IRInstruction*>{const_before_split, div,
+                                                        move_result,
+                                                        const_after_split});
+
+  auto* split_block = cfg.find_insn(const_after_split).block();
+  EXPECT_NE(split_block, cfg.find_insn(div).block());
+  auto* copied = source_blocks::get_first_source_block(split_block);
+  ASSERT_NE(copied, nullptr);
+  EXPECT_EQ(copied->id, SourceBlock::kSyntheticId);
+  EXPECT_EQ(copied->get_val(0), std::optional<float>(0.2f));
+}
+
+// A source block inserted ahead of the split is the latest one before the
+// split: the new block starts with a copy of it, not of the one that was in the
+// block before the insertion point.
+TEST_F(ControlFlowTest, insertion_split_copies_inserted_source_block) {
+  auto code = assembler::ircode_from_string(R"(
+    (
+      (:main)
+      (.src_block "LFoo;.bar:()V" 1 (0.1 1.0) (0.1 1.0) (0.1 1.0))
+      (load-param-object v0)
+      (load-param-object v1)
+      (load-param v2)
+      (.try_start foo)
+      (.src_block "LFoo;.bar:()V" 2 (0.2 1.0) (0.2 1.0) (0.2 1.0))
+      (add-int v1 v1 v1)
+      (aput-object v0 v1 v2)
+      (goto :return)
+      (.try_end foo)
+
+      (:return)
+      (return v1)
+
+      (:catch)
+      (.catch (foo))
+      (.src_block "LFoo;.bar:()V" 3 (0.3 1.0) (0.3 1.0) (0.3 1.0))
+      (const v1 0)
+      (return v1)
+    )
+  )");
+  code->build_cfg();
+  auto& cfg = code->cfg();
+  auto ii = cfg::InstructionIterable(cfg);
+  auto add_it = std::find_if(ii.begin(), ii.end(), [](const auto& mie) {
+    return mie.insn->opcode() == OPCODE_ADD_INT;
+  });
+  ASSERT_FALSE(add_it.is_end());
+  auto* existing = source_blocks::get_first_source_block(add_it.block());
+  ASSERT_NE(existing, nullptr);
+  auto* div = new IRInstruction(OPCODE_DIV_INT);
+  div->set_srcs_size(2);
+  div->set_src(0, 2);
+  div->set_src(1, 2);
+  auto* move_result = new IRInstruction(IOPCODE_MOVE_RESULT_PSEUDO);
+  move_result->set_dest(2);
+  auto* const_after_split = new IRInstruction(OPCODE_CONST);
+  const_after_split->set_dest(4)->set_literal(1);
+  std::vector<cfg::ControlFlowGraph::InsertVariant> to_insert;
+  to_insert.emplace_back(source_blocks::clone_as_synthetic(
+      existing, nullptr, SourceBlock::Val(0.5f, 1.0f)));
+  to_insert.emplace_back(div);
+  to_insert.emplace_back(move_result);
+  to_insert.emplace_back(const_after_split);
+  cfg.insert_before(add_it, to_insert.begin(), to_insert.end());
+
+  auto* split_block = cfg.find_insn(const_after_split).block();
+  EXPECT_NE(split_block, cfg.find_insn(div).block());
+  auto* copied = source_blocks::get_first_source_block(split_block);
+  ASSERT_NE(copied, nullptr);
+  EXPECT_EQ(copied->get_val(0), std::optional<float>(0.5f));
+}
+
 TEST_F(ControlFlowTest, add_sget) {
 
   auto code = assembler::ircode_from_string(R"(
@@ -3630,9 +3750,14 @@ const char* const k_three_way_switch = R"(
   )
 )";
 
-std::unique_ptr<IRCode> build_and_linearize(const char* code_str) {
+std::unique_ptr<IRCode> build_and_linearize(
+    const std::string& code_str,
+    const std::function<void(ControlFlowGraph&)>& edit = {}) {
   auto code = assembler::ircode_from_string(code_str);
   code->build_cfg();
+  if (edit) {
+    edit(code->cfg());
+  }
   code->clear_cfg();
   return code;
 }
@@ -3710,6 +3835,322 @@ TEST_F(ControlFlowTest, linearize_round_trip_is_fixpoint) {
   code->clear_cfg();
   EXPECT_EQ(assembler::to_string(code.get()), once);
 }
+
+namespace {
+
+// A method, the instruction after which a pass splits its block before the
+// first linearization (if any), and the layout every linearization must give.
+struct GotoLayoutCase {
+  std::string name;
+  std::string code;
+  std::optional<IROpcode> split_after;
+  std::string layout;
+};
+
+void PrintTo(const GotoLayoutCase& c, std::ostream* os) { *os << c.name; }
+
+class GotoLayoutTest : public ControlFlowTest,
+                       public ::testing::WithParamInterface<GotoLayoutCase> {};
+
+} // namespace
+
+// A goto's target is laid out right after its source unless that would
+// certainly start or end a try region, or the target already follows another
+// block. Rebuilding the CFG from that layout merges no block whose goto this
+// rule would decide differently, so every later linearization gives the same
+// layout.
+TEST_P(GotoLayoutTest, layout_survives_round_trips) {
+  const auto& param = GetParam();
+  auto code = build_and_linearize(param.code, [&](ControlFlowGraph& cfg) {
+    if (param.split_after) {
+      auto ii = cfg::InstructionIterable(cfg);
+      auto it = std::find_if(ii.begin(), ii.end(), [&](const auto& mie) {
+        return mie.insn->opcode() == *param.split_after;
+      });
+      ASSERT_FALSE(it.is_end());
+      cfg.split_block(it);
+    }
+  });
+  auto layout = assembler::ircode_from_string(param.layout);
+  EXPECT_CODE_EQ(code.get(), layout.get());
+  code->build_cfg();
+  code->clear_cfg();
+  EXPECT_CODE_EQ(code.get(), layout.get());
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    ControlFlowTest,
+    GotoLayoutTest,
+    ::testing::Values(
+        // `y = 1` and `y = 2` cannot throw and take the try region of the
+        // block before them, so `y = 1` falls through to `y = 2` and on to
+        // `k()`, and only `b()` needs a goto:
+        //   if (x != 0) { b(); } else { y = 1; }
+        //   y = 2;
+        //   k();
+        // with `b()` and `k()` guarded by the same handler.
+        GotoLayoutCase{"non_throwing_target_in_try_falls_through",
+                       R"((
+              (load-param v0)
+              (if-eqz v0 :a)
+              (.try_start t)
+              (invoke-static () "LFoo;.b:()V")
+              (.try_end t)
+              (goto :j)
+
+              (:a)
+              (const v1 1)
+
+              (:j)
+              (const v1 2)
+              (.try_start t)
+              (invoke-static () "LFoo;.k:()V")
+              (.try_end t)
+              (return-void)
+
+              (.catch (t))
+              (return-void)
+            ))",
+                       std::nullopt,
+                       R"((
+              (load-param v0)
+              (if-eqz v0 :a)
+              (.try_start t)
+              (invoke-static () "LFoo;.b:()V")
+              (goto :j)
+
+              (:a)
+              (const v1 1)
+
+              (:j)
+              (const v1 2)
+              (invoke-static () "LFoo;.k:()V")
+              (return-void)
+              (.try_end t)
+
+              (.catch (t))
+              (return-void)
+            ))"},
+        // A pass splits the block after `y = f()`. The rest cannot throw and
+        // takes the try region of the block before it, so it stays right after
+        // its `move-result`, where it was before the split:
+        //   if (x != 0) {
+        //     do {
+        //       y = 6;
+        //       try { y = f(); m = 3; } catch (Throwable t) { y = 7; return; }
+        //     } while (y == 0);
+        //   }
+        //   y = 6;
+        GotoLayoutCase{"target_after_move_result_split_falls_through",
+                       R"((
+              (load-param v0)
+              (if-eqz v0 :exit)
+
+              (:loop)
+              (const v1 6)
+              (.try_start t)
+              (invoke-static () "LFoo;.f:()I")
+              (move-result v1)
+              (const v2 3)
+              (if-eqz v1 :loop)
+              (.try_end t)
+
+              (:exit)
+              (const v1 6)
+              (return-void)
+
+              (.catch (t))
+              (const v1 7)
+              (return-void)
+            ))",
+                       OPCODE_MOVE_RESULT,
+                       R"((
+              (load-param v0)
+              (if-eqz v0 :exit)
+
+              (:loop)
+              (const v1 6)
+              (.try_start t)
+              (invoke-static () "LFoo;.f:()I")
+              (move-result v1)
+              (const v2 3)
+              (if-eqz v1 :loop)
+
+              (:exit)
+              (const v1 6)
+              (return-void)
+              (.try_end t)
+
+              (.catch (t))
+              (const v1 7)
+              (return-void)
+            ))"},
+        // `y = 2` has two predecessors, so which try region it ends up in is
+        // not known yet when the goto into `k()` is decided. That goto's target
+        // still stays with it, which saves a goto here but elsewhere can cost a
+        // try region boundary:
+        //   if (x != 0) { a(); } else { y = 1; }
+        //   y = 2;
+        //   try { k(); } catch (Throwable t) {}
+        GotoLayoutCase{"target_after_source_of_unknown_region_falls_through",
+                       R"((
+              (load-param v0)
+              (if-eqz v0 :a)
+              (invoke-static () "LFoo;.a:()V")
+              (goto :j)
+
+              (:a)
+              (const v1 1)
+
+              (:j)
+              (const v1 2)
+              (.try_start t)
+              (invoke-static () "LFoo;.k:()V")
+              (.try_end t)
+              (return-void)
+
+              (.catch (t))
+              (return-void)
+            ))",
+                       std::nullopt,
+                       R"((
+              (load-param v0)
+              (if-eqz v0 :a)
+              (invoke-static () "LFoo;.a:()V")
+
+              (:j)
+              (const v1 2)
+              (.try_start t)
+              (invoke-static () "LFoo;.k:()V")
+              (return-void)
+
+              (:a)
+              (const v1 1)
+              (goto :j)
+              (.try_end t)
+
+              (.catch (t))
+              (return-void)
+            ))"},
+        // `y = 1` takes the try region of `a()`, which differs from that of
+        // `c()`, so falling through to `c()` would certainly end one try region
+        // and start another, and the goto stays:
+        //   if (x != 0) {
+        //     try { a(); } catch (Throwable t) { return; }
+        //     y = 1;
+        //   }
+        //   try { c(); } catch (Throwable t) { y = 2; return; }
+        GotoLayoutCase{"target_in_other_try_region_keeps_goto",
+                       R"((
+              (load-param v0)
+              (if-eqz v0 :c)
+              (.try_start t1)
+              (invoke-static () "LFoo;.a:()V")
+              (.try_end t1)
+              (const v1 1)
+              (goto :c)
+
+              (:c)
+              (.try_start t2)
+              (invoke-static () "LFoo;.c:()V")
+              (.try_end t2)
+              (return-void)
+
+              (.catch (t1))
+              (return-void)
+
+              (.catch (t2))
+              (const v1 2)
+              (return-void)
+            ))",
+                       std::nullopt,
+                       R"((
+              (load-param v0)
+              (if-eqz v0 :c)
+              (.try_start t1)
+              (invoke-static () "LFoo;.a:()V")
+              (const v1 1)
+              (goto :c)
+              (.try_end t1)
+
+              (.catch (t1))
+              (return-void)
+
+              (.try_start t2)
+              (:c)
+              (invoke-static () "LFoo;.c:()V")
+              (return-void)
+              (.try_end t2)
+
+              (.catch (t2))
+              (const v1 2)
+              (return-void)
+            ))"},
+        // The entry block is laid out first, so it takes no try region, even
+        // when it is a loop head that a block in a try region jumps back to. A
+        // pass splits the block after the entry, which leaves `y = x + 1`, a
+        // block that cannot throw. It falls through to `f()`, and still does
+        // after a rebuild merges the two, because the entry block keeps its own
+        // try region (none) instead of taking that of `g()`, which jumps back
+        // to it:
+        //   while (true) {
+        //     x = 0;
+        //     if (x == 0) { h(); }
+        //     y = x + 1;
+        //     f();
+        //     while (true) {
+        //       try { g(); break; } catch (Throwable t) { k(); }
+        //     }
+        //   }
+        GotoLayoutCase{"entry_loop_head_takes_no_try_region",
+                       R"((
+              (:head)
+              (const v0 0)
+              (if-eqz v0 :other)
+
+              (:join)
+              (add-int/lit v1 v0 1)
+              (invoke-static () "LFoo;.f:()V")
+              (.try_start t)
+              (:body)
+              (invoke-static () "LFoo;.g:()V")
+              (goto :head)
+              (.try_end t)
+
+              (:other)
+              (invoke-static () "LFoo;.h:()V")
+              (goto :join)
+
+              (.catch (t))
+              (invoke-static () "LFoo;.k:()V")
+              (goto :body)
+            ))",
+                       OPCODE_ADD_INT_LIT,
+                       R"((
+              (:head)
+              (const v0 0)
+              (if-eqz v0 :other)
+
+              (:join)
+              (add-int/lit v1 v0 1)
+              (invoke-static () "LFoo;.f:()V")
+              (.try_start t)
+              (:body)
+              (invoke-static () "LFoo;.g:()V")
+              (goto :head)
+              (.try_end t)
+
+              (.catch (t))
+              (invoke-static () "LFoo;.k:()V")
+              (goto :body)
+
+              (:other)
+              (invoke-static () "LFoo;.h:()V")
+              (goto :join)
+            ))"}),
+    [](const ::testing::TestParamInfo<GotoLayoutCase>& info) {
+      return info.param.name;
+    });
 
 // The block after a try region is laid out right after it, so the try falls
 // through to it, even when one of the catch handlers resumes there too:

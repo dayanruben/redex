@@ -17,6 +17,10 @@ void InlinerConfig::bind_config() {
   bind("relaxed_init_inline", relaxed_init_inline, relaxed_init_inline);
   bind("unfinalize_relaxed_init_inline", unfinalize_relaxed_init_inline,
        unfinalize_relaxed_init_inline);
+  bind("relaxed_init_inline_maybe_anonymous",
+       relaxed_init_inline_maybe_anonymous, relaxed_init_inline_maybe_anonymous,
+       "Whether relaxed init inlining, and unfinalizing fields for it, also "
+       "applies to constructors of classes that may be anonymous.");
   bind("unfinalize_perf_mode", "not-cold", unfinalize_perf_mode_str,
        "one of \"none\", \"not-cold\", \"maybe-hot\", \"hot\"");
   bind("strict_throwable_init_inline", strict_throwable_init_inline,
@@ -301,6 +305,17 @@ void ResourceConfig::bind_config() {
 }
 
 void DexOutputConfig::bind_config() {
+  bind("parallel_dex_writing", parallel_dex_writing, parallel_dex_writing,
+       "Prepare multi-dex output and write dex bytes in parallel, while "
+       "preserving serial debug registration, symbol output, and metrics. "
+       "Supports both compression-conscious and greedy method-similarity "
+       "ordering. Disable to use the sequential dex writer.");
+  bind("parallel_dex_writing_max_batch_size",
+       parallel_dex_writing_max_batch_size, parallel_dex_writing_max_batch_size,
+       "Maximum simultaneous dex output buffers; must be positive. Batches "
+       "complete in dex order.");
+  always_assert_log(parallel_dex_writing_max_batch_size > 0,
+                    "parallel_dex_writing_max_batch_size must be positive");
   bind("write_class_sizes", write_class_sizes, write_class_sizes);
   bind("write_method_sizes", write_method_sizes, write_method_sizes,
        "Record the authoritative post-lowering per-method code_item byte size "

@@ -48,6 +48,56 @@ std::string_view get_merger_package_name(const DexType* root_type) {
 
 namespace class_merging {
 
+DexMethod* create_forwarding_ctor(DexType* owner, DexMethodRef* super_ctor) {
+  auto mc = MethodCreator(owner,
+                          DexString::make_string("<init>"),
+                          super_ctor->get_proto(),
+                          ACC_PUBLIC | ACC_CONSTRUCTOR);
+  // Call to super.<init>
+  std::vector<Location> args;
+  size_t args_size = super_ctor->get_proto()->get_args()->size();
+  args.reserve(args_size + 1);
+  for (size_t arg_loc = 0; arg_loc < args_size + 1; ++arg_loc) {
+    args.push_back(mc.get_local(static_cast<int>(arg_loc)));
+  }
+  auto* mb = mc.get_main_block();
+  mb->invoke(OPCODE_INVOKE_DIRECT, super_ctor, args);
+  mb->ret_void();
+  auto* ctor = mc.create();
+  ctor->get_code()->build_cfg();
+  return ctor;
+}
+
+bool is_forwarding_ctor(const DexMethod* ctor, const DexMethodRef* super_ctor) {
+  if (ctor->get_proto() != super_ctor->get_proto()) {
+    return false;
+  }
+  if (ctor->get_code() == nullptr) {
+    return false;
+  }
+  const auto& cfg = ctor->get_code()->cfg();
+  // A handler around the call would catch what the super constructor throws.
+  for (const auto* block : cfg.blocks()) {
+    if (cfg.get_succ_edge_of_type(block, cfg::EDGE_THROW) != nullptr) {
+      return false;
+    }
+  }
+  std::vector<reg_t> param_regs;
+  std::vector<const IRInstruction*> body;
+  for (const auto& mie : cfg::ConstInstructionIterable(cfg)) {
+    if (opcode::is_a_load_param(mie.insn->opcode())) {
+      param_regs.push_back(mie.insn->dest());
+    } else {
+      body.push_back(mie.insn);
+    }
+  }
+  return body.size() == 2 && opcode::is_invoke_direct(body[0]->opcode()) &&
+         body[0]->get_method() == super_ctor &&
+         std::equal(param_regs.begin(), param_regs.end(),
+                    body[0]->srcs().begin(), body[0]->srcs().end()) &&
+         opcode::is_return_void(body[1]->opcode());
+}
+
 DexClass* create_class(const DexType* type,
                        const DexType* super_type,
                        const std::string_view pkg_name,
@@ -80,22 +130,7 @@ DexClass* create_class(const DexType* type,
   // Create ctor.
   auto super_ctors = type_class(super_type)->get_ctors();
   for (auto* super_ctor : super_ctors) {
-    auto mc = MethodCreator(t,
-                            DexString::make_string("<init>"),
-                            super_ctor->get_proto(),
-                            ACC_PUBLIC | ACC_CONSTRUCTOR);
-    // Call to super.<init>
-    std::vector<Location> args;
-    size_t args_size = super_ctor->get_proto()->get_args()->size();
-    args.reserve(args_size + 1);
-    for (size_t arg_loc = 0; arg_loc < args_size + 1; ++arg_loc) {
-      args.push_back(mc.get_local(static_cast<int>(arg_loc)));
-    }
-    auto* mb = mc.get_main_block();
-    mb->invoke(OPCODE_INVOKE_DIRECT, super_ctor, args);
-    mb->ret_void();
-    auto* ctor = mc.create();
-    ctor->get_code()->build_cfg();
+    auto* ctor = create_forwarding_ctor(t, super_ctor);
     TRACE(CLMG, 4, " default ctor created %s", SHOW(ctor));
     cls->add_method(ctor);
   }

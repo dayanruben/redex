@@ -14,7 +14,6 @@
 #include "Debug.h"
 #include "MethodOverrideGraph.h"
 #include "Resolver.h"
-#include "TypeSystem.h"
 #include "Walkers.h"
 
 namespace {
@@ -34,6 +33,12 @@ class DispatchTargets {
                   const DexClass* cls)
       : m_graph(graph), m_hierarchy(hierarchy), m_type(cls->get_type()) {
     collect_inherited_candidates(cls);
+  }
+
+  // Whether `type` is the class, one of its superclasses or an interface they
+  // implement, including those without a definition.
+  bool is_supertype(const DexType* type) const {
+    return m_supertypes.count(type) != 0u;
   }
 
   // Calls `f` on each method other than `callee` that `insn`, which resolves to
@@ -108,27 +113,29 @@ class DispatchTargets {
            method->get_proto() == callee->get_proto();
   }
 
-  // Collects the classes of the superclass chain and the default methods of
-  // all interfaces they implement. A superclass or interface without a
-  // definition makes the class's inherited implementations unknown.
+  // Collects the classes of the superclass chain, the default methods of all
+  // interfaces they implement, and the types of both. A superclass or
+  // interface without a definition makes the class's inherited
+  // implementations unknown.
   void collect_inherited_candidates(const DexClass* cls) {
     std::vector<const DexType*> interfaces;
     while (cls != nullptr) {
       m_superclass_chain.push_back(cls);
+      m_supertypes.insert(cls->get_type());
       for (const auto* intf : *cls->get_interfaces()) {
         interfaces.push_back(intf);
       }
       const auto* super_type = cls->get_super_class();
       cls = super_type == nullptr ? nullptr : type_class(super_type);
       if (super_type != nullptr && cls == nullptr) {
+        m_supertypes.insert(super_type);
         m_inherited_known = false;
       }
     }
-    UnorderedSet<const DexType*> visited;
     while (!interfaces.empty()) {
       const auto* intf = interfaces.back();
       interfaces.pop_back();
-      if (!visited.insert(intf).second) {
+      if (!m_supertypes.insert(intf).second) {
         continue;
       }
       const auto* intf_cls = type_class(intf);
@@ -188,6 +195,7 @@ class DispatchTargets {
   std::vector<const DexClass*> m_superclass_chain;
   std::vector<const DexMethod*> m_default_methods;
   bool m_inherited_known{true};
+  UnorderedSet<const DexType*> m_supertypes;
 };
 
 namespace check_this {
@@ -204,8 +212,8 @@ class ThisObjectAnalysis final
     : public sparta::MonotonicFixpointIterator<cfg::GraphInterface,
                                                ThisEnvironment> {
  public:
-  explicit ThisObjectAnalysis(cfg::ControlFlowGraph* cfg,
-                              DexMethod* method,
+  explicit ThisObjectAnalysis(const cfg::ControlFlowGraph* cfg,
+                              const DexMethod* method,
                               size_t this_param_reg)
       : MonotonicFixpointIterator(*cfg, cfg->num_blocks()),
         m_method(method),
@@ -221,9 +229,8 @@ class ThisObjectAnalysis final
     return exit_state_at_source;
   }
 
-  std::optional<UnorderedSet<const DexMethod*>> collect_method_called_on_this(
-      const DispatchTargets& dispatch_targets) {
-    UnorderedSet<const DexMethod*> return_set;
+  std::optional<std::vector<const IRInstruction*>> collect_invokes_on_this() {
+    std::vector<const IRInstruction*> invokes;
     const auto* code = m_method->get_code();
     const auto& cfg = code->cfg();
     for (cfg::Block* block : cfg.blocks()) {
@@ -242,24 +249,8 @@ class ThisObjectAnalysis final
               break;
             }
           }
-          if (use_this && !insn->has_method()) {
-            // invoke-polymorphic and invoke-custom run unknown code.
-            return_set.emplace(nullptr);
-          } else if (use_this) {
-            auto* insn_method = insn->get_method();
-            auto* callee = resolve_method_deprecated(
-                insn_method, opcode_to_search(insn), m_method);
-            if (insn->opcode() == OPCODE_INVOKE_STATIC ||
-                insn->opcode() == OPCODE_INVOKE_DIRECT) {
-              if (callee != nullptr && callee->get_code() != nullptr) {
-                return_set.emplace(callee);
-              }
-            } else {
-              return_set.emplace(callee);
-              dispatch_targets.for_each_other_target(
-                  insn, callee,
-                  [&](const DexMethod* target) { return_set.emplace(target); });
-            }
+          if (use_this) {
+            invokes.push_back(insn);
           }
         } else if (op == OPCODE_IPUT_OBJECT || op == OPCODE_SPUT_OBJECT ||
                    op == OPCODE_APUT_OBJECT) {
@@ -278,7 +269,7 @@ class ThisObjectAnalysis final
         analyze_instruction(insn, &env);
       }
     }
-    return return_set;
+    return invokes;
   }
 
  private:
@@ -323,127 +314,196 @@ class ThisObjectAnalysis final
 } // namespace check_this
 
 /**
- * This function adds instance fields in cls_to_check that the method
- * accessed in blocklist_ifields.
- * Return false if all ifields are excluded - no need to check further.
+ * Finds the instance fields of one class that code running during the
+ * construction of an instance may read, and adds them to a blocklist.
  */
-bool get_ifields_read(const UnorderedSet<std::string>& allowlist_method_names,
-                      const UnorderedSet<const DexType*>& parent_intf_set,
-                      const DispatchTargets& dispatch_targets,
-                      const DexClass* ifield_cls,
-                      const DexMethod* method,
-                      ConcurrentSet<DexField*>* blocklist_ifields,
-                      UnorderedSet<const DexMethod*>* visited) {
-  if (visited->count(method) != 0u) {
-    return true;
-  }
-  visited->emplace(method);
-  if (method != nullptr) {
-    for (const auto& name : UnorderedIterable(allowlist_method_names)) {
-      // Allowed methods name from config, ignore.
-      // We have this allowlist so that we can ignore some methods that
-      // are safe and won't read instance field.
-      // TODO: Switch to a proper interprocedural fixpoint analysis.
-      if (method->get_name()->str() == name) {
+class EarlyReadFinder {
+ public:
+  EarlyReadFinder(const DispatchTargets& dispatch_targets,
+                  const UnorderedSet<std::string>& allowlist_method_names,
+                  const DexClass* ifield_cls,
+                  InsertOnlyConcurrentSet<DexField*>* blocklist_ifields)
+      : m_dispatch_targets(dispatch_targets),
+        m_allowlist_method_names(allowlist_method_names),
+        m_ifield_cls(ifield_cls),
+        m_blocklist_ifields(blocklist_ifields) {}
+
+  /**
+   * Visits the methods that an invoke instruction may call. Returns false if
+   * all ifields are excluded - no need to check further.
+   */
+  bool visit_invoke(const IRInstruction* insn, const DexMethod* caller) {
+    auto* insn_method = insn->get_method();
+    auto* callee =
+        resolve_method_deprecated(insn_method, opcode_to_search(insn), caller);
+    if (insn->opcode() == OPCODE_INVOKE_DIRECT ||
+        insn->opcode() == OPCODE_INVOKE_STATIC) {
+      // For invoke on a direct/static method, if we can't resolve them or
+      // there is no code after resolved, those must be methods not
+      // not implemented by us, so they won't access our instance fields
+      // as well.
+      if ((callee == nullptr) || (callee->get_code() == nullptr)) {
+        return true;
+      }
+    } else {
+      bool no_current_type = true;
+      // No need to check on methods whose class/arguments are not
+      // superclass or interface of ifield_cls.
+      if (callee != nullptr &&
+          !m_dispatch_targets.is_supertype(callee->get_class())) {
+        for (const auto& type : *callee->get_proto()->get_args()) {
+          if (m_dispatch_targets.is_supertype(type)) {
+            no_current_type = false;
+          }
+        }
+      } else if (callee == nullptr &&
+                 !m_dispatch_targets.is_supertype(insn_method->get_class())) {
+        for (const auto& type : *insn_method->get_proto()->get_args()) {
+          if (m_dispatch_targets.is_supertype(type)) {
+            no_current_type = false;
+          }
+        }
+      } else {
+        no_current_type = false;
+      }
+      if (no_current_type) {
         return true;
       }
     }
+    return visit_dispatch_targets(insn, callee);
   }
-  if (method == nullptr || method->get_code() == nullptr) {
-    // We can't track down further, don't process any ifields from ifield_cls.
-    for (const auto& field : ifield_cls->get_ifields()) {
-      blocklist_ifields->emplace(field);
+
+  /**
+   * Adds the instance fields of ifield_cls that the method reads, directly or
+   * through its callees. Returns false if all ifields are excluded - no need
+   * to check further.
+   */
+  bool visit_method(const DexMethod* method) {
+    if (!m_visited.emplace(method).second) {
+      return true;
     }
-    return false;
-  }
-  bool res = true;
-  cfg_adapter::iterate_with_iterator(
-      const_cast<IRCode*>(method->get_code()), [&](const IRList::iterator& it) {
-        auto* insn = it->insn;
-        if (opcode::is_an_iget(insn->opcode())) {
-          // Meet accessing of a ifield in a method called from <init>, add
-          // to blocklist.
-          auto* field = resolve_field(insn->get_field(), FieldSearch::Instance);
-          if (field != nullptr &&
-              field->get_class() == ifield_cls->get_type()) {
-            blocklist_ifields->emplace(field);
-          }
-        } else if (opcode::is_an_invoke(insn->opcode()) &&
-                   !insn->has_method()) {
-          // invoke-polymorphic and invoke-custom run unknown code, which can
-          // read the fields of an object passed to it.
-          const auto* args = insn->get_callsite_proto()->get_args();
-          if (std::any_of(args->begin(), args->end(), [&](const DexType* t) {
-                return parent_intf_set.count(t) != 0u;
-              })) {
-            bool keep_going = get_ifields_read(
-                allowlist_method_names, parent_intf_set, dispatch_targets,
-                ifield_cls, /* method */ nullptr, blocklist_ifields, visited);
-            if (!keep_going) {
+    if (method != nullptr) {
+      for (const auto& name : UnorderedIterable(m_allowlist_method_names)) {
+        // Allowed methods name from config, ignore.
+        // We have this allowlist so that we can ignore some methods that
+        // are safe and won't read instance field.
+        // TODO: Switch to a proper interprocedural fixpoint analysis.
+        if (method->get_name()->str() == name) {
+          return true;
+        }
+      }
+    }
+    if (method == nullptr || method->get_code() == nullptr) {
+      // We can't track down further, don't process any ifields from ifield_cls.
+      return blocklist_all();
+    }
+    bool res = true;
+    cfg_adapter::iterate_with_iterator(
+        const_cast<IRCode*>(method->get_code()),
+        [&](const IRList::iterator& it) {
+          auto* insn = it->insn;
+          if (opcode::is_an_iget(insn->opcode())) {
+            // Meet accessing of a ifield in a method called from <init>, add
+            // to blocklist.
+            auto* field =
+                resolve_field(insn->get_field(), FieldSearch::Instance);
+            if (field != nullptr &&
+                field->get_class() == m_ifield_cls->get_type()) {
+              m_blocklist_ifields->insert(field);
+            }
+          } else if (opcode::is_an_invoke(insn->opcode()) &&
+                     !insn->has_method()) {
+            // invoke-polymorphic and invoke-custom run unknown code, which can
+            // read the fields of an object passed to it.
+            const auto* args = insn->get_callsite_proto()->get_args();
+            if (std::any_of(args->begin(), args->end(), [&](const DexType* t) {
+                  return m_dispatch_targets.is_supertype(t);
+                })) {
+              if (!visit_method(/* method */ nullptr)) {
+                res = false;
+                return cfg_adapter::LOOP_BREAK;
+              }
+            }
+          } else if (opcode::is_a_method_invoke(insn->opcode())) {
+            // Recusive check every methods accessed from <init>.
+            if (!visit_invoke(insn, method)) {
               res = false;
               return cfg_adapter::LOOP_BREAK;
             }
           }
-        } else if (opcode::is_a_method_invoke(insn->opcode())) {
-          auto* insn_method = insn->get_method();
-          auto* callee = resolve_method_deprecated(
-              insn_method, opcode_to_search(insn), method);
-          if (insn->opcode() == OPCODE_INVOKE_DIRECT ||
-              insn->opcode() == OPCODE_INVOKE_STATIC) {
-            // For invoke on a direct/static method, if we can't resolve them or
-            // there is no code after resolved, those must be methods not
-            // not implemented by us, so they won't access our instance fields
-            // as well.
-            if ((callee == nullptr) || (callee->get_code() == nullptr)) {
-              return cfg_adapter::LOOP_CONTINUE;
-            }
-          } else {
-            bool no_current_type = true;
-            // No need to check on methods whose class/arguments are not
-            // superclass or interface of ifield_cls.
-            if (callee != nullptr &&
-                (parent_intf_set.count(callee->get_class()) == 0u)) {
-              for (const auto& type : *callee->get_proto()->get_args()) {
-                if (parent_intf_set.count(type) != 0u) {
-                  no_current_type = false;
-                }
-              }
-            } else if (callee == nullptr &&
-                       (parent_intf_set.count(insn_method->get_class()) ==
-                        0u)) {
-              for (const auto& type : *insn_method->get_proto()->get_args()) {
-                if (parent_intf_set.count(type) != 0u) {
-                  no_current_type = false;
-                }
-              }
-            } else {
-              no_current_type = false;
-            }
-            if (no_current_type) {
-              return cfg_adapter::LOOP_CONTINUE;
-            }
-          }
-          // Recusive check every methods accessed from <init>.
-          bool keep_going = get_ifields_read(
-              allowlist_method_names, parent_intf_set, dispatch_targets,
-              ifield_cls, callee, blocklist_ifields, visited);
-          dispatch_targets.for_each_other_target(
-              insn, callee, [&](const DexMethod* target) {
-                keep_going =
-                    keep_going &&
-                    get_ifields_read(allowlist_method_names, parent_intf_set,
-                                     dispatch_targets, ifield_cls, target,
-                                     blocklist_ifields, visited);
-              });
-          if (!keep_going) {
-            res = false;
-            return cfg_adapter::LOOP_BREAK;
-          }
-        }
-        return cfg_adapter::LOOP_CONTINUE;
-      });
-  return res;
-}
+          return cfg_adapter::LOOP_CONTINUE;
+        });
+    return res;
+  }
+
+  /**
+   * Adds the instance fields of ifield_cls that the constructor may read
+   * before storing them.
+   */
+  void visit_constructor(const DexMethod* ctor) {
+    const auto& cfg = ctor->get_code()->cfg();
+    check_this::ThisObjectAnalysis fixpoint(
+        &cfg, ctor, cfg.get_first_param_instruction()->dest());
+    fixpoint.run(check_this::ThisEnvironment());
+    // Only check on methods called with this object as arguments. They
+    // include the superclass constructor and any constructor that gets
+    // this as an argument: each can run code that reads this object's
+    // fields.
+    auto invokes = fixpoint.collect_invokes_on_this();
+    if (!invokes) {
+      // This object escaped to heap, blocklist all.
+      blocklist_all();
+      return;
+    }
+    for (const auto* insn : *invokes) {
+      if (!insn->has_method()) {
+        // invoke-polymorphic and invoke-custom run unknown code.
+        blocklist_all();
+        return;
+      }
+      auto* callee = resolve_method_deprecated(insn->get_method(),
+                                               opcode_to_search(insn), ctor);
+      if ((insn->opcode() == OPCODE_INVOKE_STATIC ||
+           insn->opcode() == OPCODE_INVOKE_DIRECT) &&
+          (callee == nullptr || callee->get_code() == nullptr)) {
+        continue;
+      }
+      // A callee that did not resolve makes visit_method give up on the class.
+      if (!visit_dispatch_targets(insn, callee)) {
+        return;
+      }
+    }
+  }
+
+ private:
+  /**
+   * Visits the callee of the invoke instruction, and the other methods that
+   * it may dispatch to on an instance of ifield_cls. Returns false if all
+   * ifields are excluded - no need to check further.
+   */
+  bool visit_dispatch_targets(const IRInstruction* insn,
+                              const DexMethod* callee) {
+    bool keep_going = visit_method(callee);
+    m_dispatch_targets.for_each_other_target(
+        insn, callee, [&](const DexMethod* target) {
+          keep_going = keep_going && visit_method(target);
+        });
+    return keep_going;
+  }
+
+  bool blocklist_all() {
+    for (const auto& field : m_ifield_cls->get_ifields()) {
+      m_blocklist_ifields->insert(field);
+    }
+    return false;
+  }
+
+  const DispatchTargets& m_dispatch_targets;
+  const UnorderedSet<std::string>& m_allowlist_method_names;
+  const DexClass* m_ifield_cls;
+  InsertOnlyConcurrentSet<DexField*>* m_blocklist_ifields;
+  UnorderedSet<const DexMethod*> m_visited;
+};
 
 /**
  * This function add ifields like x in following example in blocklist to avoid
@@ -460,12 +520,11 @@ bool get_ifields_read(const UnorderedSet<std::string>& allowlist_method_names,
  *     }
  *   }
  */
-ConcurrentSet<DexField*> get_ifields_read_in_callees(
+InsertOnlyConcurrentSet<DexField*> get_ifields_read_in_callees(
     const Scope& scope,
-    const UnorderedSet<std::string>& allowlist_method_names) {
-  ConcurrentSet<DexField*> return_ifields;
-  TypeSystem ts(scope);
-  auto override_graph = method_override_graph::build_graph(scope);
+    const UnorderedSet<std::string>& allowlist_method_names,
+    const method_override_graph::Graph& override_graph) {
+  InsertOnlyConcurrentSet<DexField*> return_ifields;
   auto hierarchy = build_type_hierarchy(scope);
   std::vector<DexClass*> relevant_classes;
   for (auto* cls : scope) {
@@ -492,45 +551,15 @@ ConcurrentSet<DexField*> get_ifields_read_in_callees(
   });
   walk::parallel::classes(
       relevant_classes,
-      [&return_ifields, &ts, &override_graph, &hierarchy,
+      [&return_ifields, &override_graph, &hierarchy,
        &allowlist_method_names](DexClass* cls) {
         auto* ctor = cls->get_ctors().front();
         auto* code = ctor->get_code();
         always_assert(code != nullptr);
-        auto& cfg = code->cfg();
-        check_this::ThisObjectAnalysis fixpoint(
-            &cfg, ctor, cfg.get_first_param_instruction()->dest());
-        fixpoint.run(check_this::ThisEnvironment());
-        // Only check on methods called with this object as arguments. They
-        // include the superclass constructor and any constructor that gets
-        // this as an argument: each can run code that reads this object's
-        // fields.
-        DispatchTargets dispatch_targets(*override_graph, hierarchy, cls);
-        auto check_methods =
-            fixpoint.collect_method_called_on_this(dispatch_targets);
-        if (!check_methods) {
-          // This object escaped to heap, blocklist all.
-          for (const auto& field : cls->get_ifields()) {
-            return_ifields.emplace(field);
-          }
-          return;
-        }
-        if (!check_methods->empty()) {
-          UnorderedSet<const DexMethod*> visited;
-          const auto& parent_chain = ts.parent_chain(cls->get_type());
-          UnorderedSet<const DexType*> parent_intf_set{parent_chain.begin(),
-                                                       parent_chain.end()};
-          const auto& intf_set = ts.get_implemented_interfaces(cls->get_type());
-          parent_intf_set.insert(intf_set.begin(), intf_set.end());
-          for (const auto* const method : UnorderedIterable(*check_methods)) {
-            bool keep_going = get_ifields_read(
-                allowlist_method_names, parent_intf_set, dispatch_targets, cls,
-                method, &return_ifields, &visited);
-            if (!keep_going) {
-              break;
-            }
-          }
-        }
+        DispatchTargets dispatch_targets(override_graph, hierarchy, cls);
+        EarlyReadFinder finder(dispatch_targets, allowlist_method_names, cls,
+                               &return_ifields);
+        finder.visit_constructor(ctor);
       });
   return return_ifields;
 }
@@ -552,7 +581,7 @@ UnorderedSet<const DexField*> gather_ifields_written_only_by_constructors(
     ifields_candidates.emplace(field);
   });
 
-  ConcurrentSet<DexField*> invalid_candidates;
+  InsertOnlyConcurrentSet<DexField*> invalid_candidates;
   walk::parallel::code(scope, [&](DexMethod* method, IRCode& code) {
     // Remove candidate field if it was written in code other than its class'
     // init function, or in an init function excluded from optimization.
@@ -661,7 +690,8 @@ UnorderedSet<const DexField*> gather_constructor_only_ifields(
 EligibleIfields gather_safely_inferable_ifield_candidates(
     const Scope& scope,
     const UnorderedSet<const DexField*>& candidate_ifields,
-    const UnorderedSet<std::string>& allowlist_method_names) {
+    const UnorderedSet<std::string>& allowlist_method_names,
+    const method_override_graph::Graph& method_override_graph) {
   EligibleIfields eligible_ifields;
   walk::fields(scope, [&](DexField* field) {
     if (candidate_ifields.count(field) == 0u) {
@@ -675,8 +705,8 @@ EligibleIfields gather_safely_inferable_ifield_candidates(
     }
     eligible_ifields.emplace(field);
   });
-  auto blocklist_ifields =
-      get_ifields_read_in_callees(scope, allowlist_method_names);
+  auto blocklist_ifields = get_ifields_read_in_callees(
+      scope, allowlist_method_names, method_override_graph);
   for (DexField* field : UnorderedIterable(blocklist_ifields)) {
     eligible_ifields.erase(field);
   }

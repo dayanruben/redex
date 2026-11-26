@@ -9,6 +9,7 @@
 #include <optional>
 
 #include "ApiLevelChecker.h"
+#include "ClassUtil.h"
 #include "Creators.h"
 #include "Debug.h"
 #include "Deleter.h"
@@ -26,6 +27,7 @@
 #include "PassManager.h"
 #include "RedexTest.h"
 #include "RedexTestUtils.h"
+#include "Show.h"
 #include "Walkers.h"
 
 struct MethodInlineTest : public RedexTest {
@@ -4701,6 +4703,28 @@ auto run_method_inline_pass(DexStoresVector& stores, bool normal_primary_dex) {
   return manager.get_pass_info().at(0).metrics;
 }
 
+// Runs MethodInlinePass with relaxed init inlining over prepared stores and
+// returns its metrics. `relaxed_init_inline_maybe_anonymous` keeps its default
+// unless `maybe_anonymous` is set. The pass leaves method bodies without a CFG.
+auto run_relaxed_init_method_inline_pass(DexStoresVector& stores,
+                                         bool maybe_anonymous) {
+  Json::Value config;
+  config["inliner"]["relaxed_init_inline"] = true;
+  if (maybe_anonymous) {
+    config["inliner"]["relaxed_init_inline_maybe_anonymous"] = true;
+  }
+  config["inliner"]["unfinalize_relaxed_init_inline"] = true;
+  config["inliner"]["unfinalize_perf_mode"] = "none";
+  ConfigFiles conf(config);
+  conf.parse_global_config();
+  RedexOptions options;
+  options.min_sdk = 21;
+  MethodInlinePass pass;
+  PassManager manager({&pass}, conf, options);
+  manager.run_passes(stores, conf);
+  return manager.get_pass_info().at(0).metrics;
+}
+
 // `LHelper;.choose:(I)I` returns 10 for 0 and 20 otherwise.
 DexClass* make_choose_helper() {
   return assembler::class_from_string(R"(
@@ -5310,6 +5334,36 @@ TEST_F(MethodInlineTest, delete_methods_keeps_method_handle_target) {
   EXPECT_EQ(foo_cls->get_dmethods().size(), 1);
 }
 
+// The same for a method handle that no code holds: the value of a static field.
+TEST_F(MethodInlineTest, delete_methods_keeps_encoded_method_handle_target) {
+  auto* foo_cls = create_a_class("LFoo;");
+  auto* helper = DexMethod::make_method("LFoo;.helper:(I)V")
+                     ->make_concrete(ACC_PUBLIC | ACC_STATIC,
+                                     assembler::ircode_from_string(R"((
+                                       (load-param v0)
+                                       (return-void)
+                                     ))"),
+                                     /* is_virtual */ false);
+  foo_cls->add_method(helper);
+  auto* bar_cls = create_a_class("LBar;");
+  bar_cls->add_field(
+      DexField::make_field("LBar;.HANDLE:Ljava/lang/invoke/MethodHandle;")
+          ->make_concrete(
+              ACC_PUBLIC | ACC_STATIC | ACC_FINAL,
+              std::make_unique<DexEncodedValueMethodHandle>(
+                  redex::make_method_handle(METHOD_HANDLE_TYPE_INVOKE_STATIC,
+                                            "LFoo;.helper:(I)V"))));
+  Scope scope{foo_cls, bar_cls};
+  walk::code(scope, [](auto*, IRCode& code) { code.build_cfg(); });
+
+  UnorderedSet<DexMethod*> removable{helper};
+  ConcurrentMethodResolverDeprecated concurrent_method_resolver;
+  auto deleted =
+      delete_methods(scope, removable, std::ref(concurrent_method_resolver));
+  EXPECT_TRUE(deleted.empty());
+  EXPECT_EQ(foo_cls->get_dmethods().size(), 1);
+}
+
 // Builds `LFoo;.callee:(I)I`, a switch on its argument whose every case costs
 // more than the invoke it would replace, called by three wrappers. Each wrapper
 // passes on the constant its two callers give it, so the constant is known at
@@ -5431,4 +5485,81 @@ TEST_F(MethodInlineTest, inline_everywhere_rebuilds_released_reduced_callee) {
       inline_switch_through_wrappers(conf, /* max_reduced_size */ 1);
   ASSERT_TRUE(wrappers);
   expect_folded_switch(*wrappers);
+}
+
+// `LOuter;.make:(I)Ljava/lang/Object;` instantiates the anonymous class
+// `LOuter$1;`, whose constructor assigns a final field after the super
+// constructor call, so it can only be inlined the relaxed way.
+std::pair<DexClass*, DexClass*> make_anonymous_class_instantiation(
+    DexStoresVector& stores) {
+  auto* outer_cls = assembler::class_from_string(R"(
+    (class (public) "LOuter;"
+      (method (public static) "LOuter;.make:(I)Ljava/lang/Object;"
+        (
+          (load-param v0)
+          (new-instance "LOuter$1;")
+          (move-result-pseudo-object v1)
+          (invoke-direct (v1 v0) "LOuter$1;.<init>:(I)V")
+          (return-object v1)
+        )
+      )
+    )
+  )");
+  auto* anonymous_cls = assembler::class_from_string(R"(
+    (class (public final) "LOuter$1;"
+      (field (public final) "LOuter$1;.f:I")
+      (method (public constructor) "LOuter$1;.<init>:(I)V"
+        (
+          (load-param-object v0)
+          (load-param v1)
+          (invoke-direct (v0) "Ljava/lang/Object;.<init>:()V")
+          (iput v1 v0 "LOuter$1;.f:I")
+          (return-void)
+        )
+      )
+    )
+  )");
+  anonymous_cls->set_deobfuscated_name("LOuter$1;");
+  always_assert(klass::maybe_anonymous_class(anonymous_cls));
+  DexStore store("root");
+  store.add_classes({outer_cls, anonymous_cls});
+  stores.push_back(std::move(store));
+  return {outer_cls, anonymous_cls};
+}
+
+// With relaxed_init_inline_maybe_anonymous, the anonymous class's constructor
+// is relaxed-inlined like any other class's, with the field unfinalized.
+TEST_F(MethodInlineTest, inline_init_relaxed_anonymous_class) {
+  DexStoresVector stores;
+  auto [outer_cls, anonymous_cls] = make_anonymous_class_instantiation(stores);
+
+  auto metrics =
+      run_relaxed_init_method_inline_pass(stores, /* maybe_anonymous */ true);
+
+  EXPECT_EQ(metrics.at("unfinalized_fields"), 1);
+  EXPECT_TRUE(anonymous_cls->get_ctors().empty());
+  EXPECT_FALSE(is_final(anonymous_cls->get_ifields().front()));
+  auto* make = outer_cls->get_dmethods().front();
+  make->get_code()->build_cfg();
+  bool inits_with_object_ctor = false;
+  for (const auto& mie : cfg::InstructionIterable(make->get_code()->cfg())) {
+    if (opcode::is_invoke_direct(mie.insn->opcode())) {
+      EXPECT_EQ(show(mie.insn->get_method()), "Ljava/lang/Object;.<init>:()V");
+      inits_with_object_ctor = true;
+    }
+  }
+  EXPECT_TRUE(inits_with_object_ctor);
+}
+
+// By default, the anonymous class keeps its constructor and its final field.
+TEST_F(MethodInlineTest, no_inline_init_relaxed_anonymous_class_by_default) {
+  DexStoresVector stores;
+  auto [outer_cls, anonymous_cls] = make_anonymous_class_instantiation(stores);
+
+  auto metrics =
+      run_relaxed_init_method_inline_pass(stores, /* maybe_anonymous */ false);
+
+  EXPECT_EQ(metrics.at("unfinalized_fields"), 0);
+  EXPECT_EQ(anonymous_cls->get_ctors().size(), 1);
+  EXPECT_TRUE(is_final(anonymous_cls->get_ifields().front()));
 }

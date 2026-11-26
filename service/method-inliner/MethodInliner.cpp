@@ -665,6 +665,7 @@ void gather_true_virtual_methods(
 void unfinalize_fields_if_beneficial_for_relaxed_init_inlining(
     const Scope& scope,
     const inliner::UnfinalizePerfMode& unfinalize_perf_mode,
+    bool include_maybe_anonymous_classes,
     InsertOnlyConcurrentMap<DexField*, std::vector<DexMethod*>>*
         unfinalized_fields,
     InsertOnlyConcurrentSet<DexMethod*>* methods_with_write_barrier) {
@@ -685,13 +686,7 @@ void unfinalize_fields_if_beneficial_for_relaxed_init_inlining(
       }
     }
 
-    // We also exclude possibly anonymous classes as those may
-    // regress the effectiveness of the class-merging passes.
-    // TODO T184662680: While this is not a correctness issue,
-    // we should fully support relaxed init methods in
-    // class-merging. Align with what happens in
-    // MultiMethodInliner::can_inline_init.
-    if (klass::maybe_anonymous_class(cls)) {
+    if (!include_maybe_anonymous_classes && klass::maybe_anonymous_class(cls)) {
       return;
     }
     UnorderedSet<DexField*> final_ifields;
@@ -817,14 +812,6 @@ void run_inliner(
     inliner_config.intermediate_shrinking = false;
     inliner_config.multiple_callers = true;
     inliner_config.delete_non_virtuals = true;
-    // We disable relaxed init inlining as bridge-synth-inlining likely runs
-    // before general class merging, and relaxed init inlining may regress the
-    // effectiveness of class merging, as it currently simply excludes classes
-    // affected by relaxed inits.
-    // TODO T184662680: While this is not a correctness issue, we should fully
-    // support relaxed init methods in class-merging and then not change
-    // the relaxed_init_inline here.
-    inliner_config.relaxed_init_inline = false;
     inliner_config.shrinker = shrinker::ShrinkerConfig();
     inliner_config.shrinker.compute_pure_methods = false;
     inliner_config.shrinker.run_const_prop = true;
@@ -844,7 +831,8 @@ void run_inliner(
   if (inliner_config.relaxed_init_inline &&
       inliner_config.unfinalize_relaxed_init_inline) {
     unfinalize_fields_if_beneficial_for_relaxed_init_inlining(
-        scope, inliner_config.unfinalize_perf_mode, &unfinalized_fields,
+        scope, inliner_config.unfinalize_perf_mode,
+        inliner_config.relaxed_init_inline_maybe_anonymous, &unfinalized_fields,
         &methods_with_write_barrier);
     mgr.set_metric("unfinalized_fields", unfinalized_fields.size());
     TRACE(INLINE, 3, "unfinalized %zu fields", unfinalized_fields.size());

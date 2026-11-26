@@ -58,6 +58,7 @@ check_PROGRAMS = \
     class_merging_hot_cold_grouping_test \
     class_merging_method_handle_test \
     class_merging_models_test \
+    class_merging_relaxed_init_test \
     class_order_sample_test \
     check_breadcrumbs_test \
     check_cast_analysis_test \
@@ -66,6 +67,7 @@ check_PROGRAMS = \
     concurrent_hashtable_test \
     configurable_test \
     config_files_test \
+    constant_lifting_test \
     constant_uses_test \
     constructor_accesses_test \
     constructor_analysis_test \
@@ -103,6 +105,7 @@ check_PROGRAMS = \
     fast_reg_alloc_test \
     fbjni_marker_test \
     field_op_tracker_method_handle_test \
+    field_op_tracker_test \
     final_inline_v2_test \
     fp_ev_test \
     global_type_analysis_test \
@@ -114,6 +117,7 @@ check_PROGRAMS = \
     init_class_pruner_test \
     init_class_lowering_pass_test \
     instruction_sequence_outliner_test \
+    instrument_test \
     int_type_patcher_test \
     interprocedural_constant_propagation_test \
     ipcp_stringbuilder_append_chain_test \
@@ -295,7 +299,7 @@ art_profile_writer_pass_test_SOURCES = ArtProfileWriterPassTest.cpp
 
 assert_test_SOURCES = AssertTest.cpp
 
-atomic_field_updater_lowering_test_SOURCES = AtomicFieldUpdaterLoweringTest.cpp
+atomic_field_updater_lowering_test_SOURCES = AtomicFieldUpdaterLoweringTest.cpp $(top_srcdir)/test/common/RedexTestUtils.cpp
 
 atomic_stat_counter_test_SOURCES = AtomicStatCounterTest.cpp
 
@@ -339,7 +343,7 @@ check_cast_analysis_test_SOURCES = CheckCastAnalysisTest.cpp $(top_srcdir)/test/
 
 class_order_sample_test_SOURCES = ClassOrderSampleTest.cpp
 
-clinit_batching_pass_test_SOURCES = ClinitBatchingPassTest.cpp
+clinit_batching_pass_test_SOURCES = ClinitBatchingPassTest.cpp $(top_srcdir)/test/common/RedexTestUtils.cpp
 EXTRA_clinit_batching_pass_test_DEPENDENCIES = clinit_batching_pass_test.env
 $(eval $(call make_env,clinit_batching_pass_test,manifest=$(srcdir)/../integ/ClinitBatchingTestManifest.xml))
 
@@ -358,6 +362,9 @@ class_merging_method_handle_test_SOURCES = \
 class_merging_models_test_SOURCES = \
     ClassMergingModelsTest.cpp ScopeHelper.cpp
 
+class_merging_relaxed_init_test_SOURCES = \
+    ClassMergingRelaxedInitTest.cpp ScopeHelper.cpp
+
 concurrent_containers_test_SOURCES = ConcurrentContainersTest.cpp
 
 concurrent_hashtable_test_SOURCES = ConcurrentHashtableTest.cpp
@@ -367,7 +374,7 @@ atomic_map_test_SOURCES = AtomicMapTest.cpp
 pass_input_edits_test_SOURCES = PassInputEditsTest.cpp $(top_srcdir)/test/common/pass_input_edits/PassInputEdits.cpp
 pass_input_edits_test_CPPFLAGS = $(AM_CPPFLAGS) -I$(top_srcdir)/test/common/pass_input_edits -I$(top_srcdir)/opt/remove-unused-fields
 
-pass_manager_feature_test_SOURCES = PassManagerFeatureTest.cpp
+pass_manager_feature_test_SOURCES = PassManagerFeatureTest.cpp $(top_srcdir)/test/common/RedexTestUtils.cpp
 
 configurable_test_SOURCES = ConfigurableTest.cpp
 configurable_test_LDADD = $(COMMON_MOCK_TEST_LIBS)
@@ -375,6 +382,8 @@ configurable_test_LDADD = $(COMMON_MOCK_TEST_LIBS)
 config_files_test_SOURCES = ConfigFilesTest.cpp
 EXTRA_config_files_test_DEPENDENCIES = config_files_test.env
 $(eval $(call make_env,config_files_test,class_frequencies_path=$(srcdir)/class_frequencies.txt))
+
+constant_lifting_test_SOURCES = ConstantLiftingTest.cpp
 
 constant_uses_test_SOURCES = ConstantUsesTest.cpp $(top_srcdir)/test/common/RedexTestUtils.cpp
 constant_uses_test_LDADD = $(COMMON_MOCK_TEST_LIBS)
@@ -408,7 +417,7 @@ debug_test_SOURCES = DebugTest.cpp
 
 dedup_blocks_test_SOURCES = DedupBlocksTest.cpp VirtScopeHelper.cpp ScopeHelper.cpp
 
-del_super_test_SOURCES = DelSuperTest.cpp
+del_super_test_SOURCES = DelSuperTest.cpp $(top_srcdir)/test/common/RedexTestUtils.cpp
 
 deobfuscated_alias_test_SOURCES = DeobfuscatedAliasTest.cpp
 
@@ -459,6 +468,8 @@ $(eval $(call make_env,fbjni_marker_test,test_fbjni_json=$(srcdir)/example_fbjni
 
 field_op_tracker_method_handle_test_SOURCES = FieldOpTrackerMethodHandleTest.cpp
 
+field_op_tracker_test_SOURCES = FieldOpTrackerTest.cpp
+
 final_inline_v2_test_SOURCES = FinalInlineV2Test.cpp $(top_srcdir)/test/common/RedexTestUtils.cpp
 
 fp_ev_test_SOURCES = FpEvTest.cpp
@@ -485,6 +496,8 @@ unreachable_lowering_pass_test_SOURCES = UnreachableLoweringPassTest.cpp
 int_type_patcher_test_SOURCES = IntTypePatcherTest.cpp
 
 instruction_sequence_outliner_test_SOURCES = InstructionSequenceOutlinerTest.cpp ScopeHelper.cpp $(top_srcdir)/test/common/RedexTestUtils.cpp
+
+instrument_test_SOURCES = InstrumentTest.cpp $(top_srcdir)/test/common/RedexTestUtils.cpp
 
 interprocedural_constant_propagation_test_SOURCES = constant-propagation/IPConstantPropagationTest.cpp $(top_srcdir)/test/common/RedexTestUtils.cpp
 

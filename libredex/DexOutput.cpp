@@ -40,6 +40,7 @@
 #include "DexLimits.h"
 #include "DexMethodHandle.h"
 #include "DexPosition.h"
+#include "DexStore.h"
 #include "DexUtil.h"
 #include "GlobalConfig.h"
 #include "IODIMetadata.h"
@@ -57,6 +58,7 @@
 #include "Trace.h"
 #include "TypeUtil.h"
 #include "Walkers.h"
+#include "WorkQueue.h"
 
 /*
  * For adler32...
@@ -2919,6 +2921,28 @@ void DexOutput::prepare(SortMode string_mode,
                         const std::vector<SortMode>& code_mode,
                         ConfigFiles& conf,
                         const std::string& dex_magic) {
+  prepare_without_debug(string_mode, code_mode, conf, dex_magic);
+  finalize_debug_and_header();
+}
+
+void DexOutput::prepare_without_debug(SortMode string_mode,
+                                      const std::vector<SortMode>& code_mode,
+                                      ConfigFiles& conf,
+                                      const std::string& dex_magic) {
+  always_assert_log(!conf.force_single_dex() || m_dex_number == 0,
+                    "force_single_dex requires one dex");
+  auto class_order_violations = check_class_order(m_classes);
+  if (class_order_violations > 0) {
+    // If enforce_class_order was enabled we fail the program if there exist any
+    // violations, otherwise we just record the number of violation.
+    always_assert_log(!conf.enforce_class_order(),
+                      "Dex %s - %zu has %d class order violations",
+                      m_store_name == nullptr ? "<unnamed>"
+                                              : m_store_name->c_str(),
+                      m_dex_number, class_order_violations);
+  }
+  m_stats.class_order_violations = class_order_violations;
+
   m_gtypes->set_config(&conf);
 
   fix_jumbos(m_classes, &m_dodx);
@@ -2936,6 +2960,9 @@ void DexOutput::prepare(SortMode string_mode,
   generate_callsite_data();
   generate_methodhandle_data();
   generate_annotations();
+}
+
+void DexOutput::finalize_debug_and_header() {
   generate_debug_items();
   generate_map();
   finalize_header();
@@ -2943,6 +2970,11 @@ void DexOutput::prepare(SortMode string_mode,
 }
 
 void DexOutput::write() {
+  write_dex();
+  write_symbol_files();
+}
+
+void DexOutput::write_dex() {
   int fd = open(m_filename, O_CREAT | O_TRUNC | O_WRONLY | O_BINARY, 0660);
   always_assert_log(fd != -1, "Cannot open dex output %s: %s", m_filename,
                     strerror(errno));
@@ -2964,7 +2996,6 @@ void DexOutput::write() {
   always_assert_log(close(fd) == 0, "Cannot close dex output %s: %s",
                     m_filename, strerror(errno));
   m_stats.num_bytes = static_cast<int64_t>(written);
-  write_symbol_files();
 }
 
 namespace {
@@ -3132,22 +3163,7 @@ enhanced_dex_stats_t write_classes_to_dex(
     int min_sdk,
     const std::vector<SortMode>& code_sort_mode,
     SortMode string_sort_mode) {
-  const JsonWrapper& json_cfg = conf.get_json_config();
-  bool force_single_dex = json_cfg.get("force_single_dex", false);
-  if (force_single_dex) {
-    always_assert_log(dex_number == 0, "force_single_dex requires one dex");
-  }
-
   TRACE(OPUT, 2, "[write_classes_to_dex][filename] %s", filename.c_str());
-  auto this_class_order_violations = check_class_order(classes);
-  if (this_class_order_violations > 0) {
-    // If enforce_class_order was enabled we fail the program if there exist any
-    // violations, otherwise we just record the number of violation.
-    always_assert_log(!conf.enforce_class_order(),
-                      "Dex %s - %zu has %d class order violations",
-                      store_name->c_str(), dex_number,
-                      this_class_order_violations);
-  }
 
   DexOutput dout(filename.c_str(), classes, std::move(gtypes),
                  conf.normal_primary_dex(), store_number, store_name,
@@ -3158,8 +3174,95 @@ enhanced_dex_stats_t write_classes_to_dex(
   dout.write();
   dout.metrics();
 
-  dout.m_stats.class_order_violations = this_class_order_violations;
   return dout.m_stats;
+}
+
+void write_classes_to_multiple_dexes(
+    DexStore& store,
+    size_t store_number,
+    const DexWritingContext& context,
+    const std::function<void(enhanced_dex_stats_t)>& consume_stats) {
+  auto& conf = context.config;
+  const auto& options = context.dex_output_config;
+  always_assert_log(options.parallel_dex_writing_max_batch_size > 0,
+                    "parallel_dex_writing_max_batch_size must be positive");
+  auto& dexen = store.get_dexen();
+  if (dexen.empty()) {
+    return;
+  }
+  const auto& store_name = store.get_name();
+  const auto code_sort_mode = get_code_sort_mode(conf, store_name);
+  const auto string_sort_mode = get_string_sort_mode(conf);
+  if (std::find(code_sort_mode.begin(), code_sort_mode.end(),
+                SortMode::METHOD_SIMILARITY) != code_sort_mode.end() ||
+      std::find(code_sort_mode.begin(), code_sort_mode.end(),
+                SortMode::METHOD_PROFILED_ORDER) != code_sort_mode.end()) {
+    conf.get_method_profiles();
+  }
+
+  if (!options.parallel_dex_writing || dexen.size() == 1) {
+    for (size_t i = 0; i < dexen.size(); ++i) {
+      auto* classes = &dexen[i];
+      auto stats = write_classes_to_dex(
+          context.output_dir + "/" + dex_name(store, i), classes,
+          std::make_shared<GatheredTypes>(classes), store_number, &store_name,
+          i, conf, context.position_mapper, context.debug_info_kind,
+          context.method_to_id, context.code_debug_lines, context.iodi_metadata,
+          context.dex_magic, options, context.min_sdk, code_sort_mode,
+          string_sort_mode);
+      consume_stats(std::move(stats));
+    }
+    return;
+  }
+
+  struct DexState {
+    std::string filename;
+    std::unique_ptr<DexOutput> output;
+  };
+  for (size_t batch_start = 0; batch_start < dexen.size();) {
+    const size_t batch_size = std::min(
+        dexen.size() - batch_start,
+        static_cast<size_t>(options.parallel_dex_writing_max_batch_size));
+    std::vector<DexState> states(batch_size);
+
+    // Gather in dex order before any dex-local mutations start.
+    for (size_t i = 0; i < batch_size; ++i) {
+      auto& state = states[i];
+      const size_t dex_number = batch_start + i;
+      auto* classes = &dexen[dex_number];
+      auto gtypes = std::make_shared<GatheredTypes>(classes);
+      state.filename = context.output_dir + "/" + dex_name(store, dex_number);
+      state.output = std::make_unique<DexOutput>(
+          state.filename.c_str(), classes, std::move(gtypes),
+          conf.normal_primary_dex(), store_number, &store_name, dex_number,
+          context.debug_info_kind, context.iodi_metadata, conf,
+          context.position_mapper, context.method_to_id,
+          context.code_debug_lines, options, context.min_sdk);
+    }
+
+    workqueue_run_for<size_t>(0, batch_size, [&](size_t i) {
+      states[i].output->prepare_without_debug(string_sort_mode, code_sort_mode,
+                                              conf, context.dex_magic);
+    });
+
+    // Line numbers and IODI layers must retain serial dex registration order.
+    for (auto& state : states) {
+      state.output->finalize_debug_and_header();
+    }
+
+    workqueue_run_for<size_t>(0, batch_size,
+                              [&](size_t i) { states[i].output->write_dex(); });
+
+    // Symbol files append to shared paths; metrics use shared cumulative state.
+    for (auto& state : states) {
+      state.output->write_symbol_files();
+      state.output->metrics();
+      auto stats = std::move(state.output->m_stats);
+      state.output.reset();
+      consume_stats(std::move(stats));
+    }
+    batch_start += batch_size;
+  }
 }
 
 uint64_t DexOutput::policy_cap() const {

@@ -9,7 +9,9 @@
 
 #include <array>
 
+#include "ClassAssemblingUtils.h"
 #include "ClassUtil.h"
+#include "ConstructorAnalysis.h"
 #include "DexAnnotation.h"
 #include "DexCallSite.h"
 #include "DexMethodHandle.h"
@@ -58,7 +60,7 @@ MergeabilityChecker::MergeabilityChecker(const Scope& scope,
       m_track_use_of_reflection(spec.mergeability_checks_use_of_const_class) {}
 
 void MergeabilityChecker::exclude_unsupported_cls_property(
-    TypeSet& non_mergeables) {
+    const RelaxedInitsByType& relaxed_inits, TypeSet& non_mergeables) {
   for (const auto& type : UnorderedIterable(m_spec.merging_targets)) {
     const auto& cls = type_class(type);
     if (!can_delete(cls)) {
@@ -84,7 +86,9 @@ void MergeabilityChecker::exclude_unsupported_cls_property(
         break;
       }
     }
-    if (!has_ctor) {
+    // Relaxed inits can instantiate a class whose constructors were all
+    // inlined; class merging gives it forwarding constructors.
+    if (!has_ctor && relaxed_inits.count(type) == 0) {
       non_mergeables.insert(type);
       TRACE(CLMG, 5, "Has no ctor %s", SHOW(type));
     }
@@ -123,7 +127,41 @@ TypeSet MergeabilityChecker::exclude_unsupported_bytecode_refs_for(
     DexMethod* method) {
   TypeSet non_mergeables;
   auto* code = method->get_code();
-  if ((code == nullptr) || (m_generated.count(method->get_class()) != 0u)) {
+  if (code == nullptr) {
+    return non_mergeables;
+  }
+
+  // Collect the super-type constructors that relaxed inits of merging targets
+  // invoke, in generated code too; classify_relaxed_inits decides which ones
+  // class merging handles.
+  auto relaxed_inits = constructor_analysis::find_relaxed_inits(
+      method, [&](const DexType* type) {
+        return m_spec.merging_targets.count(type) != 0u;
+      });
+  UnorderedMap<const IRInstruction*, const DexType*> invoke_types;
+  UnorderedSet<const IRInstruction*> shared_invokes;
+  for (const auto& relaxed_init : relaxed_inits) {
+    auto [it, emplaced] = invoke_types.emplace(
+        relaxed_init.invoke, relaxed_init.new_instance->get_type());
+    if (!emplaced && it->second != relaxed_init.new_instance->get_type()) {
+      shared_invokes.insert(relaxed_init.invoke);
+    }
+  }
+  for (const auto& relaxed_init : relaxed_inits) {
+    TRACE(CLMG, 5, "new-instance %s associated with invoke init %s in %s",
+          SHOW(relaxed_init.new_instance), SHOW(relaxed_init.invoke),
+          SHOW(method));
+    bool shared = shared_invokes.contains(relaxed_init.invoke);
+    m_relaxed_init_calls.update(
+        relaxed_init.new_instance->get_type(),
+        [&](const DexType*, RelaxedInitCalls& calls, bool) {
+          calls.super_ctors.insert(relaxed_init.resolved_init);
+          calls.callers.insert(method);
+          calls.shares_invoke |= shared;
+        });
+  }
+
+  if (m_generated.count(method->get_class()) != 0u) {
     return non_mergeables;
   }
 
@@ -131,18 +169,9 @@ TypeSet MergeabilityChecker::exclude_unsupported_bytecode_refs_for(
   std::vector<std::pair<IRInstruction*, const DexType*>>
       const_classes_to_verify;
   UnorderedSet<const IRInstruction*> const_classes_to_verify_set;
-  std::vector<IRInstruction*> new_instances_to_verify;
-  UnorderedSet<const IRInstruction*> new_instances_to_verify_set;
   auto& cfg = code->cfg();
   for (const auto& mie : InstructionIterable(cfg)) {
     auto* insn = mie.insn;
-
-    if (opcode::is_new_instance(insn->opcode()) &&
-        (m_spec.merging_targets.count(insn->get_type()) != 0u)) {
-      new_instances_to_verify.push_back(insn);
-      new_instances_to_verify_set.insert(insn);
-      continue;
-    }
 
     // If we have a pure method ref on a mergeable type (the class component is
     // mergeable), we do not merge the type.
@@ -176,6 +205,24 @@ TypeSet MergeabilityChecker::exclude_unsupported_bytecode_refs_for(
               SHOW(insn), SHOW(method));
       }
       continue;
+    }
+
+    // Any other string of an instruction, such as one that a call site passes
+    // to its bootstrap method, can name a class or an array of it for
+    // reflection too. Merging rewrites only the strings of const-string
+    // instructions, so the class is kept from merging even with `replace`.
+    if (!opcode::is_const_string(insn->opcode())) {
+      std::vector<const DexString*> strings;
+      insn->gather_strings(strings);
+      for (const auto* string : strings) {
+        auto* type =
+            java_names::get_element_type_from_external_name(string->str());
+        if ((type != nullptr) && m_spec.merging_targets.count(type) > 0) {
+          non_mergeables.insert(type);
+          TRACE(CLMG, 5, "[non mergeable] type like string unsafe: %s in %s",
+                SHOW(insn), SHOW(method));
+        }
+      }
     }
 
     // With type tags, a Class among the bootstrap arguments of a call site is
@@ -266,15 +313,13 @@ TypeSet MergeabilityChecker::exclude_unsupported_bytecode_refs_for(
     }
   }
 
-  if (const_classes_to_verify.empty() && new_instances_to_verify.empty()) {
+  if (const_classes_to_verify.empty()) {
     return non_mergeables;
   }
 
   live_range::MoveAwareChains chains(
-      cfg, /* ignore_unreachable */ false, [&](auto* insn) {
-        return const_classes_to_verify_set.count(insn) ||
-               new_instances_to_verify_set.count(insn);
-      });
+      cfg, /* ignore_unreachable */ false,
+      [&](auto* insn) { return const_classes_to_verify_set.count(insn); });
   live_range::DefUseChains du_chains = chains.get_def_use_chains();
 
   for (const auto& pair : const_classes_to_verify) {
@@ -304,45 +349,76 @@ TypeSet MergeabilityChecker::exclude_unsupported_bytecode_refs_for(
     }
   }
 
-  // We find and exclude classes of which instances are created via
-  // new-instance, but then the associated constructor call invokes a
-  // constructor of a super type, and not the exact instantiated type.
-  // TODO T184662680: Fully support such scenario, e.g. by synthesizing a
-  // corresponding constructor on the instantiated class, and not just exclude.
-  for (auto* new_instance_insn : UnorderedIterable(new_instances_to_verify)) {
-    auto* type = new_instance_insn->get_type();
-    const auto& use_set = du_chains[new_instance_insn];
-    for (const auto& use : UnorderedIterable(use_set)) {
-      if (use.src_index != 0) {
-        continue;
-      }
-      auto* use_insn = use.insn;
-      if (opcode::is_a_move(use_insn->opcode())) {
-        // Ignore moves
-        continue;
-      }
-      if (!use_insn->has_method()) {
-        continue;
-      }
-      auto* callee = use_insn->get_method();
-      if (!method::is_init(callee)) {
-        continue;
-      }
-      const auto* resolved_callee =
-          resolve_method_deprecated(callee, opcode_to_search(use_insn), method);
-      if ((resolved_callee == nullptr) ||
-          resolved_callee->get_class() != type) {
-        TRACE(CLMG, 5,
-              "[non mergeable] new-instance %s associated with invoke init %s "
-              "defined in other type in %s",
-              SHOW(new_instance_insn), SHOW(use_insn), SHOW(method));
-        non_mergeables.insert(type);
+  return non_mergeables;
+}
+
+void MergeabilityChecker::classify_relaxed_inits(Mergeability& mergeability) {
+  auto& exclusions = mergeability.relaxed_init_exclusions;
+  auto types =
+      unordered_to_ordered_keys(m_relaxed_init_calls, compare_dextypes);
+  const auto* init_name = DexString::make_string("<init>");
+  for (const auto* type : types) {
+    // Counted only for types that nothing else excludes.
+    if (mergeability.non_mergeables.count(type) != 0u) {
+      continue;
+    }
+    const auto& calls = m_relaxed_init_calls.at_unsafe(type);
+    const auto& super_ctor_set = calls.super_ctors;
+    auto exclude = [&](uint32_t* reason) {
+      ++*reason;
+      mergeability.non_mergeables.insert(type);
+      TRACE(CLMG, 5, "[non mergeable] unsupported relaxed init of %s",
+            SHOW(type));
+    };
+    if (!m_spec.generate_type_tag()) {
+      exclude(&exclusions.type_tag_not_generated);
+      continue;
+    }
+    if (super_ctor_set.count(nullptr) != 0u || calls.shares_invoke) {
+      exclude(&exclusions.unsupported);
+      continue;
+    }
+    std::vector<RelaxedInitForwarder> forwarders;
+    UnorderedSet<const DexProto*> protos;
+    uint32_t* reason = nullptr;
+    for (auto* super_ctor :
+         unordered_to_ordered(super_ctor_set, compare_dexmethods)) {
+      if (!type::is_subclass(super_ctor->get_class(), type)) {
+        reason = &exclusions.unsupported;
         break;
       }
+      if (super_ctor->is_external() && !is_public(super_ctor) &&
+          !is_protected(super_ctor)) {
+        reason = &exclusions.inaccessible;
+        break;
+      }
+      if (!m_ref_checker.check_method(super_ctor)) {
+        reason = &exclusions.unsafe_refs;
+        break;
+      }
+      // At most one forwarding constructor per proto, and an existing
+      // constructor with that proto must already be that forwarder.
+      auto* existing_ref = DexMethod::get_method(
+          const_cast<DexType*>(type), init_name, super_ctor->get_proto());
+      auto* existing_ctor =
+          existing_ref == nullptr ? nullptr : existing_ref->as_def();
+      if (!protos.insert(super_ctor->get_proto()).second ||
+          (existing_ctor != nullptr &&
+           !is_forwarding_ctor(existing_ctor, super_ctor))) {
+        reason = &exclusions.ctor_conflict;
+        break;
+      }
+      forwarders.push_back(RelaxedInitForwarder{super_ctor, existing_ctor});
     }
+    if (reason != nullptr) {
+      exclude(reason);
+      continue;
+    }
+    mergeability.relaxed_inits.emplace(
+        type,
+        RelaxedInits{std::move(forwarders),
+                     unordered_to_ordered(calls.callers, compare_dexmethods)});
   }
-
-  return non_mergeables;
 }
 
 void MergeabilityChecker::exclude_unsupported_bytecode(
@@ -616,19 +692,27 @@ void MergeabilityChecker::exclude_unhandled_anno_refs(TypeSet& non_mergeables) {
   }
 }
 
-TypeSet MergeabilityChecker::get_non_mergeables() {
-  TypeSet non_mergeables;
+Mergeability MergeabilityChecker::get_mergeability() {
+  Mergeability mergeability;
+  auto& non_mergeables = mergeability.non_mergeables;
   size_t prev_size = 0;
 
-  exclude_unsupported_cls_property(non_mergeables);
-  TRACE(CLMG, 4, "Non mergeables (no delete) %zu", non_mergeables.size());
+  exclude_unsupported_bytecode(non_mergeables);
+  TRACE(CLMG, 4, "Non mergeables (opcodes) %zu", non_mergeables.size());
   prev_size = non_mergeables.size();
 
-  exclude_unsupported_bytecode(non_mergeables);
+  classify_relaxed_inits(mergeability);
+  TRACE(CLMG,
+        4,
+        "Non mergeables (relaxed inits) %zu",
+        non_mergeables.size() - prev_size);
+  prev_size = non_mergeables.size();
+
+  exclude_unsupported_cls_property(mergeability.relaxed_inits, non_mergeables);
   exclude_unsupported_static_value_method_handles(non_mergeables);
   TRACE(CLMG,
         4,
-        "Non mergeables (opcodes) %zu",
+        "Non mergeables (no delete) %zu",
         non_mergeables.size() - prev_size);
   prev_size = non_mergeables.size();
 
@@ -673,5 +757,5 @@ TypeSet MergeabilityChecker::get_non_mergeables() {
         "Non mergeables (skip anonymous classes) %zu",
         non_mergeables.size() - prev_size);
 
-  return non_mergeables;
+  return mergeability;
 }
